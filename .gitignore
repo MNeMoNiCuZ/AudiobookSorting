@@ -1,3 +1,17 @@
+# Exclude __pycache__ folders
+__pycache__/
+
+# Exclude specific directories
+/input/
+/input2/
+/venv/
+
+# Exclude specific files
+book_entries.json
+venv_activate.bat
+venv_update.bat
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
