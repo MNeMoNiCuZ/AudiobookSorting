@@ -46,46 +46,32 @@ class FileOperations:
             # Create full target path
             target_path = self.output_dir / author / self.sanitize_path_component(book_dir)
             
-            # Ensure source exists
+            # Get source path and its parent directory
             source_path = Path(entry['full_audio_path'])
-            if not source_path.exists():
-                self.logger.error(f"Source file does not exist: {source_path}")
-                return None
-                
-            # Create target directory
-            try:
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.mkdir(exist_ok=True)
-            except Exception as e:
-                self.logger.error(f"Failed to create target directory {target_path}: {str(e)}")
+            source_dir = source_path.parent
+            
+            if not source_dir.exists():
+                self.logger.error(f"Source directory does not exist: {source_dir}")
                 return None
             
-            # Copy/move main audio file
-            try:
-                if self.copy_mode:
-                    self.logger.info(f"Copying {source_path} to {target_path}")
-                    shutil.copy2(source_path, target_path / source_path.name)
-                else:
-                    self.logger.info(f"Moving {source_path} to {target_path}")
-                    shutil.move(str(source_path), str(target_path / source_path.name))
-            except Exception as e:
-                self.logger.error(f"Failed to {'copy' if self.copy_mode else 'move'} file: {str(e)}")
-                return None
-                
-            # Handle additional files
-            if 'additional_files' in entry:
-                for file_path in entry['additional_files']:
-                    source = Path(file_path)
-                    if source.exists():
-                        try:
-                            if self.copy_mode:
-                                shutil.copy2(source, target_path / source.name)
-                            else:
-                                shutil.move(str(source), str(target_path / source.name))
-                        except Exception as e:
-                            self.logger.error(f"Failed to process additional file {source}: {str(e)}")
-                            continue
-                            
+            # Create target directory
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.mkdir(exist_ok=True)
+            
+            # Process all files in the source directory
+            for file_path in source_dir.iterdir():
+                if file_path.is_file():  # Only process files, not subdirectories
+                    try:
+                        if self.copy_mode:
+                            self.logger.info(f"Copying {file_path} to {target_path}")
+                            shutil.copy2(file_path, target_path / file_path.name)
+                        else:
+                            self.logger.info(f"Moving {file_path} to {target_path}")
+                            shutil.move(str(file_path), str(target_path / file_path.name))
+                    except Exception as e:
+                        self.logger.error(f"Failed to process file {file_path}: {str(e)}")
+                        continue
+                    
             return str(target_path)
             
         except Exception as e:

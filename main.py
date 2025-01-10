@@ -210,13 +210,12 @@ class AudiobookOrganizer:
                     self.logger.error(f"Failed to apply entry: {entry_id}")
 
     def apply_all_entries(self):
-        """Apply file organization for all approved entries"""
+        """Apply file organization for all entries"""
         entries = self.data_manager.get_all_entries()
         for entry_id, entry in entries.items():
-            if entry.get('status') == 'approved':
-                row = self.gui.find_entry_row(entry_id)
-                if row >= 0:
-                    self.apply_entry(row)
+            row = self.gui.find_entry_row(entry_id)
+            if row >= 0:
+                self.apply_entry(row)
 
     def run(self):
         """Starts the application"""

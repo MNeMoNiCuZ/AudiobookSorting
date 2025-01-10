@@ -311,67 +311,20 @@ class AudiobookOrganizerGUI(QMainWindow):
                 entry[key] = value
                 self.data_manager.update_entry(entry_id, entry) 
 
-    def _set_row_color(self, row: int, status: str, folder_path: str = None):
-        """Sets the background color for an entire row"""
-        colors = {
-            'approved': QColor(232, 245, 233),  # Light green
-            'rejected': QColor(255, 220, 220),  # Light red
-            'risky': QColor(255, 253, 231),     # Light yellow for LLM and shared folders
-            'default': QColor(255, 255, 255)    # White
-        }
+    def _set_row_color(self, row: int, status: str, entry_id: str):
+        """Set the row color based on status"""
+        color = {
+            'approved': QColor('#E8F5E9'),  # Light green
+            'rejected': QColor('#FFEBEE'),  # Light red
+            'applied': QColor('#E3F2FD'),   # Light blue
+            'risky': QColor('#FFF9C4'),     # Light yellow
+            'pending': QColor('white')
+        }.get(status, QColor('white'))
         
-        # Get base color based on status
-        color = colors.get(status.lower(), colors['default'])
-        
-        # Apply color to all columns in the row
         for col in range(self.table.columnCount()):
-            # For regular cells
             item = self.table.item(row, col)
             if item:
                 item.setBackground(color)
-            
-            # For the action column widget
-            widget = self.table.cellWidget(row, col)
-            if widget:
-                # Set container background while preserving button styles
-                widget.setAutoFillBackground(True)
-                palette = widget.palette()
-                palette.setColor(widget.backgroundRole(), color)
-                widget.setPalette(palette)
-                
-                # Ensure buttons maintain their styles
-                for button in widget.findChildren(QPushButton):
-                    button.setAutoFillBackground(True)
-                    # Keep original button style
-                    current_style = button.styleSheet()
-                    if not current_style:
-                        continue
-                    # Remove any background-color from current style if exists
-                    cleaned_style = re.sub(r'background-color:[^;]+;', '', current_style)
-                    button.setStyleSheet(cleaned_style)
-        
-        # Check for shared folder condition if not approved
-        if status != 'approved' and folder_path:
-            folder = str(Path(folder_path).parent)
-            folder_count = 0
-            folder_entries = []
-            
-            # Count entries sharing this folder
-            for i in range(self.table.rowCount()):
-                other_item = self.table.item(i, 0)
-                if other_item:
-                    other_path = str(Path(other_item.data(Qt.ItemDataRole.UserRole)).parent)
-                    if other_path == folder:
-                        folder_count += 1
-                        folder_entries.append(i)
-            
-            # If multiple entries share the folder, color them yellow
-            if folder_count > 1:
-                for i in folder_entries:
-                    for col in range(self.table.columnCount()):
-                        item = self.table.item(i, col)
-                        if item:
-                            item.setBackground(colors['risky'])
 
     def find_entry_row(self, entry_id: str) -> int:
         """Find the row index for an entry ID"""
