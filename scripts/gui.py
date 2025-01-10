@@ -30,6 +30,8 @@ class AudiobookOrganizerGUI(QMainWindow):
                  on_query_llm_all: Callable,
                  on_apply: Callable,
                  on_apply_all: Callable,
+                 on_approve_all: Callable,
+                 on_reject_all: Callable,
                  data_manager):
         super().__init__()
         self.on_approve = on_approve
@@ -39,11 +41,13 @@ class AudiobookOrganizerGUI(QMainWindow):
         self.on_query_llm_all = on_query_llm_all
         self.on_apply = on_apply
         self.on_apply_all = on_apply_all
+        self.on_approve_all = on_approve_all
+        self.on_reject_all = on_reject_all
         self.data_manager = data_manager
         self.logger = logging.getLogger(__name__)
         
         self.setWindowTitle("Audiobook Organizer")
-        self.setMinimumSize(1350, 800)
+        self.setMinimumSize(1400, 800)
         self.setup_gui()
 
     def setup_gui(self):
@@ -85,8 +89,8 @@ class AudiobookOrganizerGUI(QMainWindow):
         # Create bottom button panel
         button_panel = QHBoxLayout()
         
-        # Add Query LLM button
-        query_llm_button = QPushButton("Query LLM for all")
+        # Add Query LLM All button
+        query_llm_button = QPushButton("Query LLM All")
         query_llm_button.setStyleSheet("""
             QPushButton {
                 background-color: #FFD700;
@@ -100,6 +104,38 @@ class AudiobookOrganizerGUI(QMainWindow):
             }
         """)
         query_llm_button.clicked.connect(self.on_query_llm_all)
+        
+        # Add Approve All button
+        approve_all_button = QPushButton("Approve All")
+        approve_all_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        approve_all_button.clicked.connect(self.on_approve_all)
+        
+        # Add Reject All button
+        reject_all_button = QPushButton("Reject All")
+        reject_all_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #d32f2f;
+            }
+        """)
+        reject_all_button.clicked.connect(self.on_reject_all)
         
         # Add Apply All button
         apply_all_button = QPushButton("Apply All")
@@ -117,26 +153,14 @@ class AudiobookOrganizerGUI(QMainWindow):
         """)
         apply_all_button.clicked.connect(self.on_apply_all)
         
-        # Existing save button
-        save_button = QPushButton("Save All")
-        save_button.clicked.connect(self.on_save)
-        save_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        
+        # Add buttons to panel with centering
+        button_panel.addStretch()
         button_panel.addWidget(query_llm_button)
+        button_panel.addWidget(approve_all_button)
+        button_panel.addWidget(reject_all_button)
         button_panel.addWidget(apply_all_button)
         button_panel.addStretch()
-        button_panel.addWidget(save_button)
+        
         layout.addLayout(button_panel)
 
         # Connect cell editing signal

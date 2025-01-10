@@ -10,6 +10,7 @@ from scripts import (
     LLMQueryClient,
     FileOperations
 )
+from typing import Any
 
 def setup_logging():
     """Configure logging for the application"""
@@ -59,6 +60,8 @@ class AudiobookOrganizer:
             on_query_llm_all=self.query_llm_all,
             on_apply=self.apply_entry,
             on_apply_all=self.apply_all_entries,
+            on_approve_all=self.approve_all_entries,
+            on_reject_all=self.reject_all_entries,
             data_manager=self.data_manager
         )
         self.gui.show()
@@ -111,6 +114,31 @@ class AudiobookOrganizer:
         """Saves all entries"""
         self.data_manager.save_entries()
         self.logger.info("Entries saved successfully")
+
+    def _clean_metadata_value(self, field: str, value: Any) -> str:
+        """Clean and validate metadata values"""
+        # Convert value to string first
+        if value is None:
+            return ""
+        
+        # Convert to string and check for "none"
+        str_value = str(value)
+        if str_value.lower() == "none":
+            return ""
+        
+        # Validate series_index
+        if field == "series_index" and str_value:
+            try:
+                # Try to convert to integer
+                index = int(str_value)
+                if index < 0:
+                    return ""
+                return str(index)
+            except ValueError:
+                self.logger.warning(f"Invalid series index value: {str_value}")
+                return ""
+            
+        return str_value
 
     def query_llm_for_entry(self, row: int):
         """Query LLM for a single entry"""
@@ -165,9 +193,11 @@ class AudiobookOrganizer:
                 
                 for field in ['title', 'author', 'series', 'series_index']:
                     if not entry.get(field) and result.get(field):
-                        entry[field] = result[field]
-                        llm_fields.append(field)
-                        updated = True
+                        cleaned_value = self._clean_metadata_value(field, result[field])
+                        if cleaned_value:  # Only update if we have a valid value
+                            entry[field] = cleaned_value
+                            llm_fields.append(field)
+                            updated = True
                 
                 if updated:
                     entry['source'] = 'llm'
@@ -216,6 +246,16 @@ class AudiobookOrganizer:
             row = self.gui.find_entry_row(entry_id)
             if row >= 0:
                 self.apply_entry(row)
+
+    def approve_all_entries(self):
+        """Approve all entries currently in the table"""
+        for row in range(self.gui.table.rowCount()):
+            self.approve_entry(row)
+
+    def reject_all_entries(self):
+        """Reject all entries currently in the table"""
+        for row in range(self.gui.table.rowCount()):
+            self.reject_entry(row)
 
     def run(self):
         """Starts the application"""
