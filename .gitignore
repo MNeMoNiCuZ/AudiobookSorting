@@ -5,13 +5,14 @@ __pycache__/
 /input/
 /input2/
 /venv/
+/output/
 
 # Exclude specific files
 book_entries.json
 venv_activate.bat
 venv_update.bat
 config.ini
-
+api_cache.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

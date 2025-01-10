@@ -28,38 +28,10 @@ class MetadataExtractor:
         primary_path = Path(primary_path)
         metadata = self._create_empty_metadata()
         
-        # Step 1: Extract file metadata
-        self.logger.debug("Attempting file metadata extraction")
+        # Only extract file metadata initially
         metadata = self._extract_file_metadata(str(primary_path))
-        self.logger.debug(f"File metadata extracted: {metadata}")
-
-        # Check for missing required fields
-        required_fields = {'author', 'title', 'series', 'series_index'}
-        missing_fields = required_fields - set(k for k, v in metadata.items() if v)
+        metadata['source'] = 'metadata'
         
-        if missing_fields:
-            self.logger.info(f"Missing fields after file metadata: {missing_fields}")
-            
-            # Step 2: Try API search
-            self.logger.debug("Attempting API search")
-            api_data = self.api_client.search_book(metadata)
-            
-            if api_data:
-                self.logger.info("API data found, updating missing fields")
-                # Update only missing fields from API data
-                updated_fields = []
-                for field in missing_fields:
-                    if api_data.get(field):
-                        metadata[field] = api_data[field]
-                        updated_fields.append(field)
-                if updated_fields:
-                    metadata['source'] = 'api'
-                    self.logger.info(f"Updated fields from API: {updated_fields}")
-                self.logger.debug(f"Updated metadata after API: {metadata}")
-            else:
-                self.logger.info("No API data found")
-        
-        self.logger.info(f"Final metadata: {metadata}")
         return metadata
 
     def _extract_m4b_metadata(self, path: Path) -> Dict:

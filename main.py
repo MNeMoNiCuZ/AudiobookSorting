@@ -7,7 +7,8 @@ from scripts import (
     MetadataExtractor,
     DataManager,
     AudiobookOrganizerGUI,
-    LLMQueryClient
+    LLMQueryClient,
+    FileOperations
 )
 
 def setup_logging():
@@ -47,14 +48,17 @@ class AudiobookOrganizer:
         self.scanner = FileScanner(input_dir)
         self.metadata_extractor = MetadataExtractor()
         self.data_manager = DataManager()
+        self.file_ops = FileOperations(copy_mode=True)  # Set to False for move mode
         
-        # Setup GUI
+        # Setup GUI with new callbacks
         self.gui = AudiobookOrganizerGUI(
             on_approve=self.approve_entry,
             on_reject=self.reject_entry,
             on_save=self.save_entries,
             on_llm_query=self.query_llm_for_entry,
             on_query_llm_all=self.query_llm_all,
+            on_apply=self.apply_entry,
+            on_apply_all=self.apply_all_entries,
             data_manager=self.data_manager
         )
         self.gui.show()
@@ -188,6 +192,31 @@ class AudiobookOrganizer:
                     
                     # Now perform the LLM query
                     self.query_llm_for_entry(row)
+
+    def apply_entry(self, row: int):
+        """Apply file organization for a single entry"""
+        entry_id = self.gui.get_entry_id(row)
+        if entry_id:
+            entry = self.data_manager.get_entry(entry_id)
+            if entry:
+                result = self.file_ops.apply_entry(entry)
+                if result:
+                    entry['applied_path'] = result
+                    entry['status'] = 'applied'
+                    self.data_manager.update_entry(entry_id, entry)
+                    self.gui.update_entry(entry_id, entry)
+                    self.logger.info(f"Applied entry to: {result}")
+                else:
+                    self.logger.error(f"Failed to apply entry: {entry_id}")
+
+    def apply_all_entries(self):
+        """Apply file organization for all approved entries"""
+        entries = self.data_manager.get_all_entries()
+        for entry_id, entry in entries.items():
+            if entry.get('status') == 'approved':
+                row = self.gui.find_entry_row(entry_id)
+                if row >= 0:
+                    self.apply_entry(row)
 
     def run(self):
         """Starts the application"""
