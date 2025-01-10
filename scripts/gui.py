@@ -43,7 +43,7 @@ class AudiobookOrganizerGUI(QMainWindow):
         self.logger = logging.getLogger(__name__)
         
         self.setWindowTitle("Audiobook Organizer")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(1350, 800)
         self.setup_gui()
 
     def setup_gui(self):
@@ -62,21 +62,18 @@ class AudiobookOrganizerGUI(QMainWindow):
 
         # Set column properties
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)  # Folder Structure
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)      # Author
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)      # Series
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)        # Index
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)      # Title
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)        # Source
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)        # Status
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)        # Actions
+        for col in range(self.table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
 
-        # Set minimum column widths
+        # Set default column widths
         self.table.setColumnWidth(0, 300)  # Folder Structure
+        self.table.setColumnWidth(1, 200)  # Author
+        self.table.setColumnWidth(2, 200)  # Series
         self.table.setColumnWidth(3, 60)   # Index
+        self.table.setColumnWidth(4, 200)  # Title
         self.table.setColumnWidth(5, 80)   # Source
         self.table.setColumnWidth(6, 80)   # Status
-        self.table.setColumnWidth(7, 100)  # Actions
+        self.table.setColumnWidth(7, 190)  # Actions
 
         # Set the custom delegate for the folder structure column
         delegate = FileStructureDelegate()
