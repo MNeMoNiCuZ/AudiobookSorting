@@ -49,7 +49,7 @@ class AudiobookOrganizer:
         self.scanner = FileScanner(input_dir)
         self.metadata_extractor = MetadataExtractor()
         self.data_manager = DataManager()
-        self.file_ops = FileOperations(copy_mode=True)  # Set to False for move mode
+        self.file_ops = FileOperations(copy_mode=False)  # Set to False for move mode
         
         # Setup GUI with new callbacks
         self.gui = AudiobookOrganizerGUI(
@@ -121,9 +121,9 @@ class AudiobookOrganizer:
         if value is None:
             return ""
         
-        # Convert to string and check for "none"
+        # Convert to string and check for "none" or "unknown"
         str_value = str(value)
-        if str_value.lower() == "none":
+        if str_value.lower() in ["none", "unknown"]:
             return ""
         
         # Validate series_index

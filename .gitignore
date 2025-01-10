@@ -13,6 +13,7 @@ venv_activate.bat
 venv_update.bat
 config.ini
 api_cache.json
+*.jpg
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

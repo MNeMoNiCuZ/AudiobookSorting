@@ -10,6 +10,7 @@ from typing import Dict, Optional, Callable
 import logging
 from pathlib import Path
 import re
+import webbrowser
 
 class FileStructureDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
@@ -47,7 +48,7 @@ class AudiobookOrganizerGUI(QMainWindow):
         self.logger = logging.getLogger(__name__)
         
         self.setWindowTitle("Audiobook Organizer")
-        self.setMinimumSize(1400, 800)
+        self.setMinimumSize(1420, 800)
         self.setup_gui()
 
     def setup_gui(self):
@@ -77,7 +78,7 @@ class AudiobookOrganizerGUI(QMainWindow):
         self.table.setColumnWidth(4, 200)  # Title
         self.table.setColumnWidth(5, 80)   # Source
         self.table.setColumnWidth(6, 80)   # Status
-        self.table.setColumnWidth(7, 190)  # Actions
+        self.table.setColumnWidth(7, 240)  # Actions
 
         # Set the custom delegate for the folder structure column
         delegate = FileStructureDelegate()
@@ -172,6 +173,22 @@ class AudiobookOrganizerGUI(QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(8)
 
+        # Add GR button
+        gr_btn = QPushButton("GR")
+        gr_btn.setFixedWidth(40)
+        gr_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #800080;  /* Purple color */
+                color: white;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background-color: #9932CC;  /* Lighter purple on hover */
+            }
+        """)
+        gr_btn.clicked.connect(lambda: self.on_gr_query(row))
+
         # Add LLM button
         llm_btn = QPushButton("LLM")
         llm_btn.setFixedWidth(40)
@@ -235,6 +252,7 @@ class AudiobookOrganizerGUI(QMainWindow):
         """)
         apply_btn.clicked.connect(lambda: self.on_apply(row))
 
+        layout.addWidget(gr_btn)
         layout.addWidget(llm_btn)
         layout.addWidget(approve_btn)
         layout.addWidget(reject_btn)
@@ -353,3 +371,25 @@ class AudiobookOrganizerGUI(QMainWindow):
             if self.get_entry_id(row) == entry_id:
                 return row
         return -1 
+
+    def on_gr_query(self, row):
+        entry_id = self.get_entry_id(row)
+        if entry_id:
+            entry = self.data_manager.get_entry(entry_id)
+            if entry:
+                # Check if author and title are not from LLM
+                llm_fields = entry.get('llm_fields', [])
+                if 'author' not in llm_fields and 'title' not in llm_fields:
+                    author = entry.get('author', '')
+                    title = entry.get('title', '')
+
+                    # Strip numbers and special characters
+                    author_clean = re.sub(r'[^a-zA-Z\s]', '', author)
+                    title_clean = re.sub(r'[^a-zA-Z\s]', '', title)
+
+                    # Construct the Goodreads search URL
+                    query = f"{author_clean} {title_clean}".strip().replace(' ', '+')
+                    url = f"https://www.goodreads.com/search?utf8=%E2%9C%93&q={query}&search_type=books&search%5Bfield%5D=on"
+
+                    # Open the URL in the default web browser
+                    webbrowser.open_new_tab(url) 
