@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 import logging
 
 class FileScanner:
@@ -18,7 +18,15 @@ class FileScanner:
             audio_files = [f for f in files if f.lower().endswith(self.supported_audio)]
             if audio_files:
                 root_path = Path(root)
-                group_key = root_path.parent if root_path != self.input_dir else root_path
+                
+                # Skip files directly in input directory
+                if root_path == self.input_dir:
+                    continue
+                    
+                # Use parent directory as group key, but ensure it's not the input directory
+                group_key = root_path.parent
+                if group_key == self.input_dir:
+                    group_key = root_path
                 
                 if group_key not in file_groups:
                     file_groups[group_key] = []
@@ -42,9 +50,14 @@ class FileScanner:
         
         return entries
 
-    def _create_entry(self, root_path: Path, audio_files: List[str], image_files: List[str]) -> Dict:
+    def _create_entry(self, root_path: Path, audio_files: List[str], image_files: List[str]) -> Optional[Dict]:
         """Creates a dictionary entry for a book"""
         relative_path = root_path.relative_to(self.input_dir)
+        
+        # Skip if files are directly in input directory
+        if str(relative_path) == '.':
+            self.logger.warning(f"Skipping files in root directory: {audio_files}")
+            return None
         
         # Use the first audio file for metadata but keep track of all files
         primary_audio = audio_files[0]
