@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 from typing import Dict, Optional, Tuple, List
 import logging
+from .api_query import BookAPIClient
 
 # Valid source types for metadata extraction
 # These are the only allowed sources for information:
@@ -19,31 +20,46 @@ class MetadataExtractor:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.valid_sources = VALID_SOURCES
+        self.api_client = BookAPIClient()
 
     def extract_metadata(self, primary_path: str, additional_files: List[str] = None) -> Dict:
-        """Extracts metadata from audio files, prioritizing album metadata"""
+        """Extracts metadata from audio files and complements with API data"""
+        self.logger.info(f"Extracting metadata for: {primary_path}")
         primary_path = Path(primary_path)
         metadata = self._create_empty_metadata()
         
-        # Extract metadata from primary file
-        if primary_path.suffix.lower() == '.m4b':
-            metadata = self._extract_m4b_metadata(primary_path)
-        else:
-            metadata = self._extract_mp3_metadata(primary_path)
+        # Step 1: Extract file metadata
+        self.logger.debug("Attempting file metadata extraction")
+        metadata = self._extract_file_metadata(str(primary_path))
+        self.logger.debug(f"File metadata extracted: {metadata}")
+
+        # Check for missing required fields
+        required_fields = {'author', 'title', 'series', 'series_index'}
+        missing_fields = required_fields - set(k for k, v in metadata.items() if v)
         
-        # If we have additional files and no album title was found,
-        # try to extract from them
-        if not metadata.get('album') and additional_files:
-            for file_path in additional_files:
-                additional_metadata = self.extract_metadata(file_path)
-                if additional_metadata.get('album'):
-                    metadata['album'] = additional_metadata['album']
-                    break
+        if missing_fields:
+            self.logger.info(f"Missing fields after file metadata: {missing_fields}")
+            
+            # Step 2: Try API search
+            self.logger.debug("Attempting API search")
+            api_data = self.api_client.search_book(metadata)
+            
+            if api_data:
+                self.logger.info("API data found, updating missing fields")
+                # Update only missing fields from API data
+                updated_fields = []
+                for field in missing_fields:
+                    if api_data.get(field):
+                        metadata[field] = api_data[field]
+                        updated_fields.append(field)
+                if updated_fields:
+                    metadata['source'] = 'api'
+                    self.logger.info(f"Updated fields from API: {updated_fields}")
+                self.logger.debug(f"Updated metadata after API: {metadata}")
+            else:
+                self.logger.info("No API data found")
         
-        # Use album as title if available
-        if metadata.get('album'):
-            metadata['title'] = metadata['album']
-        
+        self.logger.info(f"Final metadata: {metadata}")
         return metadata
 
     def _extract_m4b_metadata(self, path: Path) -> Dict:
@@ -128,10 +144,9 @@ class MetadataExtractor:
         return {
             'author': '',
             'title': '',
-            'album': '',
             'series': '',
             'series_index': '',
-            'source': 'none'
+            'source': 'metadata'  # Default source
         }
 
     def extract_cover_image(self, file_path: str) -> Optional[bytes]:
@@ -153,3 +168,15 @@ class MetadataExtractor:
             self.logger.error(f"Error extracting cover image: {str(e)}")
             
         return None 
+
+    def _extract_file_metadata(self, path: str) -> Dict:
+        """Extract metadata from any audio file"""
+        try:
+            path = Path(path)
+            if path.suffix.lower() == '.m4b':
+                return self._extract_m4b_metadata(path)
+            else:
+                return self._extract_mp3_metadata(path)
+        except Exception as e:
+            self.logger.error(f"Error extracting metadata from {path}: {str(e)}")
+            return self._create_empty_metadata() 

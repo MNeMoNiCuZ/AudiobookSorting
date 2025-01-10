@@ -9,6 +9,7 @@ from PyQt6.QtGui import QPixmap, QIcon, QColor
 from typing import Dict, Optional, Callable
 import logging
 from pathlib import Path
+import re
 
 class FileStructureDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
@@ -21,11 +22,19 @@ class FileStructureDelegate(QStyledItemDelegate):
         editor.setText(value)
 
 class AudiobookOrganizerGUI(QMainWindow):
-    def __init__(self, on_approve: Callable, on_reject: Callable, on_save: Callable, data_manager):
+    def __init__(self, 
+                 on_approve: Callable, 
+                 on_reject: Callable, 
+                 on_save: Callable,
+                 on_llm_query: Callable,
+                 on_query_llm_all: Callable,
+                 data_manager):
         super().__init__()
         self.on_approve = on_approve
         self.on_reject = on_reject
         self.on_save = on_save
+        self.on_llm_query = on_llm_query
+        self.on_query_llm_all = on_query_llm_all
         self.data_manager = data_manager
         self.logger = logging.getLogger(__name__)
         
@@ -74,6 +83,24 @@ class AudiobookOrganizerGUI(QMainWindow):
 
         # Create bottom button panel
         button_panel = QHBoxLayout()
+        
+        # Add Query LLM button
+        query_llm_button = QPushButton("Query LLM for all")
+        query_llm_button.setStyleSheet("""
+            QPushButton {
+                background-color: #FFD700;
+                color: black;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #FFC700;
+            }
+        """)
+        query_llm_button.clicked.connect(self.on_query_llm_all)
+        
+        # Existing save button
         save_button = QPushButton("Save All")
         save_button.clicked.connect(self.on_save)
         save_button.setStyleSheet("""
@@ -88,6 +115,8 @@ class AudiobookOrganizerGUI(QMainWindow):
                 background-color: #45a049;
             }
         """)
+        
+        button_panel.addWidget(query_llm_button)
         button_panel.addStretch()
         button_panel.addWidget(save_button)
         layout.addLayout(button_panel)
@@ -98,9 +127,26 @@ class AudiobookOrganizerGUI(QMainWindow):
     def create_action_buttons(self, row):
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(8)
 
+        # Add LLM button
+        llm_btn = QPushButton("LLM")
+        llm_btn.setFixedWidth(40)
+        llm_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FFD700;
+                color: black;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background-color: #FFC700;
+            }
+        """)
+        llm_btn.clicked.connect(lambda: self.on_llm_query(row))
+
+        # Existing approve/reject buttons
         approve_btn = QPushButton("✓")
         approve_btn.setFixedWidth(30)
         approve_btn.setStyleSheet("""
@@ -131,6 +177,7 @@ class AudiobookOrganizerGUI(QMainWindow):
         """)
         reject_btn.clicked.connect(lambda: self.on_reject(row))
 
+        layout.addWidget(llm_btn)
         layout.addWidget(approve_btn)
         layout.addWidget(reject_btn)
         layout.addStretch()
@@ -139,12 +186,7 @@ class AudiobookOrganizerGUI(QMainWindow):
 
     def update_entry(self, entry_id: str, data: Dict):
         """Updates or adds an entry to the table"""
-        row = -1
-        for i in range(self.table.rowCount()):
-            if self.table.item(i, 0) and self.table.item(i, 0).data(Qt.ItemDataRole.UserRole) == entry_id:
-                row = i
-                break
-
+        row = self.find_entry_row(entry_id)
         if row == -1:
             row = self.table.rowCount()
             self.table.insertRow(row)
@@ -154,19 +196,21 @@ class AudiobookOrganizerGUI(QMainWindow):
         if series_index and str(series_index).isdigit():
             series_index = f"{int(series_index):02d}"
 
+        # Get list of fields that came from LLM
+        llm_fields = data.get('llm_fields', [])
+
         # Create items for each column
         items = [
-            (str(data.get('folder_structure', '')), entry_id, False),  # (text, user_data, editable)
-            (str(data.get('author', 'Unknown')), None, True),
-            (str(data.get('series', '')), None, True),
-            (series_index, None, True),
-            (str(data.get('title', 'Unknown')), None, True),
-            (str(data.get('source', 'none')), None, False),
-            (str(data.get('status', 'pending')), None, False)
+            (str(data.get('folder_structure', '')), entry_id, False, False),
+            (str(data.get('author', 'Unknown')), None, True, 'author' in llm_fields),
+            (str(data.get('series', '')), None, True, 'series' in llm_fields),
+            (series_index, None, True, 'series_index' in llm_fields),
+            (str(data.get('title', 'Unknown')), None, True, 'title' in llm_fields),
+            (str(data.get('source', 'none')), None, False, False),
+            (str(data.get('status', 'pending')), None, False, False)
         ]
 
-        # Set items in table
-        for col, (text, user_data, editable) in enumerate(items):
+        for col, (text, user_data, editable, is_llm) in enumerate(items):
             item = QTableWidgetItem(text)
             if user_data:
                 item.setData(Qt.ItemDataRole.UserRole, user_data)
@@ -177,11 +221,18 @@ class AudiobookOrganizerGUI(QMainWindow):
                 flags &= ~Qt.ItemFlag.ItemIsEditable
             item.setFlags(flags)
             
+            # Style LLM-provided fields with bold red text only
+            if is_llm:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setForeground(QColor('#FF0000'))
+            
             self.table.setItem(row, col, item)
 
-        # Set row color based on status
+        # Set row color based on status only
         self._set_row_color(row, data.get('status', 'pending'), entry_id)
-        
+
         # Add action buttons
         action_widget = self.create_action_buttons(row)
         self.table.setCellWidget(row, 7, action_widget)
@@ -226,21 +277,48 @@ class AudiobookOrganizerGUI(QMainWindow):
         """Sets the background color for an entire row"""
         colors = {
             'approved': QColor(232, 245, 233),  # Light green
-            'rejected': QColor(255, 220, 220),  # Light red (changed from yellow)
-            'risky': QColor(255, 253, 231),     # Light yellow
+            'rejected': QColor(255, 220, 220),  # Light red
+            'risky': QColor(255, 253, 231),     # Light yellow for LLM and shared folders
             'default': QColor(255, 255, 255)    # White
         }
         
         # Get base color based on status
         color = colors.get(status.lower(), colors['default'])
         
-        # Check for risky condition (shared folder)
+        # Apply color to all columns in the row
+        for col in range(self.table.columnCount()):
+            # For regular cells
+            item = self.table.item(row, col)
+            if item:
+                item.setBackground(color)
+            
+            # For the action column widget
+            widget = self.table.cellWidget(row, col)
+            if widget:
+                # Set container background while preserving button styles
+                widget.setAutoFillBackground(True)
+                palette = widget.palette()
+                palette.setColor(widget.backgroundRole(), color)
+                widget.setPalette(palette)
+                
+                # Ensure buttons maintain their styles
+                for button in widget.findChildren(QPushButton):
+                    button.setAutoFillBackground(True)
+                    # Keep original button style
+                    current_style = button.styleSheet()
+                    if not current_style:
+                        continue
+                    # Remove any background-color from current style if exists
+                    cleaned_style = re.sub(r'background-color:[^;]+;', '', current_style)
+                    button.setStyleSheet(cleaned_style)
+        
+        # Check for shared folder condition if not approved
         if status != 'approved' and folder_path:
             folder = str(Path(folder_path).parent)
             folder_count = 0
             folder_entries = []
             
-            # First count how many entries share this folder
+            # Count entries sharing this folder
             for i in range(self.table.rowCount()):
                 other_item = self.table.item(i, 0)
                 if other_item:
@@ -249,18 +327,17 @@ class AudiobookOrganizerGUI(QMainWindow):
                         folder_count += 1
                         folder_entries.append(i)
             
-            # If multiple entries share the folder, color them all yellow
+            # If multiple entries share the folder, color them yellow
             if folder_count > 1:
-                color = colors['risky']
-                # Update color for all entries in this folder
                 for i in folder_entries:
                     for col in range(self.table.columnCount()):
                         item = self.table.item(i, col)
                         if item:
                             item.setBackground(colors['risky'])
-        
-        # Apply color to all cells in the row
-        for col in range(self.table.columnCount()):
-            item = self.table.item(row, col)
-            if item:
-                item.setBackground(color) 
+
+    def find_entry_row(self, entry_id: str) -> int:
+        """Find the row index for an entry ID"""
+        for row in range(self.table.rowCount()):
+            if self.get_entry_id(row) == entry_id:
+                return row
+        return -1 

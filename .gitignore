@@ -10,6 +10,7 @@ __pycache__/
 book_entries.json
 venv_activate.bat
 venv_update.bat
+config.ini
 
 
 # Byte-compiled / optimized / DLL files

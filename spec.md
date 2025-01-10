@@ -43,18 +43,7 @@ We should extract the data in this priority:
 #4 search engine search? Maybe use a duckduckgo python library?
 #5 Make a guess based on reg expression, let's write some formulas to try and figure it out.
 
+API search:
+I want us to query an online book api until we find the right data. Please add a new file in /scripts/ for this. Use a suitable free API for this. When we have searched for an entry using metadata, but we are unable to find ALL the entries for Author, Series, Index, Title (each of them), we need to complement this data.I want us to search using the data we have for each entry.
+
 I want to see where we got the info from, so one column should mention which of the above we got it from.
-
-Do you understand the project? Please rewrite a spec for it and then start coding it in it's entitrety. I want you to code the entire thing, including all the code, no placeholder code (except for the LLM query).
-
-
-
-audiobook_organizer/
-├── main.py
-├── requirements.txt
-└── scripts/
-    ├── __init__.py
-    ├── file_scanner.py
-    ├── metadata_extractor.py
-    ├── data_manager.py
-    └── gui.py 
