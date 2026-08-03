@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Set
 from .journal import ApplyJournal, FileMove, Transaction
 from .models import BookEntry
 from .paths import build_destination, long_path, sanitize_component, unique_path
+from .settings import display_path
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ class ApplyResult:
         if self.skipped:
             return f'SKIP   {self.entry_id}: destination exists'
         verb = 'WOULD ' if self.dry_run else ''
-        lines = [f'{verb}APPLY {self.entry_id} -> {self.destination}']
+        lines = [f'{verb}APPLY {self.entry_id} -> {display_path(self.destination)}']
         for op in self.operations:
             lines.append(f'    {op["operation"]:6s} {Path(op["source"]).name}')
         return '\n'.join(lines)

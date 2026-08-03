@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import BookEntry
+from ..settings import display_path
 from .theme import (ACCENT, BG_BASE, BG_RAISED, FIELD, FIELD_BORDER, FIELD_HOVER,
                     RADIUS, TEXT, TEXT_DIM, TEXT_FAINT)
 
@@ -175,7 +176,8 @@ class BulkEditDialog(QDialog):
                 item = QTableWidgetItem(text)
                 if name == 'file':
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    item.setToolTip(entry.primary_audio or entry.entry_id)
+                    item.setToolTip(display_path(entry.primary_audio)
+                                    if entry.primary_audio else entry.entry_id)
                 elif name == 'series_index':
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.grid.setItem(row, column, item)

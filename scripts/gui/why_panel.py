@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import IDENTITY_FIELDS, BookEntry
+from ..settings import display_path
 from .theme import (ACCENT, BG_BASE, BG_DARKEST, BG_HOVER, BG_RAISED, BORDER,
                     STATUS_HUES, STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT,
                     confidence_color, source_color)
@@ -733,7 +734,8 @@ class WhyPanel(QWidget):
         return f'<table style="border-collapse:collapse; width:100%;">{"".join(rows)}</table>'
 
     def _files_html(self, entry: BookEntry) -> str:
-        rows = [f'<div style="color:{TEXT_DIM};">{html.escape(entry.folder)}</div>']
+        rows = [f'<div style="color:{TEXT_DIM};">'
+                f'{html.escape(display_path(entry.folder))}</div>']
         for name in entry.audio_files:
             rows.append(f'<div style="margin-left:10px;">{html.escape(name)}</div>')
         for name in entry.image_files:
@@ -745,7 +747,7 @@ class WhyPanel(QWidget):
                         f'belongs to this entry.</div>')
         if entry.applied_path:
             rows.append(f'<div style="color:{ACCENT}; margin-top:4px;">Applied to: '
-                        f'{html.escape(entry.applied_path)}</div>')
+                        f'{html.escape(display_path(entry.applied_path))}</div>')
         return ''.join(rows)
 
     def _tags_html(self, entry: BookEntry) -> str:

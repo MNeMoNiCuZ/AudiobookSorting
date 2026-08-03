@@ -356,7 +356,8 @@ class MergeDialog(QDialog):
                 entry.value('title') or Path(entry.primary_audio).name,
                 str(len(entry.audio_files)),
                 name or 'nothing to name it after',
-                str(destination.parent) if destination else '-',
+                (self.settings.display_path(destination.parent)
+                 if destination else '-'),
             ]
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)

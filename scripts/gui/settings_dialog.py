@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from ..paths import PROJECT_ROOT
 from ..settings import SCHEMA, Settings
 from ..workers import FunctionWorker
 from .icons import icon as make_icon
@@ -129,7 +130,9 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        header = QLabel(f'Settings are stored in <code>{self.settings.env_path}</code>')
+        header = QLabel('Settings are stored in '
+                        f'<code>{self.settings.display_path(self.settings.env_path)}'
+                        '</code>')
         header.setStyleSheet(f'color: {TEXT_DIM};')
         layout.addWidget(header)
 
@@ -1022,7 +1025,15 @@ class SettingsDialog(QDialog):
         else:
             path = QFileDialog.getExistingDirectory(self, 'Select folder', edit.text())
         if path:
-            edit.setText(str(Path(path)))
+            # A folder inside the program directory is recorded relative to it. The
+            # file dialog only ever hands back an absolute path, and storing that turns
+            # "input" into a drive-specific path that then shows up on every screen.
+            chosen = Path(path)
+            try:
+                chosen = chosen.relative_to(PROJECT_ROOT)
+            except ValueError:
+                pass
+            edit.setText(str(chosen))
 
     def _test_connection(self) -> None:
         """Round-trip a tiny prompt using the values currently in the form."""

@@ -137,8 +137,14 @@ class PreviewDialog(QDialog):
 
     # ------------------------------------------------------------------ build
 
+    def _display(self, path) -> str:
+        """A path as the settings describe it - absolute only if configured absolute."""
+        if self.settings is not None:
+            return self.settings.display_path(path)
+        return str(path)
+
     def _build_tree(self) -> None:
-        root = QTreeWidgetItem([str(self.output_root), '', ''])
+        root = QTreeWidgetItem([self._display(self.output_root), '', ''])
         root.setForeground(0, QColor(ACCENT))
         self.tree.addTopLevelItem(root)
 
@@ -166,7 +172,7 @@ class PreviewDialog(QDialog):
                 label = target.name
                 operation = (f'{op["operation"]} + rename' if renamed
                              else op['operation'])
-                child = QTreeWidgetItem([label, operation, str(source)])
+                child = QTreeWidgetItem([label, operation, self._display(source)])
                 child.setForeground(0, QColor(ACCENT if renamed else TEXT))
                 child.setForeground(1, QColor(TEXT_DIM))
                 child.setForeground(2, QColor(TEXT_FAINT))
@@ -205,8 +211,9 @@ class PreviewDialog(QDialog):
         try:
             relative = Path(destination).relative_to(self.output_root)
         except ValueError:
-            # Outside the configured output folder - show the absolute path as one node.
-            relative = Path(str(destination))
+            # Outside the configured output folder - show the whole path as one node,
+            # still written the way the settings describe it.
+            relative = Path(self._display(destination))
 
         current = Path('.')
         node = root
@@ -221,12 +228,11 @@ class PreviewDialog(QDialog):
             node = existing
         return node
 
-    @staticmethod
-    def _mark_book(node: QTreeWidgetItem, result) -> None:
+    def _mark_book(self, node: QTreeWidgetItem, result) -> None:
         """The deepest folder of a result is the book itself - label it as such."""
         node.setForeground(0, QColor(STATUS_TEXT['approved']))
         node.setData(0, Qt.ItemDataRole.UserRole, 'book')
-        node.setToolTip(0, f'{result.entry_id}\n{result.destination}')
+        node.setToolTip(0, f'{result.entry_id}\n{self._display(result.destination)}')
         node.setText(1, f'{len(result.operations)} file'
                         f'{"" if len(result.operations) == 1 else "s"}')
         node.setForeground(1, QColor(TEXT_DIM))

@@ -333,6 +333,31 @@ class Settings:
         path = Path(value)
         return path if path.is_absolute() else PROJECT_ROOT / path
 
+    def display_path(self, path: Any) -> str:
+        """A path written the way it is configured, for showing to the user.
+
+        ``get_path`` resolves a relatively-configured folder against the program
+        directory, so every path handed around inside the program is absolute. Printing
+        that leaks the whole drive layout for a library the user described as
+        ``input/``. This maps it back: a path under a folder whose setting is relative
+        is shown relative, and only a folder the user actually typed as absolute is
+        shown absolute.
+        """
+        target = Path(path)
+        for key in ('AO_INPUT_DIR', 'AO_OUTPUT_DIR'):
+            raw = str(self.get(key)).strip()
+            if not raw or Path(raw).is_absolute():
+                continue
+            try:
+                relative = target.relative_to(self.get_path(key))
+            except (ValueError, TypeError, OSError):
+                continue
+            return str(Path(raw) / relative) if relative.parts else raw
+        try:
+            return str(target.relative_to(PROJECT_ROOT))
+        except ValueError:
+            return str(target)
+
     def set(self, key: str, value: Any) -> None:
         """Stage a value in memory. Call :meth:`save` to persist."""
         if isinstance(value, bool):
@@ -449,3 +474,11 @@ def get_settings(reload: bool = False) -> Settings:
         _settings = Settings()
         _settings.ensure_file()
     return _settings
+
+
+def display_path(path: Any) -> str:
+    """:meth:`Settings.display_path` for callers that hold no Settings of their own."""
+    try:
+        return get_settings().display_path(path)
+    except OSError:
+        return str(path)

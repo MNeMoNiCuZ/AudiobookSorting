@@ -90,7 +90,8 @@ def run_cli(args, app: Application) -> int:
         return 2
 
     entries = app.scan()
-    print(f'Found {len(entries)} entries in {app.settings.get_path("AO_INPUT_DIR")}')
+    print(f'Found {len(entries)} entries in '
+          f'{app.settings.display_path(app.settings.get_path("AO_INPUT_DIR"))}')
     if not entries:
         return 0
 

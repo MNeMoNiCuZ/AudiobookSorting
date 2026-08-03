@@ -1380,7 +1380,8 @@ class MainWindow(QMainWindow):
 
         files = QTableWidgetItem(filename)
         files.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        files.setToolTip(f'{entry.folder}\n\n' + '\n'.join(entry.audio_files))
+        files.setToolTip(f'{self.settings.display_path(entry.folder)}\n\n'
+                         + '\n'.join(entry.audio_files))
         files.setData(ROLE_ENTRY_ID, entry.entry_id)
         files.setData(ROLE_SECONDARY, folder)
         files.setData(ROLE_KIND, KIND_FILES)
@@ -2019,7 +2020,8 @@ class MainWindow(QMainWindow):
                 else:
                     subprocess.Popen(['xdg-open', path])
             except OSError as exc:
-                self.show_message(f'Could not open {path}: {exc}')
+                self.show_message(
+                    f'Could not open {self.settings.display_path(path)}: {exc}')
                 return
         self.show_message(f'Opened {len(entries)} folder(s)')
 
