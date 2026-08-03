@@ -7,7 +7,7 @@ scrapes the web, and asks a language model — in that order, stopping as soon a
 confident. Every value it produces carries where it came from and how much it is
 trusted, and nothing is written to disk until you approve it.
 
-![AudiobookOrganizer](https://github.com/user-attachments/assets/bce5cd1b-edfa-4f9c-9406-0d2ee5623f88)
+<img width="2545" height="1382" alt="image" src="https://github.com/user-attachments/assets/f6eae790-05d1-4b00-bb18-604b11b19b2f" />
 
 ---
 
@@ -141,7 +141,7 @@ already resolved in a previous run.
 
 ---
 
-## The review window
+## The main window
 
 One horizontal split, running the full height: the review table on the left, the
 explanation panel on the right.
@@ -201,6 +201,8 @@ Any field can be edited directly in the table. A value you typed is marked as so
 identification run is ever allowed to quietly overwrite it. When a run wants to, it
 stops and shows you exactly what it proposes to change, per row, and you pick.
 
+<img width="1044" height="190" alt="image" src="https://github.com/user-attachments/assets/fef9381b-d04c-4acf-b965-7037932751f6" />
+
 For more than one book at a time, **Edit in a grid** (**F2** on a multi-row selection) is
 a small spreadsheet: the selected books down the side, the four identity fields across.
 
@@ -209,6 +211,9 @@ a small spreadsheet: the selected books down the side, the four identity fields 
 | `Enter` / `Shift+Enter` | Commit, move down / up — same field, next book |
 | `Tab` / `Shift+Tab` | Commit, move right / left — next field, same book |
 | `Ctrl+Z` | Undo the last edit made in here, one step at a time |
+
+<img width="1986" height="463" alt="image" src="https://github.com/user-attachments/assets/1351ee33-0112-49d0-add1-feb4a2de5b58" />
+With this tool, you can set the same author, or series to multiple books, and even number them incrementally, provided they are in the correct order.
 
 Enter going *down* is the point: a column is one kind of value, so working down it is
 working through the same field on successive books, which is what fixing a series
@@ -234,6 +239,8 @@ files**:
 ---
 
 ## Output
+
+<img width="1500" height="325" alt="image" src="https://github.com/user-attachments/assets/4163fedd-34ce-492a-8697-84c63de5d74c" />
 
 `AO_OUTPUT_TEMPLATE` decides where books land, `AO_FILE_TEMPLATE` what the files are
 called. Empty fields collapse cleanly, so a standalone book never ends up in a folder
@@ -273,6 +280,8 @@ handled in one place.
 ---
 
 ## Chapter merging
+
+<img width="1435" height="567" alt="image" src="https://github.com/user-attachments/assets/6bc6a0a2-887f-4643-9f37-15e7c8e1cdd2" />
 
 A book split into forty numbered `.mp3`s becomes one chaptered `.m4b`, each source file
 kept as a real chapter marker so seeking still works. Requires ffmpeg.
@@ -436,31 +445,11 @@ python tests/demo_book_databases.py "Ghost of the Shadowfort" "T.C. Edge"
 python tests/demo_book_databases.py --sources audnexus,itunes --raw "The Hobbit"
 ```
 
-### Layout
+### Legacy
 
-```
-main.py                    GUI + CLI entry point
-scripts/
-  settings.py              .env-backed configuration + the schema the UI is built from
-  api_engine.py            generic OpenAI-compatible LLM client
-  models.py                BookEntry / Field - the typed model carrying provenance
-  file_scanner.py          directory tree -> entries
-  metadata_extractor.py    tier 1: embedded tags
-  regex_parser.py          tier 2: names
-  api_query.py             tier 3: Audnexus / Apple / Google / OpenLibrary / LibriVox
-  web_search.py            tier 4: scraping + search snippets
-  llm_query.py             tier 5: the model
-  resolver.py              runs the chain, merges by confidence, records the trace
-  quality.py               dirty-output detection
-  dedupe.py                duplicate detection
-  cache.py                 SQLite lookup cache
-  file_operations.py       the apply engine
-  journal.py               undo
-  paths.py                 templating + Windows path safety
-  tag_writer.py            metadata written back into the files
-  sidecar.py               metadata.json + .opf
-  chapter_merge.py         ffmpeg chapter merging
-  workers.py               Qt background threads
-  data_manager.py          persistence for reviewed entries
-  gui/                     PyQt6 dark-mode interface
-```
+Old version:
+
+![AudiobookOrganizer](https://github.com/user-attachments/assets/bce5cd1b-edfa-4f9c-9406-0d2ee5623f88)
+
+
+
