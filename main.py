@@ -1,266 +1,625 @@
-import sys
-from PyQt6.QtWidgets import QApplication
+"""Audiobook Organizer - entry point for both the GUI and the CLI (#39).
+
+    python main.py                                  launch the GUI
+    python main.py --scan --dry-run                 preview what would happen
+    python main.py --scan --auto-approve 0.9 --apply
+    python main.py --undo-last
+"""
+
+from __future__ import annotations
+
+import argparse
 import logging
+import sys
+import time
 from pathlib import Path
-from scripts import (
-    FileScanner,
-    MetadataExtractor,
-    DataManager,
-    AudiobookOrganizerGUI,
-    LLMQueryClient,
-    FileOperations
-)
-from typing import Any
+from typing import List, Optional
 
-def setup_logging():
-    """Configure logging for the application"""
-    # Create logger
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+from scripts.cache import Cache
+from scripts.data_manager import DataManager
+from scripts.dedupe import mark_duplicates
+from scripts.file_operations import FileOperations
+from scripts.file_scanner import FileScanner
+from scripts.journal import ApplyJournal
+from scripts.models import (STATUS_APPROVED, STATUS_PENDING, STATUS_RISKY, BookEntry)
+from scripts.paths import PROJECT_ROOT, clean_temp
+from scripts.resolver import Resolver
+from scripts.settings import get_settings
+from scripts.utils import setup_logging
 
-    # Create console handler and set level
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+logger = logging.getLogger('audiobook_organizer')
 
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(formatter)
 
-    # Add console handler to logger
-    logger.addHandler(console_handler)
-    
-    # Set specific loggers to appropriate levels
-    logging.getLogger('scripts.metadata_extractor').setLevel(logging.ERROR)
-    logging.getLogger('scripts.file_scanner').setLevel(logging.WARNING)
-    logging.getLogger('scripts.gui').setLevel(logging.WARNING)
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-    logging.getLogger('httpcore').setLevel(logging.WARNING)
+class Application:
+    """Everything the GUI and CLI both need. No Qt imports in here."""
 
-class AudiobookOrganizer:
-    def __init__(self, input_dir: str):
-        setup_logging()  # Initialize logging
-        self.logger = logging.getLogger(__name__)
-        self.input_dir = Path(input_dir)
-        
-        # Initialize QApplication first
-        self.app = QApplication(sys.argv)
-        
-        # Initialize components
-        self.scanner = FileScanner(input_dir)
-        self.metadata_extractor = MetadataExtractor()
-        self.data_manager = DataManager()
-        self.file_ops = FileOperations(copy_mode=False)  # Set to False for move mode
-        
-        # Setup GUI with new callbacks
-        self.gui = AudiobookOrganizerGUI(
-            on_approve=self.approve_entry,
-            on_reject=self.reject_entry,
-            on_save=self.save_entries,
-            on_llm_query=self.query_llm_for_entry,
-            on_query_llm_all=self.query_llm_all,
-            on_apply=self.apply_entry,
-            on_apply_all=self.apply_all_entries,
-            on_approve_all=self.approve_all_entries,
-            on_reject_all=self.reject_all_entries,
-            data_manager=self.data_manager
-        )
-        self.gui.show()
-        
-        # Scan directory and process entries
-        self.process_entries()
+    def __init__(self, settings=None):
+        self.settings = settings or get_settings()
+        self.cache = Cache(self.settings.get_path('AO_CACHE_DB'),
+                           miss_ttl=self.settings.get_int('AO_CACHE_MISS_TTL', 86400))
+        self.data = DataManager()
+        # PROJECT_ROOT, not __file__: frozen into a one-file .exe the sources live in
+        # a temp folder that is deleted on exit, and the undo journal with them.
+        self.journal = ApplyJournal(PROJECT_ROOT / 'apply_journal.jsonl')
+        self.scanner = FileScanner(str(self.settings.get_path('AO_INPUT_DIR')))
+        self.resolver = Resolver(self.settings, cache=self.cache)
+        self.file_ops = FileOperations(self.settings, journal=self.journal)
+        self._apply_global_settings()
 
-    def process_entries(self):
-        """Scans directory and processes all entries"""
+    def _apply_global_settings(self) -> None:
+        """Settings that live in a module rather than on an object.
+
+        Filename sanitising is called from a dozen places that have no Settings to
+        hand, so the chosen strategy is pushed into the module instead of threaded
+        through every call site.
+        """
+        from scripts.paths import set_illegal_char_mode
+        set_illegal_char_mode(self.settings.get('AO_ILLEGAL_CHARS', 'smart'))
+
+    def reload_settings(self) -> None:
+        """Re-read .env after the Settings page saved, and rebuild what depends on it."""
+        self.settings.reload()
+        self.scanner = FileScanner(str(self.settings.get_path('AO_INPUT_DIR')))
+        self.resolver = Resolver(self.settings, cache=self.cache)
+        self.file_ops = FileOperations(self.settings, journal=self.journal)
+        self._apply_global_settings()
+
+    def scan(self) -> List[BookEntry]:
         entries = self.scanner.scan_directory()
-        
+        return self.data.merge_scanned(
+            entries, resume=self.settings.get_bool('AO_RESUME_SCANS', True),
+            input_root=self.scanner.input_dir)
+
+    def close(self) -> None:
+        self.data.close()
+        self.cache.close()
+
+
+# ------------------------------------------------------------------------- CLI
+
+def run_cli(args, app: Application) -> int:
+    # Unset resolves to the program's own directory, which is the one folder that
+    # must not be scanned. Say so and stop rather than walking it.
+    if not app.settings.is_set('AO_INPUT_DIR'):
+        print('No input folder is set. Put AO_INPUT_DIR in .env, or choose one on '
+              'the General tab of the Settings page.')
+        return 2
+    if args.apply and not app.settings.is_set('AO_OUTPUT_DIR'):
+        print('No output folder is set, so --apply has nowhere to write. Set '
+              'AO_OUTPUT_DIR in .env first.')
+        return 2
+
+    entries = app.scan()
+    print(f'Found {len(entries)} entries in {app.settings.get_path("AO_INPUT_DIR")}')
+    if not entries:
+        return 0
+
+    if not args.no_identify:
+        groups = {}
         for entry in entries:
-            try:
-                # Extract metadata
-                metadata = self.metadata_extractor.extract_metadata(entry['full_audio_path'])
-                
-                # Combine entry data
-                entry_data = {**entry, **metadata}
-                
-                # Generate unique ID for entry
-                entry_id = str(Path(entry['full_audio_path']).relative_to(self.input_dir))
-                
-                # Update data manager
-                self.data_manager.update_entry(entry_id, entry_data)
-                
-                # Update GUI
-                self.gui.update_entry(entry_id, entry_data)
-            except Exception as e:
-                self.logger.error(f"Error processing entry {entry.get('full_audio_path', 'unknown')}: {str(e)}")
+            groups.setdefault(entry.folder, []).append(entry)
+        for index, (folder, group) in enumerate(groups.items(), start=1):
+            print(f'  [{index}/{len(groups)}] {Path(folder).name}', flush=True)
+            app.resolver.resolve_folder(group)
+        app.data.mark_dirty()
 
-    def approve_entry(self, row: int):
-        """Handles entry approval"""
-        entry_id = self.gui.get_entry_id(row)
-        if entry_id:
-            entry = self.data_manager.get_entry(entry_id)
-            entry['status'] = 'approved'
-            self.data_manager.update_entry(entry_id, entry)
-            self.gui.update_entry(entry_id, entry)
+    if app.settings.get_bool('AO_DETECT_DUPLICATES', True):
+        flagged = mark_duplicates(entries)
+        if flagged:
+            print(f'{flagged} possible duplicate(s) flagged')
 
-    def reject_entry(self, row: int):
-        """Handles entry rejection"""
-        entry_id = self.gui.get_entry_id(row)
-        if entry_id:
-            entry = self.data_manager.get_entry(entry_id)
-            entry['status'] = 'rejected'
-            self.data_manager.update_entry(entry_id, entry)
-            self.gui.update_entry(entry_id, entry)
+    if args.auto_approve is not None:
+        approved = 0
+        for entry in entries:
+            if (entry.status in (STATUS_PENDING, STATUS_RISKY) and entry.is_complete()
+                    and entry.confidence() >= args.auto_approve):
+                entry.status = STATUS_APPROVED
+                approved += 1
+        print(f'Auto-approved {approved} entries at >= {args.auto_approve:.0%}')
+        app.data.mark_dirty()
 
-    def save_entries(self):
-        """Saves all entries"""
-        self.data_manager.save_entries()
-        self.logger.info("Entries saved successfully")
+    print()
+    print(f'{"CONFIDENCE":>10}  {"STATUS":<10} {"AUTHOR":<24} {"SERIES":<22} #    TITLE')
+    print('-' * 118)
+    for entry in sorted(entries, key=lambda e: (-e.confidence(), e.entry_id)):
+        print(f'{entry.confidence():>9.0%}  {entry.status:<10} '
+              f'{_fit(entry.value("author"), 24)} {_fit(entry.value("series"), 22)} '
+              f'{_fit(entry.value("series_index"), 4)} {entry.value("title")}')
 
-    def _clean_metadata_value(self, field: str, value: Any) -> str:
-        """Clean and validate metadata values"""
-        # Convert value to string first
-        if value is None:
-            return ""
-        
-        # Convert to string and check for "none" or "unknown"
-        str_value = str(value)
-        if str_value.lower() in ["none", "unknown"]:
-            return ""
-        
-        # Validate series_index
-        if field == "series_index" and str_value:
-            try:
-                # Try to convert to integer
-                index = int(str_value)
-                if index < 0:
-                    return ""
-                return str(index)
-            except ValueError:
-                self.logger.warning(f"Invalid series index value: {str_value}")
-                return ""
-            
-        return str_value
+    counts = app.data.stats()
+    print()
+    print('  '.join(f'{name}: {count}' for name, count in sorted(counts.items())))
 
-    def query_llm_for_entry(self, row: int):
-        """Query LLM for a single entry"""
-        entry_id = self.gui.get_entry_id(row)
-        if entry_id:
-            entry = self.data_manager.get_entry(entry_id)
-            if not entry:
+    if args.apply or args.dry_run:
+        targets = [e for e in entries if e.status == STATUS_APPROVED]
+        if not targets:
+            print('\nNothing approved, so nothing to apply. '
+                  'Use --auto-approve to approve by confidence.')
+        else:
+            preview = args.dry_run
+            print(f'\n{"Previewing" if preview else "Applying"} {len(targets)} entries:')
+            app.file_ops.reset_batch()
+            failures = 0
+            for entry in targets:
+                result = (app.file_ops.preview(entry) if preview
+                          else app.file_ops.apply_entry(entry))
+                print(result.describe())
+                if result.error:
+                    failures += 1
+                elif not preview and result.ok:
+                    entry.status = 'applied'
+            app.data.mark_dirty()
+            if preview:
+                print('\nNothing was written. Re-run with --apply (and without '
+                      '--dry-run) to perform these operations.')
+            elif failures:
+                print(f'\n{failures} entr{"y" if failures == 1 else "ies"} failed.')
+
+    app.data.flush()
+    return 0
+
+
+def run_undo(args, app: Application) -> int:
+    if args.undo_all:
+        count, problems = app.journal.undo_all()
+        print(f'Undid {count} transaction(s)')
+    else:
+        transaction, problems = app.journal.undo_last()
+        if transaction is None:
+            print('Nothing to undo')
+            return 1
+        print(f'Undid the apply of {transaction.entry_id}')
+
+    for problem in problems:
+        print(f'  ! {problem}')
+    return 0
+
+
+def _fit(text: str, width: int) -> str:
+    text = str(text or '')
+    if len(text) <= width:
+        return text.ljust(width)
+    return text[:width - 1] + '…'
+
+
+# ------------------------------------------------------------------------- GUI
+
+def run_gui(app: Application) -> int:
+    from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
+
+    from scripts.gui import MainWindow, PreviewDialog, SettingsDialog, apply_theme
+    from scripts.workers import (ApplyWorker, FunctionWorker, ResolveWorker, ScanWorker,
+                                 WorkerManager)
+
+    qt_app = QApplication(sys.argv)
+    qt_app.setApplicationName('Audiobook Organizer')
+    apply_theme(qt_app)
+
+    # Title bar, alt-tab and the taskbar. On Windows the taskbar groups by AppUserModel
+    # ID, and without one set it groups under "python.exe" and shows the Python icon
+    # however good ours is - so the ID is claimed before the first window appears.
+    from scripts.gui.app_icon import app_icon
+    icon = app_icon()
+    qt_app.setWindowIcon(icon)
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                'MNeMoNiCuZ.AudiobookOrganizer')
+        except Exception as exc:
+            logger.debug('Could not set the taskbar identity: %s', exc)
+
+    window = MainWindow(app.settings)
+    window.setWindowIcon(icon)
+    workers = WorkerManager(app.settings.get_int('AO_THREADS', 4))
+
+    def persist(entry: BookEntry) -> None:
+        app.data.update(entry)
+
+    window.entry_changed = persist
+    # The confidence control on the filter row writes .env directly, so the resolver
+    # has to be rebuilt against the new value rather than keeping the old threshold.
+    window.settings_changed.connect(app.reload_settings)
+    # The queue view reads the manager directly rather than being fed a copy, so the
+    # badge, the toolbar count and the Queue window can never disagree about it.
+    window.queue_provider = workers.status
+    workers.on_queue_change = lambda _count: window.show_queue(workers.labels())
+    window.queue_remove_requested.connect(lambda index: (
+        workers.remove(index), window.show_queue(workers.labels()),
+        window.show_message('Removed a queued job')))
+    window.queue_clear_requested.connect(lambda: (
+        workers.clear_queue(), window.show_queue(workers.labels()),
+        window.show_message('Cleared the queue')))
+
+    def wire(worker):
+        worker.signals.progress.connect(window.show_progress)
+        worker.signals.message.connect(window.show_message)
+        worker.signals.entry_done.connect(window.upsert_entry)
+        worker.signals.error.connect(lambda text: (
+            window.set_busy(workers.busy), window.show_message('Failed - see the log'),
+            QMessageBox.critical(window, 'Something went wrong', text)))
+        worker.signals.cancelled.connect(lambda: (
+            window.set_busy(workers.busy), window.show_message('Cancelled')))
+        window.set_busy(True)
+        started = workers.start(worker)
+        window.show_queue(workers.labels())
+        if workers.queued:
+            count = workers.queued
+            window.show_message(
+                f'Queued behind {count} other job' + ('' if count == 1 else 's'))
+        return started
+
+    def require_path(key: str, what: str) -> bool:
+        """Refuse to act on a folder nobody chose, and say where to choose one.
+
+        An unset path resolves to the program's own directory, which is the one
+        folder that must never be scanned or written into. Offering the Settings
+        page is the whole of the fix, so the question offers it.
+        """
+        if not app.settings.is_set(key):
+            window.show_message(f'No {what} folder is set')
+            if QMessageBox.question(
+                    window, f'No {what} folder',
+                    f'No {what} folder has been chosen yet, so there is nothing to '
+                    f'{"read" if what == "input" else "write to"}.\n\nOpen Settings and '
+                    f'choose one now?') == QMessageBox.StandardButton.Yes:
+                do_settings('General')
+            return False
+
+        # A relative path like "input" is resolved against the program's own folder.
+        # That is a useful default, but only if it says so: "Scanned 0 entries" for a
+        # folder full of books is the least helpful thing this could report, and it is
+        # what a typo in the path looked like.
+        resolved = app.settings.get_path(key)
+        if what == 'input' and not resolved.is_dir():
+            typed = app.settings.get(key)
+            window.show_message(f'The {what} folder does not exist')
+            QMessageBox.warning(
+                window, f'No such {what} folder',
+                f'The {what} folder is set to:\n\n    {typed}\n\n'
+                + (f'which is relative, so it means:\n\n    {resolved}\n\n'
+                   if not Path(typed).is_absolute() else '')
+                + 'That folder does not exist, so there is nothing to scan.')
+            return False
+        return True
+
+    # --- scan
+    def do_scan():
+        app.reload_settings()
+        window.refresh_mode_label()
+        if not require_path('AO_INPUT_DIR', 'input'):
+            return
+        worker = ScanWorker(app.scanner, app.data,
+                            resume=app.settings.get_bool('AO_RESUME_SCANS', True),
+                            resolver=app.resolver)
+
+        def done(result):
+            entries = result.get('entries', [])
+            flagged = 0
+            if app.settings.get_bool('AO_DETECT_DUPLICATES', True):
+                flagged = mark_duplicates(entries)
+            # One rebuild after the duplicate pass, so the table and the library card
+            # on the right both reflect the final statuses.
+            window.set_entries(entries)
+            window.set_busy(workers.busy)
+            window.show_message(f'Scanned {len(entries)} entries'
+                                + (f' ({flagged} possible duplicates)' if flagged else ''))
+
+        worker.signals.finished.connect(done)
+        wire(worker)
+
+    # --- identify
+    def do_resolve(entries, tiers):
+        worker = ResolveWorker(app.resolver, entries, tiers=list(tiers))
+
+        def done(result):
+            app.data.mark_dirty()
+            window.set_busy(workers.busy)
+            window.refresh_stats()
+            window.show_message(f'Identified {result.get("resolved", 0)} entries')
+            # Anything a tier wanted to write over a manual edit is put to the user
+            # now, in one dialog, rather than silently discarded or silently applied.
+            window.review_overwrites(entries)
+
+        worker.signals.finished.connect(done)
+        wire(worker)
+
+    # --- apply / preview
+    def do_apply(entries, preview):
+        # A preview writes nothing and touches no network: it renders the templates
+        # against the entries we already have in memory. Putting it behind a running
+        # encode meant pressing Preview did nothing visible for two minutes, so it runs
+        # inline. Only the jobs that are genuinely long - identification, applying,
+        # merging, undo - go through the queue.
+        if not require_path('AO_OUTPUT_DIR', 'output'):
+            return
+
+        if preview:
+            do_preview(entries)
+            return
+
+        # The window already asks for confirmation (AO_UI_CONFIRM_APPLY). A second
+        # dialog for the same click is just something to dismiss twice.
+        worker = ApplyWorker(app.file_ops, entries, preview=preview)
+
+        def done(result):
+            app.data.mark_dirty()
+            window.set_busy(workers.busy)
+            window.refresh_stats()
+            results = result.get('results', [])
+            failures = sum(1 for r in results if r.error)
+            skipped = sum(1 for r in results if r.skipped)
+            preview = result.get('preview')
+
+            if preview:
+                window.show_message(f'Previewed {len(results)} entries')
+            else:
+                window.show_message(
+                    f'Applied {len(results) - failures - skipped} of {len(results)}'
+                    + (f', {failures} failed' if failures else '')
+                    + (f', {skipped} skipped' if skipped else ''))
+
+            if preview or failures or skipped:
+                dialog = PreviewDialog(results, app.settings.get_path('AO_OUTPUT_DIR'),
+                                       dry_run=preview, parent=window,
+                                       settings=app.settings)
+                dialog.settings_requested.connect(do_settings)
+                dialog.exec()
+                app.reload_settings()
+
+        worker.signals.finished.connect(done)
+        wire(worker)
+
+    def do_preview(entries):
+        """Render the preview here and now - no worker, no queue, no waiting."""
+        app.file_ops.reset_batch()
+        results = [app.file_ops.preview(entry) for entry in entries]
+        window.show_message(f'Previewed {len(results)} entries')
+        dialog = PreviewDialog(results, app.settings.get_path('AO_OUTPUT_DIR'),
+                               dry_run=True, parent=window, settings=app.settings)
+        dialog.settings_requested.connect(do_settings)
+        dialog.exec()
+        app.reload_settings()
+
+    # --- undo
+    def history_labels():
+        """One label per undoable apply, oldest first - what the history menu shows."""
+        labels = []
+        for transaction in app.journal.pending():
+            when = time.strftime('%H:%M:%S', time.localtime(transaction.timestamp))
+            name = Path(transaction.destination).name or transaction.entry_id
+            labels.append(f'{when}  {name}')
+        return labels
+
+    window.history_provider = history_labels
+    # Undo is greyed out until it has something to reach, and it cannot know that
+    # until the provider above is in place - a journal left over from the last run
+    # counts.
+    window.refresh_action_states()
+
+    def do_undo(index):
+        history = history_labels()
+        if not history or index < 0 or index >= len(history):
+            window.show_message('Nothing to undo')
+            return
+
+        count = len(history) - index
+        target = (f'the most recent apply' if count == 1
+                  else f'the {count} most recent applies')
+        if QMessageBox.question(
+                window, 'Undo', f'Reverse {target}?\nFiles will be moved back to where '
+                                f'they came from.') != QMessageBox.StandardButton.Yes:
+            return
+
+        def work():
+            undone, problems = app.journal.undo_through(index)
+            return f'Undid {undone} apply/applies', problems
+
+        worker = FunctionWorker(work)
+
+        def done(result):
+            window.set_busy(workers.busy)
+            message, problems = result
+            window.show_message(message)
+            if problems:
+                window.show_report('Undo finished with problems', '\n'.join(problems))
+
+        worker.signals.finished.connect(done)
+        wire(worker)
+
+    # --- chapter merge
+    def do_merge(plan):
+        """One book's chapters into one .m4b, queued like every other long job.
+
+        The name was decided in the merge dialog, from the same template the rest of
+        the library is filed under - nothing is asked for here. Progress is reported
+        twice: on the toolbar like any job, and as a bar across the book's own row,
+        because a two-minute encode of one book out of forty needs to say which one.
+        """
+        from scripts.chapter_merge import merge_to_m4b
+
+        entry = plan.entry
+        files = entry.absolute_files()
+        worker = FunctionWorker(
+            merge_to_m4b, files, plan.destination,
+            label=f'Merge {len(files)} chapters into {plan.destination.name}',
+            kind='merge',
+            ffmpeg=app.settings.get('AO_FFMPEG_PATH'), bitrate=plan.bitrate,
+            title=entry.value('title'), author=entry.value('author'))
+
+        worker.signals.progress.connect(
+            lambda done_, total_, message: window.set_row_progress(
+                entry.entry_id, (done_ / total_) if total_ else 0.03, message))
+
+        def done(result):
+            window.set_row_progress(entry.entry_id, None)
+            window.set_busy(workers.busy)
+            ok, message = result
+            window.show_message(message)
+            if not ok:
+                QMessageBox.warning(window, 'Merge failed', message)
                 return
+            _finish_merge(plan)
 
-            # Set status to risky immediately when querying LLM
-            entry['status'] = 'risky'
-            self.data_manager.update_entry(entry_id, entry)
-            self.gui.update_entry(entry_id, entry)
+        worker.signals.error.connect(
+            lambda _text: window.set_row_progress(entry.entry_id, None))
+        worker.signals.cancelled.connect(
+            lambda: window.set_row_progress(entry.entry_id, None))
+        worker.signals.finished.connect(done)
+        wire(worker)
 
-            # Create file structure from available data
-            file_structure = {
-                'path': entry.get('relative_path', entry.get('root_path', '')),
-                'files': entry.get('audio_files', [])
-            }
-            
-            # Create verified metadata dict
-            verified_metadata = {
-                'title': entry.get('title', ''),
-                'author': entry.get('author', ''),
-                'series': entry.get('series', ''),
-                'series_index': entry.get('series_index', '')
-            }
-            
-            # Log the query details
-            self.logger.info("Sending LLM query for:")
-            self.logger.info(f"Path: {file_structure['path']}")
-            self.logger.info("Files:")
-            for file in file_structure['files']:
-                self.logger.info(f"  - {file}")
-            self.logger.info("Current metadata:")
-            for key, value in verified_metadata.items():
-                self.logger.info(f"  {key}: {value}")
-            
-            # Query LLM
-            llm_client = LLMQueryClient()
-            result = llm_client.query_metadata(verified_metadata, file_structure)
-            
-            if result:
-                # Log the response
-                self.logger.info("LLM Response:")
-                for key, value in result.items():
-                    self.logger.info(f"  {key}: {value}")
-                
-                # Only update empty fields
-                updated = False
-                llm_fields = entry.get('llm_fields', [])
-                
-                for field in ['title', 'author', 'series', 'series_index']:
-                    if not entry.get(field) and result.get(field):
-                        cleaned_value = self._clean_metadata_value(field, result[field])
-                        if cleaned_value:  # Only update if we have a valid value
-                            entry[field] = cleaned_value
-                            llm_fields.append(field)
-                            updated = True
-                
-                if updated:
-                    entry['source'] = 'llm'
-                    entry['llm_fields'] = llm_fields
-                    entry['status'] = 'risky'  # Always set to risky when LLM updates
-                    self.data_manager.update_entry(entry_id, entry)
-                    self.gui.update_entry(entry_id, entry)
+    def _finish_merge(plan) -> None:
+        """Tidy up after a successful merge: delete originals, re-point the entry."""
+        entry = plan.entry
+        removed = 0
+        if plan.delete_originals:
+            for path in entry.absolute_files():
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError as exc:
+                    logger.warning('Could not delete %s: %s', path, exc)
 
-    def query_llm_all(self):
-        """Query LLM for all entries with missing information"""
-        entries = self.data_manager.get_all_entries()
-        for entry_id, entry in entries.items():
-            # Check if any required fields are missing
-            if not all([entry.get(f) for f in ['title', 'author', 'series', 'series_index']]):
-                # Find row index for this entry
-                row = self.gui.find_entry_row(entry_id)
-                if row >= 0:
-                    # Set status to risky immediately
-                    entry['status'] = 'risky'
-                    self.data_manager.update_entry(entry_id, entry)
-                    self.gui.update_entry(entry_id, entry)
-                    
-                    # Now perform the LLM query
-                    self.query_llm_for_entry(row)
+        if plan.replace_entry and plan.destination.exists():
+            # The book is one file now, so the entry has to agree - otherwise the
+            # table keeps offering to merge chapters that are gone.
+            entry.folder = str(plan.destination.parent)
+            entry.audio_files = [plan.destination.name]
+            entry.primary_audio = str(plan.destination)
+            entry.log('user', f'Merged into {plan.destination.name}'
+                              + (f'; deleted {removed} chapter files' if removed
+                                 else ''))
+            window.upsert_entry(entry)
+            app.data.update(entry)
+        elif removed:
+            window.show_message(f'Merged, and deleted {removed} chapter files')
 
-    def apply_entry(self, row: int):
-        """Apply file organization for a single entry"""
-        entry_id = self.gui.get_entry_id(row)
-        if entry_id:
-            entry = self.data_manager.get_entry(entry_id)
-            if entry:
-                result = self.file_ops.apply_entry(entry)
-                if result:
-                    entry['applied_path'] = result
-                    entry['status'] = 'applied'
-                    self.data_manager.update_entry(entry_id, entry)
-                    self.gui.update_entry(entry_id, entry)
-                    self.logger.info(f"Applied entry to: {result}")
-                else:
-                    self.logger.error(f"Failed to apply entry: {entry_id}")
+    # --- settings
+    def do_settings(tab: str = ''):
+        def restyle():
+            """Interface settings preview live, before anything is written."""
+            window.refresh_toolbar()
+            window.apply_ui_settings()
 
-    def apply_all_entries(self):
-        """Apply file organization for all entries"""
-        entries = self.data_manager.get_all_entries()
-        for entry_id, entry in entries.items():
-            row = self.gui.find_entry_row(entry_id)
-            if row >= 0:
-                self.apply_entry(row)
+        dialog = SettingsDialog(app.settings, window, live_preview=restyle)
+        if tab:
+            dialog.show_tab(tab)
 
-    def approve_all_entries(self):
-        """Approve all entries currently in the table"""
-        for row in range(self.gui.table.rowCount()):
-            self.approve_entry(row)
+        def saved():
+            app.reload_settings()
+            window.refresh_mode_label()
+            restyle()
+            window.show_message('Settings saved to .env')
 
-    def reject_all_entries(self):
-        """Reject all entries currently in the table"""
-        for row in range(self.gui.table.rowCount()):
-            self.reject_entry(row)
+        dialog.saved.connect(saved)
+        dialog.layout_reset.connect(window.reset_layout)
+        dialog.exec()
+        # Whatever happened - saved, or cancelled and rolled back - the window has to
+        # end up matching the settings that are actually in force.
+        restyle()
+        window.refresh_mode_label()
 
-    def run(self):
-        """Starts the application"""
-        return self.app.exec()
+    window.scan_requested.connect(do_scan)
+    window.resolve_requested.connect(do_resolve)
+    window.apply_requested.connect(do_apply)
+    window.undo_requested.connect(do_undo)
+    window.merge_requested.connect(do_merge)
+    window.settings_requested.connect(lambda: do_settings())
+    window.settings_requested_on_tab.connect(do_settings)
+    window.cancel_requested.connect(workers.cancel)
+    window.cancel_current_requested.connect(workers.cancel_current)
+    # There is no Save button: identification results and review decisions are
+    # written continuously (DataManager autosaves on a debounce), and flushed on exit.
 
-if __name__ == "__main__":
-    app = AudiobookOrganizer("input")
-    sys.exit(app.run()) 
+    window.show()
+
+    # Show whatever the last session left behind, then scan for anything new.
+    existing = app.data.all()
+    if existing:
+        window.set_entries(existing)
+        window.show_message(f'Loaded {len(existing)} entries from the last session - '
+                            f'press Ctrl+R to rescan')
+    elif app.settings.is_set('AO_INPUT_DIR'):
+        do_scan()
+    else:
+        # A first run has no input folder yet. The banner above the table says so and
+        # links to the page that fixes it; a modal on top of an empty window that the
+        # user has not asked anything of yet would be shouting.
+        window.show_message('Set an input folder to get started')
+
+    exit_code = qt_app.exec()
+    app.data.flush()
+    return exit_code
+
+
+# ------------------------------------------------------------------------ main
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='main.py', description='Organise a messy audiobook library.')
+    parser.add_argument('--scan', action='store_true',
+                        help='run headless: scan, identify and report')
+    parser.add_argument('--no-identify', action='store_true',
+                        help='skip the identification chain (scan only)')
+    parser.add_argument('--auto-approve', type=float, metavar='CONF',
+                        help='approve every entry at or above this confidence (0-1)')
+    parser.add_argument('--apply', action='store_true',
+                        help='apply approved entries - writes to the output folder')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='print what --apply would do, without writing anything')
+    parser.add_argument('--undo-last', action='store_true', help='reverse the last apply')
+    parser.add_argument('--undo-all', action='store_true', help='reverse every apply')
+    parser.add_argument('--input', metavar='DIR', help='override the input folder')
+    parser.add_argument('--output', metavar='DIR', help='override the output folder')
+    parser.add_argument('--provider', metavar='NAME', help='override the LLM provider')
+    parser.add_argument('--log-level', default=None,
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    settings = get_settings()
+
+    # Command-line overrides win over .env, but are never written back to it.
+    if args.input:
+        settings.set('AO_INPUT_DIR', args.input)
+    if args.output:
+        settings.set('AO_OUTPUT_DIR', args.output)
+    if args.provider:
+        settings.set('AO_PROVIDER', args.provider)
+
+    setup_logging(args.log_level or settings.get('AO_LOG_LEVEL', 'INFO'))
+
+    # Stated at every start-up, because "settings do not save" and "settings save to a
+    # file you are not looking at" produce identical symptoms and cannot be told apart
+    # without this line. Frozen, PROJECT_ROOT is the folder holding the .exe - so an
+    # .exe copied elsewhere reads and writes the .env beside *it*, not the one in the
+    # source tree.
+    logger.info('Program folder: %s  (frozen=%s)', PROJECT_ROOT,
+                getattr(sys, 'frozen', False))
+    logger.info('Settings file:  %s  (exists=%s)', settings.env_path,
+                settings.env_path.exists())
+
+    # A run that was killed mid-encode leaves its segment files behind. Nothing else
+    # is going to clear them, and they are whole chapters of audio.
+    stale = clean_temp()
+    if stale:
+        logger.info('Removed %d leftover working folder(s) from temp/', stale)
+
+    app = Application(settings)
+    try:
+        if args.undo_last or args.undo_all:
+            return run_undo(args, app)
+        if args.scan:
+            return run_cli(args, app)
+        return run_gui(app)
+    except KeyboardInterrupt:
+        print('\nInterrupted')
+        return 130
+    finally:
+        app.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

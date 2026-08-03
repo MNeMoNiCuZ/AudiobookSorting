@@ -1,11 +1,19 @@
-mutagen==1.47.0
-Pillow==10.2.0
-requests==2.31.0
-duckduckgo_search==4.1.1
-PyQt6==6.6.1
-PyQt6-Qt6==6.6.1
-PyQt6-sip==13.6.0 
-openai
-requests
-groq
-mistralai
+# GUI. Pinned as a matched set - PyQt6 and PyQt6-Qt6 must agree on the minor
+# version or Qt fails to load its DLLs at import time.
+PyQt6>=6.9,<6.12
+PyQt6-Qt6>=6.9,<6.12
+PyQt6-sip>=13.8
+
+# Audio tags
+mutagen>=1.47
+Pillow>=10.2
+
+# Lookups
+requests>=2.31
+duckduckgo-search>=6.1
+
+# CLI niceties
+colorama>=0.4.6
+
+# Tests
+pytest>=8.0
