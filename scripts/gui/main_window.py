@@ -39,6 +39,7 @@ from .delegates import (KIND_CONFIDENCE, KIND_COVER, KIND_FILES, KIND_STATUS,
                         ROLE_CONFIDENCE, ROLE_ENTRY_ID, ROLE_KIND, ROLE_PROGRESS,
                         ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
                         ReviewDelegate)
+from .cover_viewer import CoverViewer
 from .icons import badged_icon
 from .icons import icon as make_icon
 from .queue_dialog import plural
@@ -292,6 +293,9 @@ class MainWindow(QMainWindow):
         # second click raises the existing window instead of stacking another one.
         self._history_dialog = None
         self._queue_dialog = None
+        # Opened by clicking a cover thumbnail; reused so stepping through books with
+        # the arrow keys does not leave a trail of windows behind.
+        self._cover_viewer = None
         # Event filters for the right-clickable toolbar buttons. Rebuilt with the
         # toolbar, and held here because a filter nobody references stops filtering.
         self._right_click_filters: List[QObject] = []
@@ -588,6 +592,9 @@ class MainWindow(QMainWindow):
             lambda *_: self.table.viewport().update())
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.itemChanged.connect(self._item_edited)
+        # The cover cell is not editable and has nothing to select, so a plain click
+        # on it is free to mean "show me this properly".
+        self.table.clicked.connect(self._cell_clicked)
         self.table.setToolTip('Double-click author, series, # or title to edit it. '
                               'Right-click for everything you can do to the selection.')
 
@@ -1375,6 +1382,7 @@ class MainWindow(QMainWindow):
         cover.setData(ROLE_KIND, KIND_COVER)
         cover.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         cover.setToolTip('Cover art embedded in the file, or an image in its folder.\n'
+                         'Click to view it full size; arrow keys walk images and books.\n'
                          'Click this column\'s header to sort the table by folder path.')
         self.table.setItem(row, COL_COVER, cover)
 
@@ -1556,6 +1564,82 @@ class MainWindow(QMainWindow):
         # Cache on the entry so scrolling doesn't re-decode every repaint.
         object.__setattr__(entry, '_cover_pixmap', pixmap)
         return pixmap if not pixmap.isNull() else None
+
+    # ----------------------------------------------------------- cover viewer
+
+    def _cell_clicked(self, index) -> None:
+        if index.column() == COL_COVER:
+            self._open_cover_viewer(index.row())
+
+    def _cover_sources(self, entry: BookEntry) -> List:
+        """Every image this book has, embedded art first, then the folder's files.
+
+        The embedded cover is what the player shows, so it leads; the loose files
+        follow in the order the scanner found them, which is sorted by name.
+        """
+        sources = []
+        try:
+            from ..metadata_extractor import MetadataExtractor
+            data = MetadataExtractor().extract_cover(entry.primary_audio)
+            if data:
+                sources.append(('Embedded cover', data))
+        except Exception as exc:
+            logger.debug('No embedded cover for %s: %s', entry.entry_id, exc)
+
+        folder = Path(entry.folder)
+        for name in entry.image_files:
+            sources.append((name, folder / name))
+        return sources
+
+    def _open_cover_viewer(self, row: int) -> None:
+        entry = self._entry_at(row)
+        if entry is None:
+            return
+        if self._cover_viewer is None:
+            self._cover_viewer = CoverViewer(self)
+            self._cover_viewer.step_book.connect(self._step_cover_book)
+            self._cover_viewer.finished.connect(
+                lambda _: setattr(self, '_cover_viewer', None))
+        self._cover_viewer.set_book(
+            self._cover_title(entry), self._cover_sources(entry),
+            has_prev=self._adjacent_row(row, -1) is not None,
+            has_next=self._adjacent_row(row, 1) is not None)
+        self._cover_viewer.show()
+        self._cover_viewer.raise_()
+        self._cover_viewer.activateWindow()
+
+    @staticmethod
+    def _cover_title(entry: BookEntry) -> str:
+        """What to call this book in the viewer - the title if we have one.
+
+        Early in a run most rows have no identity yet, and "Untitled" three times in a
+        row tells you nothing about which book you are looking at; the folder name is
+        at least the thing you would have read off the disk yourself.
+        """
+        title = entry.title.value.strip()
+        author = entry.author.value.strip()
+        if title:
+            return f'{author} - {title}' if author else title
+        return Path(entry.folder).name or entry.entry_id
+
+    def _adjacent_row(self, row: int, delta: int) -> Optional[int]:
+        """The next row in ``delta``'s direction that the filters have left visible."""
+        target = row + delta
+        while 0 <= target < self.table.rowCount():
+            if not self.table.isRowHidden(target):
+                return target
+            target += delta
+        return None
+
+    def _step_cover_book(self, delta: int) -> None:
+        """Move the viewer - and the table's cursor - to the next visible row."""
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        target = self._adjacent_row(row, delta)
+        if target is not None:
+            self.table.setCurrentCell(target, COL_COVER)
+            self._open_cover_viewer(target)
 
     # --------------------------------------------------------------- filtering
 
