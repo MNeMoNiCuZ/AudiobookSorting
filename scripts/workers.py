@@ -93,13 +93,18 @@ class CancellableWorker(QRunnable):
 class ScanWorker(CancellableWorker):
     """Walk the input tree and produce entries. Fast, but I/O bound on big libraries."""
 
-    def __init__(self, scanner, data_manager, resume: bool = True, resolver=None):
+    def __init__(self, scanner, data_manager, resume: bool = True, resolver=None,
+                 dedupe: bool = False, cache=None):
         super().__init__()
         self.scanner = scanner
         self.data_manager = data_manager
         self.resume = resume
         # When given, the offline tiers run as part of the scan - see work().
         self.resolver = resolver
+        # Duplicate detection reads bytes off the disk, so it belongs on this thread
+        # rather than in the finished handler, which runs on the GUI's.
+        self.dedupe = dedupe
+        self.cache = cache
         self.label = 'Scan the input folder'
 
     def work(self) -> Dict:
@@ -117,7 +122,13 @@ class ScanWorker(CancellableWorker):
             # Tags and filename parsing cost nothing but local I/O, and the answer is
             # already sitting in the file - so a freshly scanned table arrives filled
             # in, and identification is only ever needed for what is genuinely unknown.
-            if self.resolver is not None and not entry.trace:
+            #
+            # The test is `resolved`, which the resolver sets and a load that clears a
+            # book unsets. It used to be "has no trace", and that was wrong the moment
+            # clearing started writing a "Cleared on load" line into the trace: the
+            # books that most needed re-reading were the only ones skipped, and they
+            # arrived in the table blank, at zero confidence.
+            if self.resolver is not None and not entry.resolved:
                 try:
                     self.resolver.resolve(entry, tiers=['metadata', 'regex'])
                 except Exception:
@@ -125,7 +136,16 @@ class ScanWorker(CancellableWorker):
             self.signals.entry_done.emit(entry)
             if index % 25 == 0 or index == total:
                 self.signals.progress.emit(index, total, f'Read {index} of {total}')
-        return {'entries': entries, 'count': total}
+
+        flagged = 0
+        if self.dedupe and not self._cancelled:
+            self.signals.progress.emit(total, total, 'Checking for duplicate copies...')
+            from .dedupe import mark_duplicates
+            try:
+                flagged = mark_duplicates(entries, cache=self.cache)
+            except Exception:
+                logger.exception('Duplicate detection failed')
+        return {'entries': entries, 'count': total, 'duplicates': flagged}
 
 
 class ResolveWorker(CancellableWorker):

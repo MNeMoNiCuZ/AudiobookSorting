@@ -29,205 +29,143 @@ SCHEMA: Dict[str, tuple] = {
     # folder inside the program directory, so the first Scan appears to work and finds
     # nothing - and every later run keeps aiming at the wrong place because nobody was
     # ever asked. Empty means unset, the window says so, and it links to this page.
-    'AO_INPUT_DIR': ('', 'path', 'Folder to scan for unsorted audiobooks.'),
-    'AO_OUTPUT_DIR': ('', 'path', 'Folder the organised library is written to.'),
+    'AO_INPUT_DIR': ('', 'path', 'Folder containing unsorted audiobooks.'),
+    'AO_OUTPUT_DIR': ('', 'path', 'Folder for organised audiobooks.'),
 
     # --- LLM provider
-    'AO_PROVIDER': ('sanctum', 'str', 'Active LLM provider (a name from the provider list).'),
-    'AO_TEMPERATURE': ('0.1', 'float', 'Sampling temperature for LLM calls.'),
-    'AO_MAX_TOKENS': ('2048', 'int', 'Maximum tokens per LLM response.'),
-    'AO_TIMEOUT': ('120', 'int', 'HTTP timeout in seconds.'),
-    'AO_MAX_RETRIES': ('3', 'int', 'Retries per failed HTTP call (exponential backoff).'),
+    'AO_PROVIDER': ('sanctum', 'str', 'Language model service to use.'),
+    'AO_TEMPERATURE': ('0.1', 'float', 'Randomness of language model responses.'),
+    'AO_MAX_TOKENS': ('2048', 'int', 'Maximum response length from the language model.'),
+    'AO_TIMEOUT': ('120', 'int', 'Seconds to wait for a response.'),
+    'AO_MAX_RETRIES': ('3', 'int', 'Number of retries after a failed request.'),
 
     # --- resolution chain
-    'AO_ENABLE_METADATA': ('true', 'bool', 'Tier 1: read tags embedded in the audio files.'),
-    'AO_ENABLE_REGEX': ('true', 'bool', 'Tier 2: parse author/series/title out of filenames.'),
-    'AO_ENABLE_API': ('true', 'bool', 'Tier 3: look the book up in online book databases.'),
-    'AO_ENABLE_SEARCH': ('true', 'bool', 'Tier 4: fall back to a web search + page scrape.'),
-    'AO_ENABLE_LLM': ('true', 'bool', 'Tier 5: ask a language model to fill the gaps.'),
+    'AO_ENABLE_METADATA': ('true', 'bool', 'Read metadata embedded in audio files.'),
+    'AO_ENABLE_REGEX': ('true', 'bool', 'Read details from file and folder names.'),
+    'AO_ENABLE_API': ('true', 'bool', 'Search enabled book databases.'),
+    'AO_ENABLE_SEARCH': ('true', 'bool', 'Use web search when more information is needed.'),
+    'AO_ENABLE_LLM': ('true', 'bool', 'Use a language model to fill missing details.'),
     'AO_API_SOURCES': ('audnexus,itunes,googlebooks,openlibrary,librivox', 'str',
-                       'Book databases to query, in order. Available: audnexus '
-                       '(Audible), itunes (Apple Books), googlebooks, openlibrary, '
-                       'librivox (public domain only).'),
+                       'Book databases used for identification.'),
     'AO_GOOGLE_BOOKS_KEY': ('', 'secret',
-                            'Google Books API key. Without one that source cannot be '
-                            'used at all: anonymous callers share a project whose daily '
-                            'quota is zero, so every request comes back HTTP 429. A key '
-                            'is free from console.cloud.google.com - enable the Books '
-                            'API and create an API key.'),
+                            'API key for Google Books.'),
     'AO_SEARCH_BRAVE_KEY': ('', 'secret',
-                            'Brave Search API key, used by tier 4. Without one that '
-                            'tier can only fall back to DuckDuckGo, which now answers '
-                            'automated callers with an anti-bot challenge instead of '
-                            'results - so in practice tier 4 is reduced to scraping '
-                            'Goodreads directly. A key is free from '
-                            'brave.com/search/api (the free plan allows 2,000 queries '
-                            'a month, one per second).'),
+                            'API key for Brave Search.'),
     'AO_CONFIDENCE_SCORE': ('0.80', 'percent',
-                            'How sure an identification must be before searching '
-                            'stops. Lower it to accept looser matches, raise it to '
-                            'keep digging. This is not a filter - it is the point at '
-                            'which the tiers stop looking.'),
+                            'Stop identification when confidence reaches this value.'),
     'AO_ALWAYS_SEARCH_TO_TIER': ('3', 'choice:1|2|3|4|5',
-                                 'Always run at least this many tiers, however '
-                                 'confident we already are. 1 tags, 2 filenames, '
-                                 '3 book databases, 4 web search, 5 the model.'),
+                                 'Minimum identification stage to run.'),
     'AO_REQUIRE_COVER': ('false', 'bool',
-                         'Treat a missing cover image as incomplete data, so the '
-                         'next source is tried for it too.'),
+                         'Keep searching when cover art is missing.'),
     'AO_FOLDER_REASONING': ('true', 'bool',
-                            'Resolve all books in a folder in one LLM call (cheaper, smarter).'),
+                            'Identify books in the same folder together.'),
 
     # --- caching
-    'AO_CACHE_DB': ('cache.sqlite3', 'path', 'SQLite file holding cached lookups.'),
+    'AO_CACHE_DB': ('cache.sqlite3', 'path', 'File used to cache lookup results.'),
     'AO_CACHE_MISS_TTL': ('86400', 'int',
-                          'Seconds to remember a failed lookup. Successful lookups never expire.'),
-    'AO_RESUME_SCANS': ('true', 'bool', 'Skip entries already resolved in a previous run.'),
+                          'Seconds to remember a failed lookup.'),
+    'AO_RESUME_SCANS': ('true', 'bool', 'Reuse previously identified books.'),
+
+    # --- what a load keeps. The Load Input dialog writes these back, so the boxes
+    # you tick are the boxes you get next time.
+    'AO_LOAD_KEEP_MANUAL': ('true', 'bool',
+                            'Keep manually edited values when loading again.'),
+    'AO_LOAD_KEEP_CONFIDENT': ('false', 'bool',
+                               'Keep confident values when loading again.'),
+    'AO_LOAD_KEEP_ABOVE': ('75', 'int',
+                           'Minimum confidence for values kept when loading again.'),
+    'AO_LOAD_KEEP_DECISIONS': ('false', 'bool',
+                               'Keep approval and rejection decisions when loading again.'),
 
     # --- review
-    'AO_AUTO_APPROVE_THRESHOLD': ('0.0', 'percent',
-                                  'Auto-approve entries at or above this confidence. '
-                                  '0 disables it.'),
-    'AO_DETECT_DUPLICATES': ('true', 'bool', 'Flag books that look like ones you already have.'),
+    'AO_REVIEW_APPROVE_THRESHOLD': ('', 'percent',
+                                    'Confidence used by middle-click Approve; leave empty to disable.'),
+    'AO_REVIEW_REJECT_THRESHOLD': ('', 'percent',
+                                   'Confidence used by middle-click Reject; leave empty to disable.'),
+    'AO_DETECT_DUPLICATES': ('true', 'bool',
+                             'Flag exact duplicate audio.'),
 
     # --- apply behaviour
     'AO_COPY_MODE': ('true', 'bool',
-                     'How Save writes to the output folder. ON = copy: the originals '
-                     'stay exactly where they are and a second copy is written to the '
-                     'output folder, so your input library is never touched (uses twice '
-                     'the disk space). OFF = move: the files are moved out of the input '
-                     'folder into the output folder and the input copy is gone - faster, '
-                     'instant on the same drive, and no duplicated data, but the only '
-                     'way back is Undo. Either way the files are renamed and foldered '
-                     'by the templates below.'),
+                     'Copy books to the output folder instead of moving them.'),
     'AO_OUTPUT_TEMPLATE': ('{author}/{series} {series_index:02d} - {title}', 'str',
-                           'Destination folder. Placeholders: {author} {series} '
-                           '{series_index} {title}. Empty fields collapse gracefully.'),
+                           'Folder naming pattern for organised books.'),
     'AO_RENAME_FILES': ('true', 'bool',
-                        'Rename the audio files themselves to match the file template '
-                        'below. Off means the files keep their original names and only '
-                        'the folders are organised.'),
+                        'Rename audio files using the file naming pattern.'),
     'AO_FILE_TEMPLATE': ('{series} {series_index:02d} - {title} {file_index:03d}', 'str',
-                         'Name given to each audio file when renaming is on. '
-                         'Placeholders: {author} {series} {series_index} (or {index}) '
-                         '{title} {file_index} {extension}. Any number takes a format '
-                         'spec: {series_index:02d} pads to two digits, '
-                         '{file_index:03d} to three. Empty fields collapse without '
-                         'leaving gaps, and the real file extension is appended if '
-                         'the template does not end in one.'),
+                         'Naming pattern for audio files.'),
     'AO_RENAME_SUPPORT_FILES': ('true', 'bool',
-                                'Rename every non-audio file that travels with the '
-                                'book - cover art, .epub, .pdf, .nfo, .cue, .txt - to '
-                                'the same name as the audio. A file is only renamed '
-                                'when it is the only one of its extension in the '
-                                'output folder, because two .jpgs renamed to one stem '
-                                'would collide.'),
+                                'Rename companion files to match the audio files.'),
     'AO_COLLISION_POLICY': ('suffix', 'choice:suffix|skip|merge|overwrite',
                             'What to do when the destination already exists.'),
     'AO_ILLEGAL_CHARS': ('smart', 'choice:smart|dash|underscore|space|remove',
-                         'How characters that a book title may contain but a filename '
-                         'may not are replaced.\n'
-                         'Smart - a look-alike per character:  :  becomes " -",  /  '
-                         'and  \\  and  |  become "-",  <  >  become "(" ")",  "  '
-                         'becomes \',  *  becomes +,  ?  is dropped.  '
-                         '"Who Goes There? Vol 2: Rising" becomes '
-                         '"Who Goes There Vol 2 - Rising".\n'
-                         'Dash - every one of  < > : " / \\ | ? *  becomes "-":  '
-                         '"Who Goes There- Vol 2- Rising".\n'
-                         'Underscore - all of them become "_".  '
-                         'Space - all of them become " ".  '
-                         'Remove - all of them are deleted:  '
-                         '"Who Goes There Vol 2 Rising".'),
+                         'How unsupported filename characters are replaced.'),
     'AO_WARN_DIRTY_OUTPUT': ('true', 'bool',
-                             'Flag values that look like a scrape went wrong - an '
-                             'unclosed bracket, stray punctuation, HTML entities, an '
-                             'author in ALL CAPS - and lower the confidence of the '
-                             'fields involved so they surface for review instead of '
-                             'being applied silently.'),
-    'AO_WRITE_TAGS': ('true', 'bool', 'Write corrected metadata back into the audio files.'),
-    'AO_WRITE_SIDECAR': ('false', 'bool', 'Write metadata.json + .opf next to the book.'),
+                             'Flag suspicious metadata for review.'),
+    'AO_WRITE_TAGS': ('true', 'bool', 'Write corrected metadata into audio files.'),
+    'AO_WRITE_SIDECAR': ('false', 'bool', 'Write metadata sidecar files.'),
 
     # --- interface
     'AO_UI_DENSITY': ('normal', 'choice:compact|normal|comfortable',
-                      'Row height in the review table. Compact hides cover art.'),
+                      'Review table row height.'),
     'AO_UI_ICON_SIZE': ('large', 'choice:compact|normal|comfortable|large',
-                        'Size of the toolbar buttons. "Large" is half again bigger '
-                        'than comfortable, icon included.'),
+                        'Toolbar button size.'),
     'AO_UI_TOOLBAR_LABELS': ('true', 'bool',
                              'Show each button name underneath its icon.'),
     'AO_UI_COLOR_BY_SOURCE': ('true', 'bool',
-                              'Tint each field by which source produced it. Off by '
-                              'default: an approved row reads green throughout, and '
-                              'mixing per-field hues into that hides the decision.'),
+                              'Colour fields by their identification source.'),
     'AO_UI_SHOW_COVERS': ('true', 'bool', 'Show cover art in the review table.'),
     'AO_UI_STATUS_STRIPE': ('true', 'bool',
                             'Mark each row with a colour stripe for its review status.'),
     'AO_UI_ROW_TINT': ('true', 'bool',
-                       'Also wash the whole row in its status colour. Loud, and off '
-                       'by default - the stripe and the status pill already say it.'),
+                       'Tint each row with its review status colour.'),
     'AO_UI_CONFIDENCE_COLOR': ('true', 'bool',
-                               'Colour the confidence bar by how confident we are - '
-                               'red below 50%, amber below 80%, green above. Off draws '
-                               'it in neutral grey.'),
+                               'Colour confidence as red, amber or green.'),
+    'AO_UI_CONFIDENT_THRESHOLD': ('0.80', 'percent',
+                                  'Minimum confidence shown in green.'),
+    'AO_UI_DOUBTFUL_THRESHOLD': ('0.50', 'percent',
+                                 'Confidence below this value is shown in red.'),
     'AO_UI_COPY_RECENTS': ('1', 'int',
-                           'How many recently-used copy actions to list directly in the '
-                           'right-click menu, above the "Copy..." submenu. 0 shows none. '
-                           'Set it to the number of copy actions or higher and they are '
-                           'all listed, and the submenu disappears.'),
+                           'Recent copy actions shown directly in the right-click menu.'),
     'AO_UI_SHOW_FILTERS': ('true', 'bool', 'Show the filter and search bar.'),
     'AO_UI_SHOW_PANEL': ('true', 'bool',
-                         'Show the panel explaining how the selected row was identified.'),
+                         'Show identification details for the selected row.'),
     'AO_UI_HIDDEN_COLUMNS': ('', 'str',
-                             'Columns hidden in the review table. Right-click the '
-                             'table header to change this.'),
+                             'Columns hidden in the review table.'),
     'AO_UI_RESORT_LIVE': ('false', 'bool',
-                          'Re-sort the table as values change. Off by default: rows '
-                          'jumping to a new position the moment you approve them '
-                          'loses your place. Rows move on sort, rescan or restart.'),
+                          'Re-sort the table whenever values change.'),
     'AO_UI_ADVANCE_AFTER_DECISION': ('true', 'bool',
-                                     'Move to the next row after approving or '
-                                     'rejecting, so reviewing flows without the mouse.'),
+                                     'Select the next row after approving or rejecting.'),
     'AO_UI_CONFIRM_APPLY': ('true', 'bool',
-                            'Ask for confirmation before applying to the filesystem.'),
+                            'Ask for confirmation before saving files.'),
     'AO_UI_REMEMBER_LAYOUT': ('true', 'bool',
                               'Reopen with the last window size and panel split.'),
-    'AO_UI_WINDOW': ('', 'str', 'Saved window size and split position.'),
-    'AO_UI_COLUMN_WIDTHS': ('', 'str', 'Saved review-table column widths.'),
-    'AO_UI_COPY_RECENT_LIST': ('', 'str', 'Recently used copy actions, most recent first.'),
+    'AO_UI_WINDOW': ('', 'str', 'Saved window layout.'),
+    'AO_UI_COLUMN_WIDTHS': ('', 'str', 'Saved table column widths.'),
+    'AO_UI_COPY_RECENT_LIST': ('', 'str', 'Recently used copy actions.'),
 
     # --- chapter merging (the modal remembers what you chose last time)
     'AO_MERGE_TEMPLATE': ('{series} {series_index:02d} - {title}', 'str',
-                          'Name pattern for a merged .m4b. Empty falls back to the '
-                          'file template on the Output tab.'),
+                          'Naming pattern for merged books.'),
     'AO_MERGE_IN_PLACE': ('true', 'bool',
-                          'Write the merged .m4b next to the chapter files. Off writes '
-                          'it into the output folder instead.'),
+                          'Write merged books beside their chapter files.'),
     'AO_MERGE_DELETE_ORIGINALS': ('false', 'bool',
-                                  'Delete the chapter files once the merge succeeded.'),
+                                  'Delete chapter files after a successful merge.'),
     'AO_MERGE_BITRATE': ('same', 'choice:same|320k|256k|192k|128k|96k|64k|32k',
-                         'Bitrate for a merged .m4b. "Same" reads the bitrate of the '
-                         'chapter files and encodes at that, so a merge never throws '
-                         'quality away - it is the right answer almost always. The '
-                         'fixed rates re-encode to that number whatever the source '
-                         'was; 64k is the usual choice for spoken word.'),
+                         'Audio bitrate for merged books.'),
     'AO_MERGE_REPLACE_ENTRY': ('true', 'bool',
-                               'Point the library entry at the merged .m4b afterwards, '
-                               'so it is treated as a single-file book.'),
+                               'Replace the chapter entry with the merged book.'),
     'AO_MERGE_OVERWRITE': ('false', 'bool',
-                           'Overwrite an existing .m4b of the same name instead of '
-                           'appending " (2)" to the new one.'),
+                           'Overwrite an existing merged book with the same name.'),
     'AO_TOOLBAR': ('scan,sources,identify,|,approve,reject,reset,|,'
                    'goodreads,preview,apply,undo,|,settings', 'str',
-                   'Toolbar buttons in display order; "|" is a separator. '
-                   'Anything left out is hidden. Edit this on the Toolbar tab.'),
+                   'Saved toolbar layout.'),
 
     # --- misc
     'AO_FFMPEG_PATH': ('ffmpeg', 'str',
-                       'Path to the ffmpeg executable. Only needed for "Merge chapters '
-                       'into one .m4b" in the right-click menu; leave it as "ffmpeg" if '
-                       'ffmpeg is on your PATH.'),
-    'AO_LOG_LEVEL': ('DEBUG', 'choice:DEBUG|INFO|WARNING|ERROR', 'Console log verbosity.'),
-    'AO_THREADS': ('4', 'int', 'Parallel workers for lookups.'),
+                       'ffmpeg executable used for chapter merging.'),
+    'AO_LOG_LEVEL': ('DEBUG', 'choice:DEBUG|INFO|WARNING|ERROR', 'Log detail level.'),
+    'AO_THREADS': ('4', 'int', 'Maximum number of parallel jobs.'),
 }
 
 # Providers are stored flat so they fit .env:

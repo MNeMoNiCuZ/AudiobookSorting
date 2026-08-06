@@ -1,8 +1,10 @@
-"""One layout, rendered for both .env and .env.example.
+"""One layout, for the one file it renders: the .env a fresh install writes itself.
 
-The point of scripts.env_layout is that there is no second structure to drift: a
-fresh install's .env and the committed example come out of the same table. These
-tests hold that line, and hold the committed example to being key-free.
+There is no committed .env.example. The app generates its own .env from the built-in
+defaults on first run, so a checked-in copy of that same output was a second file to
+keep in step and nothing else - and these tests are what used to demand it existed.
+They now hold the generated file to the same standards: every setting present, every
+value the built-in default, no credential and no private address anywhere in it.
 """
 
 from __future__ import annotations
@@ -13,13 +15,19 @@ import pytest
 
 from scripts import env_layout
 from scripts.env_layout import (SECTIONS, is_credential, layout_keys, relayout_env,
-                                render, render_example)
-from scripts.paths import PROJECT_ROOT
+                                render)
 from scripts.settings import SCHEMA, Settings, _unquote
 
-EXAMPLE = PROJECT_ROOT / '.env.example'
 
-# Written by the app as the window is used; not seeded by hand, so not in the example.
+@pytest.fixture
+def generated(tmp_path):
+    """The .env a fresh install writes for itself, as text."""
+    target = tmp_path / '.env'
+    Settings(env_path=target).ensure_file()
+    return target.read_text(encoding='utf-8')
+
+
+# Written by the app as the window is used; not seeded by hand, so not in a fresh file.
 MACHINE_WRITTEN = {'AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS', 'AO_UI_HIDDEN_COLUMNS',
                    'AO_UI_COPY_RECENT_LIST', 'AO_UI_GRID_WINDOW', 'AO_UI_GRID_COLUMNS'}
 
@@ -58,40 +66,34 @@ def test_max_tokens_is_not_mistaken_for_a_secret():
     assert is_credential('AO_PROVIDER_OPENAI_API_KEY')
 
 
-# ------------------------------------------------------------ the committed example
+# ------------------------------------------------------- the file a fresh install gets
 
-def test_example_is_in_sync_with_the_layout():
-    """The file is generated. If this fails, run `python -m scripts.env_layout`."""
-    assert EXAMPLE.read_text(encoding='utf-8') == render_example(), (
-        '.env.example is stale - regenerate it with `python -m scripts.env_layout`')
-
-
-def test_example_carries_no_credentials():
-    leaked = {k: v for k, v in _assignments(EXAMPLE.read_text(encoding='utf-8'))
+def test_a_fresh_env_carries_no_credentials(generated):
+    """Nothing that authenticates is ever written by the generator."""
+    leaked = {k: v for k, v in _assignments(generated)
               if is_credential(k) and _unquote(v)}
-    assert not leaked, f'.env.example contains real credentials: {sorted(leaked)}'
+    assert not leaked, f'a generated .env contains credentials: {sorted(leaked)}'
 
 
-def test_example_leaks_no_private_addresses():
-    text = EXAMPLE.read_text(encoding='utf-8')
-    assert not re.search(r'\b(?:192\.168|10)\.\d+\.\d+', text)
+def test_a_fresh_env_leaks_no_private_addresses(generated):
+    """A LAN address baked into a default would ship one person's network to everyone."""
+    assert not re.search(r'(?:192\.168|10)\.\d+\.\d+', generated)
 
 
-def test_example_documents_every_setting():
-    documented = {k for k, _ in _assignments(EXAMPLE.read_text(encoding='utf-8'))}
+def test_a_fresh_env_documents_every_setting(generated):
+    documented = {k for k, _ in _assignments(generated)}
     assert not set(SCHEMA) - documented - MACHINE_WRITTEN
 
 
-def test_example_values_are_the_built_in_defaults():
-    wrong = {k: (_unquote(v), SCHEMA[k][0])
-             for k, v in _assignments(EXAMPLE.read_text(encoding='utf-8'))
+def test_a_fresh_env_holds_the_built_in_defaults(generated):
+    wrong = {k: (_unquote(v), SCHEMA[k][0]) for k, v in _assignments(generated)
              if k in SCHEMA and not is_credential(k) and _unquote(v) != SCHEMA[k][0]}
-    assert not wrong, f'example disagrees with the built-in default: {wrong}'
+    assert not wrong, f'generated .env disagrees with the built-in default: {wrong}'
 
 
-def test_example_loads_as_an_env_file(tmp_path):
-    target = tmp_path / '.env'
-    target.write_text(EXAMPLE.read_text(encoding='utf-8'), encoding='utf-8')
+def test_a_fresh_env_loads_back(tmp_path, generated):
+    target = tmp_path / 'copy.env'
+    target.write_text(generated, encoding='utf-8')
     loaded = Settings(env_path=target)
     assert loaded.get('AO_PROVIDER') == SCHEMA['AO_PROVIDER'][0]
     # Quoted JSON is the value most likely to survive a round trip badly.

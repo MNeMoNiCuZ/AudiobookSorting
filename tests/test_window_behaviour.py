@@ -21,6 +21,7 @@ from PyQt6.QtTest import QTest                                        # noqa: E4
 from PyQt6.QtWidgets import QApplication                              # noqa: E402
 
 from scripts.gui.main_window import SHAPE_FILTERS, MainWindow         # noqa: E402
+from scripts.load_options import plan_load                            # noqa: E402
 from scripts.models import BookEntry, Field                           # noqa: E402
 
 
@@ -326,3 +327,421 @@ def test_a_long_status_message_cannot_crowd_out_cancel(window):
 
     rect = _toolbar_item_geometry(window, window.status_label)
     assert rect is not None and rect.width() <= 340
+
+
+# ------------------------------------------------------------- the stale-scan badge
+
+def _icon_bytes(action, size):
+    """The rendered pixels of an action's icon, so a badge can be seen rather than
+    assumed present because the code that draws it was called."""
+    image = action.icon().pixmap(size, size).toImage()
+    return image.constBits().asstring(image.sizeInBytes())
+
+
+def test_scan_badge_appears_when_the_input_folder_has_drifted(window, qt_app):
+    """A "!" is painted onto Scan - and really onto its pixels, not just recorded."""
+    action = window.tool_actions['scan']
+    size = window._icon_size()
+
+    window.set_scan_stale(None)
+    qt_app.processEvents()
+    clean = _icon_bytes(action, size)
+    assert 'input folder has changed' not in action.toolTip()
+
+    window.set_scan_stale({'added': 3, 'missing': 1, 'changed': 0})
+    qt_app.processEvents()
+    badged = _icon_bytes(action, size)
+
+    assert badged != clean, 'the badge changed nothing on screen'
+    assert '3 added' in action.toolTip()
+    assert '1 missing' in action.toolTip()
+
+    window.set_scan_stale(None)
+    qt_app.processEvents()
+    assert _icon_bytes(action, size) == clean, 'the badge did not come off again'
+
+
+def test_scan_badge_survives_a_toolbar_rebuild(window, qt_app):
+    """Rebuilding the toolbar makes fresh actions; the badge has to be put back."""
+    window.set_scan_stale({'added': 2, 'missing': 0, 'changed': 0})
+    window.refresh_toolbar()
+    qt_app.processEvents()
+
+    action = window.tool_actions['scan']
+    size = window._icon_size()
+    window_clean = MainWindow(window.settings)
+    try:
+        clean = _icon_bytes(window_clean.tool_actions['scan'], size)
+    finally:
+        window_clean.close()
+    assert _icon_bytes(action, size) != clean
+    assert '2 added' in action.toolTip()
+
+
+# ------------------------------------------------------------------- Load Input
+
+def _loaded(window, *entries):
+    window.set_entries(list(entries))
+    QApplication.processEvents()
+
+
+def test_loading_an_empty_list_asks_nothing(window, monkeypatch):
+    """There is nothing to lose, so there is no question worth putting on screen."""
+    from scripts.gui import load_dialog
+
+    monkeypatch.setattr(load_dialog.LoadInputDialog, 'exec',
+                        lambda self: pytest.fail('a dialog for an empty list'))
+    seen = []
+    window.load_requested.connect(lambda targets, keep: seen.append((targets, keep)))
+
+    window._request_load()
+
+    assert len(seen) == 1
+    targets, keep = seen[0]
+    assert targets is None and keep.keeps_everything()
+
+
+def test_loading_over_work_asks_what_to_keep(window, monkeypatch):
+    """The one question a load has - and it is only asked when it is a real one."""
+    from PyQt6.QtWidgets import QDialog
+
+    from scripts.gui import load_dialog
+
+    _loaded(window, BookEntry(entry_id='a', title=Field(value='Typed', source='user',
+                                                        confidence=1.0)))
+    monkeypatch.setattr(load_dialog.LoadInputDialog, 'exec',
+                        lambda self: QDialog.DialogCode.Accepted)
+    seen = []
+    window.load_requested.connect(lambda targets, keep: seen.append((targets, keep)))
+
+    window._request_load()
+
+    assert len(seen) == 1
+    targets, keep = seen[0]
+    assert targets is None, 'no selection means the whole input folder'
+    assert keep.manual is True
+
+
+def test_the_load_dialog_defaults_to_the_selection(qt_app, settings):
+    """Selecting rows says which books you mean, so the dialog starts there."""
+    from scripts.gui.load_dialog import LoadInputDialog
+
+    books = [BookEntry(entry_id=str(i)) for i in range(4)]
+    dialog = LoadInputDialog(books, books[:2], settings)
+
+    assert dialog.scope_selected.isChecked()
+    assert len(dialog.scope()) == 2
+
+    assert LoadInputDialog(books, [], settings).scope() is None, 'no selection, no scope'
+
+
+def test_a_fresh_load_dialog_keeps_only_what_you_typed(qt_app, tmp_path):
+    """Out of the box a load re-reads the folder; only your own edits are protected."""
+    from scripts.gui.load_dialog import LoadInputDialog
+    from scripts.settings import Settings
+
+    dialog = LoadInputDialog([BookEntry(entry_id='a')], [], Settings(tmp_path / '.env'))
+
+    assert dialog.keep_manual.isChecked()
+    assert not dialog.keep_confident.isChecked()
+    assert not dialog.keep_decisions.isChecked()
+    keep = dialog.keep_options()
+    assert keep.manual and keep.above > 100 and not keep.decisions
+
+
+def test_the_load_button_is_never_painted_as_a_danger(qt_app, settings):
+    """Red next to Cancel reads as a second Cancel - the summary says what is lost."""
+    from scripts.gui.load_dialog import LoadInputDialog
+
+    losing = BookEntry(entry_id='a', title=Field(value='Guessed', source='api',
+                                                 confidence=0.2))
+    dialog = LoadInputDialog([losing], [], settings)
+
+    assert dialog.go.property('danger') in (None, False)
+    assert 'RESET' in dialog.summary.text(), 'the loss is still spelled out'
+
+
+def test_the_summary_counts_each_field_separately(qt_app, settings):
+    """"31 values cleared" is not actionable; "every series number goes" is."""
+    from scripts.gui.load_dialog import LoadInputDialog
+
+    books = [BookEntry(entry_id=str(i),
+                       author=Field(value='Sanderson', source='api', confidence=0.9),
+                       series=Field(value='Mistborn', source='regex', confidence=0.4))
+             for i in range(3)]
+    dialog = LoadInputDialog(books, [], settings)
+    dialog.keep_confident.setChecked(True)
+    dialog.threshold.setValue(75)
+
+    plan = plan_load(books, dialog.keep_options())
+    assert (plan.tally('author').kept, plan.tally('author').cleared) == (3, 0)
+    assert (plan.tally('series').kept, plan.tally('series').cleared) == (0, 3)
+
+    text = dialog.summary.text()
+    assert 'Series #' in text and 'Author' in text
+    # The two sentences that said nothing worth reading are gone.
+    assert 'Loading' not in text and 'tags and filenames' not in text
+
+
+def test_the_load_dialog_remembers_what_you_ticked(qt_app, tmp_path):
+    from scripts.gui.load_dialog import LoadInputDialog
+    from scripts.settings import Settings
+
+    config = Settings(tmp_path / '.env')
+    dialog = LoadInputDialog([BookEntry(entry_id='a')], [], config)
+    dialog.keep_decisions.setChecked(True)
+    dialog.remember()
+
+    assert Settings(tmp_path / '.env').get_bool('AO_LOAD_KEEP_DECISIONS') is True
+
+
+def test_cancelling_the_load_dialog_loads_nothing(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+
+    from scripts.gui import load_dialog
+
+    _loaded(window, BookEntry(entry_id='a'))
+    monkeypatch.setattr(load_dialog.LoadInputDialog, 'exec',
+                        lambda self: QDialog.DialogCode.Rejected)
+    seen = []
+    window.load_requested.connect(lambda *a: seen.append(a))
+
+    window._request_load()
+
+    assert not seen
+
+
+def test_right_clicking_load_offers_the_scope_and_the_folder(window, monkeypatch):
+    from PyQt6.QtWidgets import QMenu
+
+    shown = []
+    monkeypatch.setattr(QMenu, 'exec',
+                        lambda self, *a: shown.append([x.text() for x in self.actions()]))
+    _loaded(window, BookEntry(entry_id='a'), BookEntry(entry_id='b'))
+    window.table.selectRow(0)
+
+    window._show_load_menu()
+
+    assert len(shown) == 1
+    menu = shown[0]
+    assert menu[0] == 'Load the whole input folder'
+    assert menu[1] == 'Load only the 1 selected book'
+    assert 'Choose input folder...' in menu
+
+
+def test_the_load_menu_drops_the_selected_entry_when_nothing_is_selected(
+        window, monkeypatch):
+    """A menu lists what you can do right now - nothing greyed out, nothing lying."""
+    from PyQt6.QtWidgets import QMenu
+
+    shown = []
+    monkeypatch.setattr(QMenu, 'exec',
+                        lambda self, *a: shown.append([x.text() for x in self.actions()]))
+    _loaded(window, BookEntry(entry_id='a'))
+    window.table.clearSelection()
+
+    window._show_load_menu()
+
+    assert not any('selected' in text for text in shown[0])
+
+
+def test_changing_the_input_folder_badges_the_button(window, qt_app):
+    """The one kind of staleness no file comparison can find."""
+    action = window.tool_actions['scan']
+    size = window._icon_size()
+
+    window.set_input_folder_changed(None)
+    qt_app.processEvents()
+    clean = _icon_bytes(action, size)
+
+    window.set_input_folder_changed('D:/Audiobooks/Old')
+    qt_app.processEvents()
+
+    assert _icon_bytes(action, size) != clean, 'the badge changed nothing on screen'
+    assert 'D:/Audiobooks/Old' in action.toolTip()
+
+    window.set_input_folder_changed(None)
+    qt_app.processEvents()
+    assert _icon_bytes(action, size) == clean, 'the badge did not come off again'
+
+
+def test_unsaved_rows_light_up_and_then_stop(window, qt_app):
+    """Highlighted really means painted: the row carries the tint, the others do not."""
+    from scripts.gui.delegates import ROLE_FLASH
+    from scripts.gui.main_window import COL_TITLE
+
+    typed = BookEntry(entry_id='typed', folder='/library/typed',
+                      title=Field(value='Typed', source='user', confidence=1.0))
+    found = BookEntry(entry_id='found', folder='/library/found',
+                      title=Field(value='Found', source='audnexus', confidence=0.9))
+    _loaded(window, typed, found)
+
+    window.flash_unsaved(seconds=10)
+    qt_app.processEvents()
+
+    lit = {window.row_ids[row]: window.table.item(row, COL_TITLE).data(ROLE_FLASH)
+           for row in range(window.table.rowCount())}
+    assert lit['typed'], 'the unsaved row was not highlighted'
+    assert not lit['found'], 'a row with nothing waiting was highlighted'
+    assert 'unsaved changes' in window._status_text
+
+    # Run it out: the highlight is temporary, and has to actually come off.
+    window._flash_left = 0.01
+    window._tick_flash()
+    qt_app.processEvents()
+    assert not window.table.item(0, COL_TITLE).data(ROLE_FLASH)
+    assert not window._flash_timer.isActive()
+
+
+# ------------------------------------------------ confidence review thresholds
+
+def _identified(entry_id, confidence, status='pending'):
+    return BookEntry(
+        entry_id=entry_id, folder=f'/library/{entry_id}', status=status,
+        author=Field(value='Author', source='test', confidence=confidence),
+        title=Field(value='Title', source='test', confidence=confidence))
+
+
+def test_confidence_setting_is_not_on_the_main_filter_row(window):
+    assert not hasattr(window, 'confidence_score')
+
+
+def test_confidence_bands_do_not_replace_the_review_status(window):
+    from scripts.gui.delegates import ROLE_STATUS
+
+    settings = window.settings
+    settings.set('AO_UI_CONFIDENT_THRESHOLD', '0.85')
+    settings.set('AO_UI_DOUBTFUL_THRESHOLD', '0.45')
+    books = [_identified('green', 0.90), _identified('amber', 0.60),
+             _identified('red', 0.30)]
+    _loaded(window, *books)
+
+    for row in range(window.table.rowCount()):
+        assert window.table.item(row, 7).text() == 'Pending'
+        assert window.table.item(row, 0).data(ROLE_STATUS) == 'pending'
+
+
+def test_status_filter_lists_review_statuses_not_confidence_bands(window):
+    items = [window.status_filter.itemText(index)
+             for index in range(window.status_filter.count())]
+    assert items == ['All statuses', 'Pending', 'Approved', 'Rejected', 'Unsure',
+                     'Applied', 'Duplicate']
+
+
+def test_unsure_rows_have_no_status_background_tint():
+    from scripts.gui.theme import BG_BASE, STATUS_COLORS
+
+    assert STATUS_COLORS['risky'] == BG_BASE
+
+
+def test_confidence_filter_lists_coloured_bands_and_custom(window):
+    items = [window.confidence_filter.itemText(index)
+             for index in range(window.confidence_filter.count())]
+    assert items == ['Any confidence', 'Confident', 'Unsure', 'Doubtful',
+                     'Custom threshold...']
+    for index in (1, 2, 3):
+        assert window.confidence_filter.itemData(
+            index, Qt.ItemDataRole.ForegroundRole) is not None
+
+
+def test_confidence_filter_uses_the_configured_band_boundaries(window):
+    window.settings.set('AO_UI_CONFIDENT_THRESHOLD', '0.80')
+    window.settings.set('AO_UI_DOUBTFUL_THRESHOLD', '0.50')
+    books = [_identified('high', 0.90), _identified('middle', 0.60),
+             _identified('low', 0.30)]
+    _loaded(window, *books)
+
+    expected = {'Confident': {'high'}, 'Unsure': {'middle'}, 'Doubtful': {'low'}}
+    for label, visible in expected.items():
+        window.confidence_filter.setCurrentText(label)
+        window._apply_filters()
+        shown = {window._entry_at(row).entry_id
+                 for row in range(window.table.rowCount())
+                 if not window.table.isRowHidden(row)}
+        assert shown == visible
+
+
+def test_completeness_filter_has_extra_closed_width(window):
+    text_width = window.missing_filter.fontMetrics().horizontalAdvance(
+        'Any completeness')
+    assert window.missing_filter.minimumWidth() >= text_width + 20
+
+
+def test_threshold_actions_only_change_matching_undecided_rows(window):
+    books = [_identified('high', 0.90), _identified('middle', 0.60),
+             _identified('low', 0.30), _identified('decided', 0.95, 'rejected')]
+    _loaded(window, *books)
+
+    window._apply_review_threshold('approve', 80)
+    window._apply_review_threshold('reject', 50)
+
+    assert books[0].status == 'approved'
+    assert books[1].status == 'pending'
+    assert books[2].status == 'rejected'
+    assert books[3].status == 'rejected'
+
+
+def test_middle_click_runs_the_saved_threshold(window, qt_app):
+    window.settings.set('AO_REVIEW_APPROVE_THRESHOLD', '0.80')
+    high = _identified('high', 0.90)
+    low = _identified('low', 0.40)
+    _loaded(window, high, low)
+    button = window.toolbar.widgetForAction(window.tool_actions['approve'])
+
+    QTest.mouseClick(button, Qt.MouseButton.MiddleButton, pos=QPoint(5, 5))
+    qt_app.processEvents()
+
+    assert high.status == 'approved'
+    assert low.status == 'pending'
+
+
+def test_blank_saved_threshold_disables_middle_click(window, qt_app):
+    window.settings.set('AO_REVIEW_APPROVE_THRESHOLD', '')
+    high = _identified('high', 0.90)
+    _loaded(window, high)
+    button = window.toolbar.widgetForAction(window.tool_actions['approve'])
+
+    QTest.mouseClick(button, Qt.MouseButton.MiddleButton, pos=QPoint(5, 5))
+    qt_app.processEvents()
+
+    assert high.status == 'pending'
+    assert 'Disabled in Settings' in window.tool_actions['approve'].toolTip()
+
+
+def test_legacy_auto_approve_setting_no_longer_approves_during_identification(settings):
+    from scripts.resolver import Resolver
+
+    settings.set('AO_AUTO_APPROVE_THRESHOLD', '0.80')
+    book = _identified('high', 0.95)
+
+    Resolver(settings)._finalise(book)
+
+    assert book.status == 'pending'
+
+
+def test_review_button_menu_has_saved_and_custom_entries(window, monkeypatch):
+    from PyQt6.QtWidgets import QMenu
+
+    shown = []
+    monkeypatch.setattr(
+        QMenu, 'exec',
+        lambda self, *args: shown.append(
+            [(action.text(), action.toolTip()) for action in self.actions()]))
+    window.settings.set('AO_REVIEW_REJECT_THRESHOLD', '0.45')
+    _loaded(window, _identified('book', 0.40))
+    button = window.toolbar.widgetForAction(window.tool_actions['reject'])
+
+    window._show_review_threshold_menu('reject', button)
+
+    assert [text for text, _tip in shown[0]] == [
+        'Decline under 45%', 'Decline under...']
+    assert all(tip for _text, tip in shown[0])
+
+
+def test_review_button_tooltips_explain_all_three_mouse_buttons(window):
+    _loaded(window, _identified('book', 0.90))
+    for key in ('approve', 'reject'):
+        tooltip = window.tool_actions[key].toolTip()
+        assert 'LMB:' in tooltip
+        assert 'MMB:' in tooltip
+        assert 'RMB:' in tooltip

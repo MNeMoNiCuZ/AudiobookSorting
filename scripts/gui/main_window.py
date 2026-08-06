@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from PyQt6.QtCore import QEvent, QObject, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import (QAction, QColor, QFont, QIntValidator, QKeySequence,
+from PyQt6.QtGui import (QAction, QColor, QFont, QKeySequence,
                          QPixmap, QShortcut)
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView,
@@ -34,17 +34,17 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import (IDENTITY_FIELDS, STATUS_APPROVED, STATUS_PENDING,
-                      STATUS_REJECTED, BookEntry, pretty_status)
+                      STATUS_REJECTED, STATUS_RISKY, BookEntry, pretty_status)
 from .delegates import (KIND_CONFIDENCE, KIND_COVER, KIND_FILES, KIND_STATUS,
-                        ROLE_CONFIDENCE, ROLE_ENTRY_ID, ROLE_KIND, ROLE_PROGRESS,
-                        ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
+                        ROLE_CONFIDENCE, ROLE_ENTRY_ID, ROLE_FLASH, ROLE_KIND,
+                        ROLE_PROGRESS, ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
                         ReviewDelegate)
 from .cover_viewer import CoverViewer
 from .icons import badged_icon
 from .icons import icon as make_icon
 from .queue_dialog import plural
-from .theme import (ACCENT, ACCENT_DARK, BG_RAISED, ROW_HEIGHTS, STATUS_TEXT, TEXT,
-                    TEXT_DIM, TEXT_FAINT, source_color)
+from .theme import (ACCENT, ACCENT_DARK, BG_RAISED, CONFIDENCE_HUES, ROW_HEIGHTS,
+                    STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT, source_color)
 from .toolbar import ITEMS_BY_KEY, SEPARATOR, parse_layout
 from .why_panel import WhyPanel
 
@@ -184,9 +184,11 @@ class _KeyedItem(QTableWidgetItem):
 class _RightClickFilter(QObject):
     """Turns a right-click on one widget into a call, whatever Qt calls the event."""
 
-    def __init__(self, parent, handler: Callable[[], None]):
+    def __init__(self, parent, handler: Callable[[], None],
+                 middle_handler: Optional[Callable[[], None]] = None):
         super().__init__(parent)
         self._handler = handler
+        self._middle_handler = middle_handler
 
     def eventFilter(self, watched, event) -> bool:
         kind = event.type()
@@ -197,10 +199,19 @@ class _RightClickFilter(QObject):
                 and event.button() == Qt.MouseButton.RightButton):
             self._handler()
             return True
+        if (self._middle_handler is not None
+                and kind == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.MiddleButton):
+            self._middle_handler()
+            return True
         # The release is swallowed too, or the button sees an unmatched release and
         # repaints itself as still pressed.
         if (kind == QEvent.Type.MouseButtonRelease
                 and event.button() == Qt.MouseButton.RightButton):
+            return True
+        if (self._middle_handler is not None
+                and kind == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.MiddleButton):
             return True
         return super().eventFilter(watched, event)
 
@@ -243,7 +254,9 @@ class MainWindow(QMainWindow):
     """The review UI. All heavy work is delegated to the controller via signals."""
 
     # Emitted for the controller (main.py) to act on.
-    scan_requested = pyqtSignal()
+    # entries to load (None = the whole input folder), and a KeepOptions saying what
+    # survives. There is one load action, and this is it.
+    load_requested = pyqtSignal(object, object)
     resolve_requested = pyqtSignal(list, list)     # entries, tier names
     apply_requested = pyqtSignal(list, bool)       # entries, preview
     undo_requested = pyqtSignal(int)               # index into the pending journal
@@ -303,6 +316,18 @@ class MainWindow(QMainWindow):
         self._wanted_split: Optional[int] = None
         # Set by the controller: a WorkerManager.status() snapshot on demand.
         self.queue_provider: Callable[[], dict] = dict
+        # What compare_to_entries last reported, or None when the table is in step with
+        # the input folder. Drives the "!" on Load Input - see set_scan_stale.
+        self._scan_drift: Optional[dict] = None
+        # Set when the input folder setting itself changed: the list now describes a
+        # folder nobody is pointing at any more, which no file comparison can detect.
+        self._folder_changed_from: Optional[str] = None
+        # entry_id -> 0..1, the fading highlight on rows carrying unsaved work.
+        self._flash: Dict[str, float] = {}
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(120)
+        self._flash_timer.timeout.connect(self._tick_flash)
+        self._flash_left = 0.0
         self._last_progress = (0, 0, '')
         # entry_id -> (fraction 0..1, short label), for the bar drawn across a row
         # while a long job - a chapter merge - is working on that one book.
@@ -412,24 +437,19 @@ class MainWindow(QMainWindow):
         which = ' and '.join(missing)
         self.paths_banner_label.setText(
             f'<b>No {which} folder is set.</b>  '
-            + ('Nothing can be scanned or saved until both are chosen.'
+            + ('Nothing can be loaded or saved until both are chosen.'
                if len(missing) == 2 else
-               'Scanning has nothing to read.' if missing == ['input'] else
+               'Load Input has nothing to read.' if missing == ['input'] else
                'Saving has nowhere to write.'))
 
     def _build_filter_row(self) -> QHBoxLayout:
-        """Three zones: the filters on the left, the count centred, Confidence right.
-
-        The count is centred rather than right-aligned because it is not a control -
-        it is a readout, and parking it next to the Confidence field made two unrelated
-        numbers read as one pair. Confidence keeps the right-hand end to itself.
-        """
+        """Filters on the left and the matching-row count centred."""
         row = QHBoxLayout()
         row.setSpacing(6)
         row.setContentsMargins(0, 0, 0, 0)
 
         self.status_filter = self._filter_combo(
-            ['All statuses', 'Pending', 'Approved', 'Rejected', 'Risky', 'Applied',
+            ['All statuses', 'Pending', 'Approved', 'Rejected', 'Unsure', 'Applied',
              'Duplicate'],
             'Show only rows with this review status')
         row.addWidget(self.status_filter)
@@ -438,14 +458,20 @@ class MainWindow(QMainWindow):
             ['Any completeness', 'Missing any field', 'Missing author',
              'Missing series', 'Missing index', 'Missing title', 'Missing cover',
              'Has cover', 'Complete only'],
-            'Show only rows that are missing a given field or cover image')
+            'Show only rows that are missing a given field or cover image',
+            minimum_extra=20)
         row.addWidget(self.missing_filter)
 
         self.confidence_filter = self._filter_combo(
-            ['Any confidence', 'Below 50%', 'Below 80%', '80% and above',
+            ['Any confidence', 'Confident', 'Unsure', 'Doubtful',
              'Custom threshold...'],
-            'Show only rows whose overall identification confidence is in this range. '
+            'Show rows in a configured confidence colour band. '
             '"Custom threshold" asks for your own number.')
+        for index, colour in ((1, CONFIDENCE_HUES[0][1]),
+                              (2, CONFIDENCE_HUES[1][1]),
+                              (3, CONFIDENCE_HUES[2][1])):
+            self.confidence_filter.setItemData(
+                index, QColor(colour), Qt.ItemDataRole.ForegroundRole)
         self.confidence_filter.activated.connect(self._confidence_filter_chosen)
         row.addWidget(self.confidence_filter)
 
@@ -473,8 +499,8 @@ class MainWindow(QMainWindow):
         self.search_box.textChanged.connect(self._apply_filters)
         row.addWidget(self.search_box, stretch=2)
 
-        # Stretch, count, stretch: two equal springs put the readout in the middle of
-        # whatever space is left between the filters and the Confidence control.
+        # Stretch, count, stretch: two equal springs centre the readout in the space
+        # left by the filters.
         row.addStretch(1)
         self.count_label = QLabel('')
         self.count_label.setProperty('count', True)
@@ -483,59 +509,10 @@ class MainWindow(QMainWindow):
         row.addWidget(self.count_label)
         row.addStretch(1)
 
-        # Not a filter - the setting that decides when identification stops digging.
-        # It lives here because it is the number you actually adjust while working
-        # through a library, and burying it three tabs deep in Settings meant it was
-        # adjusted never. Bold, because it is the one thing on this row that changes
-        # what the program *does* rather than what it shows.
-        label = QLabel('Confidence')
-        label.setStyleSheet(f'color: {TEXT}; font-weight: 700; padding-right: 6px;')
-        row.addWidget(label)
-
-        self.confidence_score = QLineEdit()
-        self.confidence_score.setProperty('filter', True)
-        self.confidence_score.setFixedWidth(56)
-        self.confidence_score.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.confidence_score.setValidator(QIntValidator(0, 100, self.confidence_score))
-        tip = ('How sure an identification has to be before the tiers stop looking.\n'
-               'This is NOT a filter - it changes what identification does, not what\n'
-               'the table shows. Lower it to accept looser matches; raise it to keep\n'
-               'digging through more sources.')
-        self.confidence_score.setToolTip(tip)
-        label.setToolTip(tip)
-        self.confidence_score.editingFinished.connect(self._confidence_score_changed)
-        row.addWidget(self.confidence_score)
-
-        percent = QLabel('%')
-        # Same weight as its label - "Confidence" and "%" are one phrase with a box in
-        # the middle, so they cannot be two different weights. The padding is the
-        # right-hand margin of the whole row.
-        percent.setStyleSheet(f'color: {TEXT}; font-weight: 700; padding: 0 14px 0 3px;')
-        percent.setToolTip(tip)
-        row.addWidget(percent)
-        self._load_confidence_score()
         return row
 
-    def _load_confidence_score(self) -> None:
-        self.confidence_score.setText(
-            str(int(round(self.settings.get_float('AO_CONFIDENCE_SCORE', 0.8) * 100))))
-
-    def _confidence_score_changed(self) -> None:
-        """Write the threshold straight back to .env - it is a setting, not a filter."""
-        try:
-            percent = min(100, max(0, int(self.confidence_score.text().strip())))
-        except ValueError:
-            self._load_confidence_score()
-            return
-        self.settings.set('AO_CONFIDENCE_SCORE', str(round(percent / 100.0, 4)))
-        try:
-            self.settings.save()
-        except OSError as exc:
-            logger.warning('Could not save the confidence score: %s', exc)
-        self.settings_changed.emit()
-        self.show_message(f'Identification now stops at {percent}% confidence')
-
-    def _filter_combo(self, items: List[str], tooltip: str) -> QComboBox:
+    def _filter_combo(self, items: List[str], tooltip: str,
+                      minimum_extra: int = 0) -> QComboBox:
         """A filter drop-down that looks like one, and marks itself when it is on."""
         combo = QComboBox()
         combo.setProperty('filter', True)
@@ -548,6 +525,10 @@ class MainWindow(QMainWindow):
         combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         combo.setMinimumContentsLength(10)
+        if minimum_extra:
+            widest = max(combo.fontMetrics().horizontalAdvance(text) for text in items)
+            combo.setMinimumWidth(max(combo.sizeHint().width() + minimum_extra,
+                                      widest + 40))
         combo.view().setMinimumWidth(
             max(combo.fontMetrics().horizontalAdvance(text) for text in items) + 40)
         combo.currentIndexChanged.connect(
@@ -689,6 +670,10 @@ class MainWindow(QMainWindow):
         self.delegate.row_tint = get_bool('AO_UI_ROW_TINT', False)
         self.delegate.show_covers = get_bool('AO_UI_SHOW_COVERS', True)
         self.delegate.colour_confidence = get_bool('AO_UI_CONFIDENCE_COLOR', True)
+        self.delegate.confident_threshold = self.settings.get_float(
+            'AO_UI_CONFIDENT_THRESHOLD', 0.80)
+        self.delegate.doubtful_threshold = self.settings.get_float(
+            'AO_UI_DOUBTFUL_THRESHOLD', 0.50)
 
         density = self.settings.get('AO_UI_DENSITY') or 'normal'
         height = ROW_HEIGHTS.get(density, ROW_HEIGHTS['normal'])
@@ -904,7 +889,7 @@ class MainWindow(QMainWindow):
         self.toolbar.setToolButtonStyle(self._tool_button_style())
 
         handlers = {
-            'scan': self._request_scan,
+            'scan': lambda: self._request_load(),
             'identify': lambda: self._request_resolve(),
             'approve': lambda: self._set_status_selected(STATUS_APPROVED),
             'reject': lambda: self._set_status_selected(STATUS_REJECTED),
@@ -937,7 +922,10 @@ class MainWindow(QMainWindow):
 
             colour = tinted.get(key, ACCENT if key in accented else TEXT)
             action = QAction(make_icon(key, colour, icon), item.label, self)
-            action.setToolTip(f'{item.label}\n{item.tooltip}')
+            if key in ('approve', 'reject'):
+                action.setToolTip(self._review_button_tooltip(key))
+            else:
+                action.setToolTip(f'{item.label}\n{item.tooltip}')
             action.triggered.connect(handlers[key])
             self.toolbar.addAction(action)
             self.tool_actions[key] = action
@@ -954,10 +942,17 @@ class MainWindow(QMainWindow):
                 # The badge is painted onto this button's icon, so it has to be
                 # findable again when the queue changes.
                 self._watch_right_click(action, self.show_queue_window)
+            if key == 'scan':
+                # Same one action, scoped - plus the way to change which folder it
+                # reads. Left click is still the whole thing, so nothing moved.
+                self._watch_right_click(action, self._show_load_menu)
+            if key in ('approve', 'reject'):
+                self._watch_review_clicks(action, key)
 
         self._add_toolbar_status()
         self.refresh_action_states()
         self._refresh_identify_badge()
+        self._refresh_scan_badge()
         self._tighten_toolbar(icon)
         self.toolbar.setVisible(True)
         # The rebuild made fresh actions; re-apply whatever the running job implies.
@@ -1014,7 +1009,8 @@ class MainWindow(QMainWindow):
         work. The buttons that need a selection say so the same way, by being
         unavailable until there is one.
 
-        Scan, Sources and Settings are never disabled: they are how you get out of
+        Load Input, Sources and Settings are never disabled: they are how you get
+        out of
         the state where everything else is.
         """
         table = getattr(self, 'table', None)
@@ -1028,10 +1024,10 @@ class MainWindow(QMainWindow):
 
         available = {
             # Identify needs entries, not a selection - with none it identifies the
-            # lot, like Scan and Preview.
+            # lot, like Load Input and Preview.
             'identify': anything,
-            'approve': selected,
-            'reject': selected,
+            'approve': anything,
+            'reject': anything,
             'reset': selected,
             'goodreads': selected,
             # Preview needs no selection - with none it previews the lot - but it does
@@ -1041,12 +1037,12 @@ class MainWindow(QMainWindow):
             'undo': self.can_undo(),
         }
         reasons = {
-            'identify': 'Nothing has been scanned yet',
-            'approve': 'Select some rows first',
-            'reject': 'Select some rows first',
+            'identify': 'Nothing is loaded yet - press Ctrl+R',
+            'approve': 'Nothing is loaded yet',
+            'reject': 'Nothing is loaded yet',
             'reset': 'Select some rows first',
             'goodreads': 'Select some rows first',
-            'preview': 'Nothing has been scanned yet',
+            'preview': 'Nothing is loaded yet - press Ctrl+R',
             'apply': 'Nothing is approved yet - approve some rows first (F5)',
             'undo': 'Nothing to undo yet',
         }
@@ -1060,8 +1056,11 @@ class MainWindow(QMainWindow):
                 # place - _refresh_identify_badge, called immediately after this.
                 continue
             item = ITEMS_BY_KEY[key]
-            action.setToolTip(f'{item.label}\n{item.tooltip}' if enabled
-                              else f'{item.label}\n{reasons[key]}')
+            if enabled and key in ('approve', 'reject'):
+                action.setToolTip(self._review_button_tooltip(key))
+            else:
+                action.setToolTip(f'{item.label}\n{item.tooltip}' if enabled
+                                  else f'{item.label}\n{reasons[key]}')
 
     def _watch_right_click(self, target, handler: Callable[[], None]) -> None:
         """Call `handler` when `target` is right-clicked.
@@ -1087,6 +1086,111 @@ class MainWindow(QMainWindow):
         # Kept alive by the window: an event filter that is garbage-collected stops
         # filtering, silently, and the button goes back to doing nothing.
         self._right_click_filters.append(watcher)
+
+    def _watch_review_clicks(self, action: QAction, key: str) -> None:
+        """Give a review button its middle-click run and right-click menu."""
+        button = self.toolbar.widgetForAction(action)
+        if button is None:
+            return
+        button.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        watcher = _RightClickFilter(
+            button,
+            lambda: self._show_review_threshold_menu(key, button),
+            lambda: self._run_configured_review_threshold(key))
+        button.installEventFilter(watcher)
+        self._right_click_filters.append(watcher)
+
+    def _review_threshold(self, key: str) -> Optional[int]:
+        setting = ('AO_REVIEW_APPROVE_THRESHOLD' if key == 'approve'
+                   else 'AO_REVIEW_REJECT_THRESHOLD')
+        raw = self.settings.get(setting).strip()
+        if not raw:
+            return None
+        try:
+            return min(100, max(0, int(round(float(raw) * 100))))
+        except ValueError:
+            return None
+
+    def _review_button_tooltip(self, key: str) -> str:
+        percent = self._review_threshold(key)
+        if key == 'approve':
+            return ('Approve\nLMB: Approve selected\n'
+                    + (f'MMB: Approve over {percent}%\n' if percent is not None
+                       else 'MMB: Disabled in Settings\n')
+                    + 'RMB: Choose approve threshold')
+        return ('Reject\nLMB: Reject selected\n'
+                + (f'MMB: Decline under {percent}%\n' if percent is not None
+                   else 'MMB: Disabled in Settings\n')
+                + 'RMB: Choose decline threshold')
+
+    def _show_review_threshold_menu(self, key: str, button: QWidget) -> None:
+        percent = self._review_threshold(key)
+        verb = 'Approve over' if key == 'approve' else 'Decline under'
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        configured = menu.addAction(
+            f'{verb} {percent}%' if percent is not None
+            else f'{verb} saved threshold  (disabled)',
+            lambda: self._run_configured_review_threshold(key))
+        configured.setEnabled(percent is not None)
+        configured.setToolTip('Run the threshold saved in Settings' if percent is not None
+                              else 'Set a threshold in Settings to enable this')
+        custom = menu.addAction(
+            f'{verb}...', lambda: self._ask_review_threshold(key))
+        custom.setToolTip('Enter a threshold for this run')
+        menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _run_configured_review_threshold(self, key: str) -> None:
+        percent = self._review_threshold(key)
+        if percent is None:
+            self.show_message('Set this review threshold in Settings first')
+            return
+        self._apply_review_threshold(key, percent)
+
+    def _ask_review_threshold(self, key: str) -> None:
+        setting = ('AO_UI_LAST_APPROVE_THRESHOLD' if key == 'approve'
+                   else 'AO_UI_LAST_REJECT_THRESHOLD')
+        configured = self._review_threshold(key)
+        fallback = 80 if key == 'approve' else 50
+        default = self.settings.get_int(
+            setting, configured if configured is not None else fallback)
+        verb = 'Approve over' if key == 'approve' else 'Decline under'
+        percent, accepted = QInputDialog.getInt(
+            self, f'{verb} threshold', f'{verb}:', default, 0, 100, 1)
+        if not accepted:
+            return
+        self.settings.set(setting, percent)
+        try:
+            self.settings.save()
+        except OSError as exc:
+            logger.warning('Could not save the last review threshold: %s', exc)
+        self._apply_review_threshold(key, percent)
+
+    def _apply_review_threshold(self, key: str, percent: int) -> None:
+        threshold = percent / 100.0
+        candidates = [entry for entry in self.entries.values()
+                      if entry.status in (STATUS_PENDING, STATUS_RISKY)]
+        if key == 'approve':
+            matches = [entry for entry in candidates
+                       if entry.is_complete() and entry.confidence() >= threshold]
+            status = STATUS_APPROVED
+            description = f'at or above {percent}%'
+        else:
+            matches = [entry for entry in candidates
+                       if entry.confidence() < threshold]
+            status = STATUS_REJECTED
+            description = f'below {percent}%'
+        for entry in matches:
+            entry.status = status
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+        self._apply_filters()
+        self.refresh_stats()
+        self.show_message(
+            f'{len(matches)} entr{"y" if len(matches) == 1 else "ies"} '
+            f'{"approved" if key == "approve" else "rejected"} {description}')
 
     def _tighten_toolbar(self, _icon: int) -> None:
         """Take the dead space out of the toolbar row.
@@ -1282,7 +1386,7 @@ class MainWindow(QMainWindow):
             ('F7', lambda: self._request_apply(preview=True)),
             ('F8', lambda: self._set_status_selected(STATUS_PENDING)),
             ('F12', self.settings_requested.emit),
-            ('Ctrl+R', self._request_scan),
+            ('Ctrl+R', lambda: self._request_load()),
             ('Ctrl+Z', self._undo_last),
             ('Ctrl+Y', self._redo_last),
             ('Ctrl+Shift+Z', self._redo_last),
@@ -1365,7 +1469,7 @@ class MainWindow(QMainWindow):
         self._updating = True
         # Writing into a sorted table makes Qt re-sort on the spot, so approving one
         # row teleports it somewhere else in the list mid-review. Rows only move when
-        # you sort, rescan, or reopen - unless you ask for live re-sorting.
+        # you sort, load, or reopen - unless you ask for live re-sorting.
         resort = self.settings.get_bool('AO_UI_RESORT_LIVE', False)
         was_sorting = self.table.isSortingEnabled()
         if not resort:
@@ -1431,9 +1535,9 @@ class MainWindow(QMainWindow):
         status = QTableWidgetItem(pretty_status(entry.status))
         status.setData(ROLE_KIND, KIND_STATUS)
         status.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        status.setToolTip(f'Review status: {pretty_status(entry.status)}. The stripe '
+        status.setToolTip(f'Status: {pretty_status(entry.status)}. The stripe '
                           f'down the left of '
-                          f'the row and this pill are the only things colour means.')
+                          f'the row and this pill use the same colour.')
         self.table.setItem(row, COL_STATUS, status)
         if not resort and was_sorting:
             self.table.setSortingEnabled(True)
@@ -1662,7 +1766,7 @@ class MainWindow(QMainWindow):
                                      entry.value('title'), entry.entry_id]).lower()
                 show = text in haystack
             if show and status != 'All statuses':
-                show = entry.status == status.lower()
+                show = pretty_status(entry.status) == status
             if show and missing != 'Any completeness':
                 gaps = entry.missing_fields()
                 if missing == 'Missing any field':
@@ -1676,16 +1780,18 @@ class MainWindow(QMainWindow):
                     show = missing.replace('Missing ', '').replace('index', 'series_index') in gaps
             if show and confidence != 'Any confidence':
                 value = entry.confidence()
-                if confidence == 'Below 50%':
-                    show = value < 0.5
-                elif confidence == 'Below 80%':
-                    show = value < 0.8
+                confident = self.settings.get_float(
+                    'AO_UI_CONFIDENT_THRESHOLD', 0.80)
+                doubtful = self.settings.get_float(
+                    'AO_UI_DOUBTFUL_THRESHOLD', 0.50)
+                if confidence == 'Confident':
+                    show = value >= confident
+                elif confidence == 'Unsure':
+                    show = doubtful <= value < confident
+                elif confidence == 'Doubtful':
+                    show = value < doubtful
                 elif confidence.startswith('At least'):
                     show = value >= self._custom_confidence
-                elif confidence.startswith('Below') :
-                    show = value < self._custom_confidence
-                else:
-                    show = value >= 0.8
             if show and shape is not None:
                 show = bool(shape(entry))
 
@@ -1795,6 +1901,10 @@ class MainWindow(QMainWindow):
         section('IDENTIFY')
         add(f'Identify{suffix}  (F4)', lambda: self._request_resolve(),
             'Run the ticked sources over every selected row')
+        add(f'Load from disk{suffix}...',
+            lambda: self._request_load(selected_only=True),
+            'Read these books from disk again. You choose what to keep of what we '
+            'already worked out.')
         # One source per entry rather than a dialog with a dropdown: picking a
         # source is one click, not a click, a scroll and an OK.
         sources = menu.addMenu('Identify with...')
@@ -2686,52 +2796,114 @@ class MainWindow(QMainWindow):
         self.show_message(f'{"Cleared" if cleaned in ("", 0) else "Set"} {label} '
                           f'on {len(entries)} entries')
 
-    def _request_scan(self) -> None:
-        """No selection: rescan everything. With a selection: redo just those rows.
+    def _request_load(self, selected_only: Optional[bool] = None) -> None:
+        """Load the input folder. The only question is what to keep.
 
-        Re-reading one badly-identified book used to mean rescanning the library.
+        There is one load action and it always means the same thing: read the books on
+        disk into the list. It is only destructive when there is already something to
+        destroy, so an empty list loads immediately and a worked-on one is asked first.
+
+        ``selected_only`` preselects the scope for the right-click menu; None lets the
+        dialog decide (the whole folder, unless you pick otherwise).
         """
-        entries = self.selected_entries()
-        if not entries:
-            self.scan_requested.emit()
+        from ..load_options import KeepOptions
+
+        # Nothing to lose, or nowhere to load from: either way the question would have
+        # exactly one answer. The controller does the asking when no folder is set -
+        # "what should I keep" in front of "you have not chosen a folder" is a dialog
+        # about a decision that does not exist yet.
+        if not self.entries or not self.settings.is_set('AO_INPUT_DIR'):
+            self.load_requested.emit(None, KeepOptions.keep_everything())
             return
 
-        if QMessageBox.question(
-                self, 'Rescan selected',
-                f'Discard what we know about {len(entries)} selected '
-                f'entr{"y" if len(entries) == 1 else "ies"} and read them again '
-                f'from disk?\n\nApproval and manual edits on those rows are lost.'
-        ) != QMessageBox.StandardButton.Yes:
+        from .load_dialog import LoadInputDialog
+
+        selected = self.selected_entries()
+        dialog = LoadInputDialog(list(self.entries.values()), selected,
+                                 self.settings, parent=self)
+        dialog.settings_requested.connect(self.settings_requested_on_tab.emit)
+        if selected and selected_only is not None:
+            dialog.scope_selected.setChecked(bool(selected_only))
+            dialog.scope_all.setChecked(not selected_only)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        from ..models import Field
-        for entry in entries:
-            for name in ('author', 'series', 'series_index', 'title'):
-                setattr(entry, name, Field())
-            entry.trace, entry.evidence, entry.raw_tags = [], {}, {}
-            entry.resolved = False
-            entry.status = STATUS_PENDING
-            row = self._row_for(entry.entry_id)
-            if row is not None:
-                self._fill_row(row, entry)
-            self.entry_changed(entry)
-        self._apply_filters()
-        self.refresh_stats()
-        self.show_message(f'Reset {len(entries)} entr'
-                          f'{"y" if len(entries) == 1 else "ies"} - re-reading them')
-        self.resolve_requested.emit(entries, ['metadata', 'regex'])
+        dialog.remember()
+        self.load_requested.emit(dialog.scope(), dialog.keep_options())
+
+    def _show_load_menu(self) -> None:
+        """Right-clicking Load Input: the same action, scoped, plus where to load from."""
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+
+        every = menu.addAction('Load the whole input folder')
+        every.setToolTip('Books that appeared are added, books that are gone are '
+                         'removed, and you choose what to keep of the rest.')
+        every.triggered.connect(lambda: self._request_load(selected_only=False))
+
+        selected = self.selected_entries()
+        if selected:
+            one = menu.addAction(f'Load only the {len(selected)} selected '
+                                 f'book{"" if len(selected) == 1 else "s"}')
+            one.setToolTip('Reads just those books from disk again. The rest of the '
+                           'list is left exactly as it is.')
+            one.triggered.connect(lambda: self._request_load(selected_only=True))
+
+        menu.addSeparator()
+        folder = menu.addAction('Choose input folder...')
+        folder.setToolTip('Open Settings and pick the folder to load from')
+        folder.triggered.connect(lambda: self.settings_requested_on_tab.emit('General'))
+
+        if self._scan_drift or self._folder_changed_from:
+            what = menu.addAction('What changed since the last load...')
+            what.triggered.connect(self._show_drift_report)
+
+        action = self.tool_actions.get('scan')
+        button = (self.toolbar.widgetForAction(action) if action is not None else None)
+        anchor = button if button is not None else self.toolbar
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+
+    def _show_drift_report(self) -> None:
+        """Why the "!" is lit, in words, with the button that clears it."""
+        drift = self._scan_drift or {}
+        parts = [f'{count} audio file{"" if count == 1 else "s"} {word}'
+                 for word, count in (('added', drift.get('added', 0)),
+                                     ('no longer there', drift.get('missing', 0)),
+                                     ('changed', drift.get('changed', 0))) if count]
+        lines = []
+        if self._folder_changed_from:
+            lines.append(f'The input folder was changed.\n\n'
+                         f'    was:  {self._folder_changed_from}\n'
+                         f'    now:  '
+                         f'{self.settings.display_path(self.settings.get_path("AO_INPUT_DIR"))}'
+                         f'\n\nThe list still holds the books from the old folder. They '
+                         f'stay editable and can still be saved; loading replaces them '
+                         f'with what is in the new folder.')
+        if parts:
+            lines.append('Since this list was written, the input folder has '
+                         + ', '.join(parts) + '.')
+        if not lines:
+            lines.append('The list is in step with the input folder.')
+
+        box = QMessageBox(QMessageBox.Icon.Information, 'Since the last load',
+                          '\n\n'.join(lines), parent=self)
+        load = box.addButton('Load now', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('Close', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is load:
+            self._request_load()
 
     def _request_resolve(self) -> None:
         tiers = self.selected_tiers()
         if not tiers:
             self.show_message('Tick at least one source in the Sources menu')
             return
-        # No selection means the whole library, the same way Scan and Preview read it.
+        # No selection means the whole library, the same way Load and Preview read it.
         # Refusing the click and telling you about Ctrl+A was making you do by hand the
         # only thing an empty selection could have meant.
         entries = self.selected_entries() or list(self.entries.values())
         if not entries:
-            self.show_message('Nothing to identify - scan a folder first')
+            self.show_message('Nothing to identify - load the input folder first')
             return
         self.resolve_requested.emit(entries, tiers)
 
@@ -2744,7 +2916,7 @@ class MainWindow(QMainWindow):
             # button that looks broken.
             entries = self.selected_entries() or list(self.entries.values())
             if not entries:
-                self.show_message('Nothing to preview - scan a folder first')
+                self.show_message('Nothing to preview - load the input folder first')
                 return
             self.apply_requested.emit(entries, True)
             return
@@ -3042,6 +3214,123 @@ class MainWindow(QMainWindow):
         self._refresh_identify_badge()
         self._refresh_queue_dialog()
 
+    def set_scan_stale(self, drift: Optional[dict]) -> None:
+        """Mark Load Input when the list no longer matches the input folder.
+
+        A saved list is a snapshot. Files added, removed or replaced since it was
+        written are invisible until it is loaded again, and the whole session after
+        that point is spent reviewing a library that no longer exists - so the button
+        that fixes it says so, with a "!" badge and a tooltip naming what changed.
+
+        ``drift`` is what :meth:`FileScanner.compare_to_entries` returned, or None for
+        "not stale".
+        """
+        self._scan_drift = drift or None
+        self._refresh_scan_badge()
+
+    def set_input_folder_changed(self, previous: Optional[str]) -> None:
+        """The input folder setting itself changed - the list is now the wrong folder's.
+
+        No comparison of files can find this: every book in the list is exactly where
+        the list says it is, they are simply somewhere nobody is pointing at any more.
+        So the controller says so explicitly, and the button carries it like any other
+        reason to press it.
+        """
+        self._folder_changed_from = previous or None
+        self._refresh_scan_badge()
+
+    def _refresh_scan_badge(self) -> None:
+        action = self.tool_actions.get('scan')
+        if action is None:
+            return
+        base = ITEMS_BY_KEY['scan']
+        drift = getattr(self, '_scan_drift', None)
+        moved = getattr(self, '_folder_changed_from', None)
+        size = self._icon_size()
+        action.setIcon(badged_icon('scan', TEXT, size,
+                                   '!' if (drift or moved) else ''))
+
+        if not drift and not moved:
+            action.setToolTip(f'{base.label}\n{base.tooltip}')
+            return
+
+        why = []
+        if moved:
+            why.append(f'! The input folder was changed - the list still holds the '
+                       f'books from {moved}.')
+        if drift:
+            parts = [f'{count} {word}' for word, count in
+                     (('added', drift.get('added', 0)),
+                      ('missing', drift.get('missing', 0)),
+                      ('changed', drift.get('changed', 0))) if count]
+            detail = (', '.join(parts) if parts
+                      else 'the input folder could not be read')
+            why.append(f'! The input folder has changed since this list was written '
+                       f'({detail}).')
+        action.setToolTip(
+            f'{base.label}\n{base.tooltip}\n\n' + '\n'.join(why)
+            + '\nLoad it before you review, or you are working on stale data.')
+
+    # --------------------------------------------------------- unsaved work
+
+    def flash_unsaved(self, seconds: float = 10.0, announce: bool = True) -> int:
+        """Light up the rows carrying work that has not been written out yet.
+
+        Pressing Load Input is the moment to notice that eleven books are approved and
+        still sitting here, so they are shown rather than described. The highlight
+        fades over `seconds` - but a highlight you looked away from is no help at all,
+        so the "Unsaved changes" shape filter can pull exactly these rows back up on
+        demand, whenever.
+
+        Returns how many there were. `announce` off leaves the status line alone, for
+        callers with something of their own to say about the same event.
+        """
+        from ..load_options import unsaved_entries
+
+        waiting = unsaved_entries(self.entries.values())
+        self._flash = {entry.entry_id: 1.0 for entry in waiting}
+        self._flash_left = float(seconds) if waiting else 0.0
+        if not waiting:
+            self._flash_timer.stop()
+            self._paint_flash()
+            return 0
+
+        self._paint_flash()
+        self._flash_timer.start()
+        if announce:
+            # Short, because the status label is width-capped - the whole sentence is
+            # in its tooltip, and the shape filter is the way back to these rows.
+            self.show_message(f'{len(waiting)} book'
+                              f'{" has" if len(waiting) == 1 else "s have"} unsaved '
+                              f'changes - highlighted, and under the "Unsaved changes" '
+                              f'filter')
+        return len(waiting)
+
+    def _tick_flash(self) -> None:
+        self._flash_left -= self._flash_timer.interval() / 1000.0
+        if self._flash_left <= 0:
+            self._flash_timer.stop()
+            self._flash.clear()
+            self._paint_flash()
+            return
+        # Full strength for most of it, then fade out over the last second and a half,
+        # so it does not simply vanish while you are still looking at it.
+        strength = max(0.0, min(1.0, self._flash_left / 1.5))
+        self._flash = {key: strength for key in self._flash}
+        self._paint_flash()
+
+    def _paint_flash(self) -> None:
+        """Push the current highlight strength onto the rows and repaint."""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, COL_FILES)
+            entry_id = item.data(ROLE_ENTRY_ID) if item is not None else None
+            strength = self._flash.get(entry_id, 0.0)
+            for column in range(len(COLUMNS)):
+                cell = self.table.item(row, column)
+                if cell is not None:
+                    cell.setData(ROLE_FLASH, strength or None)
+        self.table.viewport().update()
+
     def _refresh_identify_badge(self) -> None:
         """Put the number of outstanding identifications on the Identify button."""
         action = self.tool_actions.get('identify')
@@ -3054,7 +3343,7 @@ class MainWindow(QMainWindow):
         # Disabled, the tooltip's job is to say why - the queue count is beside the
         # point when the button cannot be pressed. See refresh_action_states.
         body = (base.tooltip if action.isEnabled()
-                else 'Nothing has been scanned yet')
+                else 'Nothing is loaded yet - press Ctrl+R')
         action.setToolTip(
             f'{base.label}\n{body}'
             + (f'\n\n{plural(count, "identification")} outstanding. '

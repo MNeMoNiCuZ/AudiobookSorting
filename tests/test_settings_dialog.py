@@ -10,10 +10,12 @@ from __future__ import annotations
 import re
 
 import pytest
-from PyQt6.QtWidgets import QApplication, QGroupBox, QLineEdit, QPushButton
+from PyQt6.QtWidgets import (QApplication, QComboBox, QGroupBox, QLabel, QLineEdit,
+                             QPushButton)
 
 from scripts.settings import SCHEMA
-from scripts.gui.settings_dialog import CREDENTIAL_KEYS, TABS, SettingsDialog
+from scripts.gui.settings_dialog import (CREDENTIAL_KEYS, TABS, SettingsComboBox,
+                                         SettingsDialog)
 
 # Keys that are state rather than settings: window geometry, column widths, the toolbar
 # layout and the recent-folder list are all written by the UI as you use it.
@@ -50,6 +52,64 @@ def test_every_setting_is_editable_somewhere(dialog):
             continue
         assert key in listed or key in dialog.widgets, \
             f'{key} is in SCHEMA but on no tab - it can only be set by editing .env'
+
+
+def test_setting_descriptions_are_short_single_lines():
+    for key, (_default, _kind, description) in SCHEMA.items():
+        assert '\n' not in description, key
+        assert len(description) <= 100, key
+        assert 'SHA-256' not in description, key
+        assert 'Tier 1:' not in description, key
+
+
+def test_identification_stage_names_live_in_the_menu(dialog):
+    combo = dialog.widgets['AO_ALWAYS_SEARCH_TO_TIER']
+    assert isinstance(combo, QComboBox)
+    assert [combo.itemText(index) for index in range(combo.count())] == [
+        '1 - Audio tags', '2 - File and folder names', '3 - Book databases',
+        '4 - Web search', '5 - Language model']
+
+
+def test_closed_settings_dropdown_ignores_wheel_input(dialog):
+    class WheelEvent:
+        def __init__(self):
+            self.ignored = False
+
+        def ignore(self):
+            self.ignored = True
+
+    combo = dialog.widgets['AO_ALWAYS_SEARCH_TO_TIER']
+    assert isinstance(combo, SettingsComboBox)
+    before = combo.currentIndex()
+    event = WheelEvent()
+
+    combo.wheelEvent(event)
+
+    assert event.ignored is True
+    assert combo.currentIndex() == before
+
+
+def test_help_tab_has_quickstart_hotkeys_and_version(dialog):
+    from scripts.version import APP_VERSION
+
+    titles = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
+    assert 'Help' in titles
+    tab = dialog.tabs.widget(titles.index('Help'))
+    text = ' '.join(label.text() for label in tab.findChildren(QLabel))
+    assert 'Quick start' in [group.title() for group in tab.findChildren(QGroupBox)]
+    assert 'Ctrl+R' in text
+    assert 'F12' in text
+    assert APP_VERSION in text
+
+
+def test_review_threshold_defaults_are_blank_and_disabled(dialog):
+    for key in ('AO_REVIEW_APPROVE_THRESHOLD', 'AO_REVIEW_REJECT_THRESHOLD'):
+        assert SCHEMA[key][0] == ''
+        edit = dialog.widgets[key].findChild(QLineEdit, 'value')
+        dialog.settings.set(key, '')
+        dialog._load_values()
+        assert edit.text() == ''
+        assert dialog._collect()[key] == ''
 
 
 def test_the_provider_tab_gathers_every_credential(dialog):

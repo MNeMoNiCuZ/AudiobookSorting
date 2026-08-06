@@ -40,10 +40,6 @@ echo === Packaging ===
 REM  --windowed          no console window behind the GUI
 REM  --onefile           one .exe, nothing to install
 REM  --icon              the .ico just drawn, embedded in the executable
-REM  --add-data          .env.example ships so a fresh install has a template. The
-REM                      source path is absolute because --specpath moves the spec
-REM                      into build\, and PyInstaller resolves relative data paths
-REM                      against the spec rather than against the working directory.
 REM  --collect-submodules  mutagen is imported lazily in places, so PyInstaller's
 REM                        static analysis does not find all of it
 REM  --paths             note the trailing dot in "%~dp0." - %~dp0 ends in a
@@ -56,7 +52,6 @@ REM                      the next argument
     --windowed ^
     --name "AudiobookOrganizer" ^
     --icon "%~dp0build\audiobook_organizer.ico" ^
-    --add-data "%~dp0.env.example;." ^
     --paths "%~dp0." ^
     --collect-submodules mutagen ^
     --hidden-import "scripts.gui.app_icon" ^

@@ -668,7 +668,7 @@ class Resolver:
 
         The value is left exactly as it was - rewriting a guess into a different guess
         helps nobody. What changes is how sure we claim to be about it, so a book with
-        "The Deep Sky (Unabridged" in its title stops clearing the auto-approve
+        "The Deep Sky (Unabridged" in its title stops clearing a review threshold
         threshold and turns up in the review queue where a person can look at it.
         """
         entry.warnings = []
@@ -718,15 +718,10 @@ class Resolver:
         self._check_quality(entry)
         if entry.status in ('approved', 'rejected', 'applied'):
             return
-        threshold = self.settings.get_float('AO_AUTO_APPROVE_THRESHOLD', 0.0)
         confidence = entry.confidence()
 
         if not entry.is_complete():
             entry.status = STATUS_RISKY
-        elif threshold > 0 and confidence >= threshold:
-            entry.status = 'approved'
-            entry.log('auto', f'Auto-approved: confidence {confidence:.2f} '
-                              f'>= threshold {threshold:.2f}')
         elif confidence < 0.6 or entry.warnings:
             # A malformed-looking value is exactly what "risky" is for.
             entry.status = STATUS_RISKY

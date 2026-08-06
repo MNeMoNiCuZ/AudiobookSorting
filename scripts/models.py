@@ -2,8 +2,8 @@
 
 A book's identifying fields are not plain strings: each carries where it came from and
 how much we trust it, so the UI can colour-code them, the resolver can decide whether a
-later tier is allowed to overwrite an earlier one, and auto-approve has something real
-to threshold on.
+later tier is allowed to overwrite an earlier one, and review threshold actions have
+something real to use.
 """
 
 from __future__ import annotations
@@ -81,6 +81,11 @@ class BookEntry:
     folder: str = ''                      # directory containing the audio
     relative_path: str = ''
     audio_files: List[str] = field(default_factory=list)   # names, relative to folder
+    # Byte size of each file in audio_files, as it was when the folder was scanned.
+    # Recorded so that "does the table still describe what is on disk?" can be answered
+    # without re-reading anything: a file replaced by a different copy keeps its name
+    # and its path, and its size is the only cheap thing about it that changes.
+    audio_sizes: List[int] = field(default_factory=list)
     primary_audio: str = ''               # absolute path to the representative file
     image_files: List[str] = field(default_factory=list)
     is_multi_book_folder: bool = False    # siblings in this folder are other books
@@ -249,7 +254,9 @@ def pretty_status(status: str) -> str:
     The stored value is an identifier and stays lower-case forever; every place a
     human reads one goes through here so they all agree.
     """
-    return str(status or '').replace('_', ' ').title()
+    labels = {'risky': 'Unsure'}
+    return labels.get(str(status or '').lower(),
+                      str(status or '').replace('_', ' ').title())
 
 
 def clean_value(name: str, value: Any) -> str:

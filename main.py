@@ -26,6 +26,7 @@ from scripts.paths import PROJECT_ROOT, clean_temp
 from scripts.resolver import Resolver
 from scripts.settings import get_settings
 from scripts.utils import setup_logging
+from scripts.version import APP_VERSION
 
 logger = logging.getLogger('audiobook_organizer')
 
@@ -105,9 +106,9 @@ def run_cli(args, app: Application) -> int:
         app.data.mark_dirty()
 
     if app.settings.get_bool('AO_DETECT_DUPLICATES', True):
-        flagged = mark_duplicates(entries)
+        flagged = mark_duplicates(entries, cache=app.cache)
         if flagged:
-            print(f'{flagged} possible duplicate(s) flagged')
+            print(f'{flagged} duplicate(s) flagged')
 
     if args.auto_approve is not None:
         approved = 0
@@ -185,8 +186,93 @@ def _fit(text: str, width: int) -> str:
 
 # ------------------------------------------------------------------------- GUI
 
+def check_scan_freshness(app: 'Application', window) -> Optional[dict]:
+    """Ask whether the table still describes the input folder, and badge Scan if not.
+
+    Returns what drifted, or None when the two are in step. Cheap enough to run at
+    start-up and after every scan: directory listings and sizes, no tag reads.
+    """
+    if not app.settings.is_set('AO_INPUT_DIR'):
+        window.set_scan_stale(None)
+        return None
+    try:
+        drift = app.scanner.compare_to_entries(app.data.all())
+    except Exception:
+        logger.exception('Could not compare the saved entries to the input folder')
+        window.set_scan_stale(None)
+        return None
+
+    stale = any(drift.get(key) for key in ('added', 'missing', 'changed', 'unreadable'))
+    if stale:
+        logger.info('Input folder has drifted from the saved entries: %s', drift)
+    window.set_scan_stale(drift if stale else None)
+    return drift if stale else None
+
+
+def install_crash_handler() -> None:
+    """Turn an unhandled exception into a logged report instead of a vanished window.
+
+    PyQt does not carry an exception out of a slot: it prints it and, on a windowed
+    build with no console to print to, the process simply dies. A crash reported as
+    "it closed when I clicked a book" is a crash nobody can fix, so anything that
+    escapes a slot is written to audiobook_organizer.log with its full traceback and
+    put on screen with the path to that log. The application keeps running - the
+    failure was in one click, not in the program's state.
+    """
+    import traceback
+
+    from PyQt6.QtWidgets import QMessageBox
+
+    log_path = PROJECT_ROOT / 'audiobook_organizer.log'
+    shown = {'count': 0}
+
+    def handle(kind, value, tb) -> None:
+        if issubclass(kind, KeyboardInterrupt):
+            sys.__excepthook__(kind, value, tb)
+            return
+        text = ''.join(traceback.format_exception(kind, value, tb))
+        logger.error('Unhandled exception:\n%s', text)
+
+        # Only the first few get a dialog: a fault inside a paint event repeats on every
+        # repaint, and a stack of identical message boxes is its own kind of crash.
+        shown['count'] += 1
+        if shown['count'] > 3:
+            return
+        try:
+            box = QMessageBox(QMessageBox.Icon.Critical, 'Something went wrong',
+                              f'{kind.__name__}: {value}\n\n'
+                              f'The full details were written to:\n{log_path}\n\n'
+                              f'The application is still running, but the action you '
+                              f'just took did not complete.')
+            box.setDetailedText(text)
+            box.exec()
+        except Exception:
+            pass
+
+    sys.excepthook = handle
+    try:
+        import threading
+        threading.excepthook = lambda args: handle(
+            args.exc_type, args.exc_value, args.exc_traceback)
+    except Exception:
+        pass
+
+
+def _under(folder: str, root: Path) -> bool:
+    """Is `folder` the input root or somewhere inside it?
+
+    Path comparison only - no disk access, so it can be asked about every entry in a
+    large library without costing anything.
+    """
+    try:
+        target, base = Path(folder).resolve(), Path(root).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+    return target == base or base in target.parents
+
+
 def run_gui(app: Application) -> int:
-    from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
+    from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QMessageBox)
 
     from scripts.gui import MainWindow, PreviewDialog, SettingsDialog, apply_theme
     from scripts.workers import (ApplyWorker, FunctionWorker, ResolveWorker, ScanWorker,
@@ -194,7 +280,9 @@ def run_gui(app: Application) -> int:
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName('Audiobook Organizer')
+    qt_app.setApplicationVersion(APP_VERSION)
     apply_theme(qt_app)
+    install_crash_handler()
 
     # Title bar, alt-tab and the taskbar. On Windows the taskbar groups by AppUserModel
     # ID, and without one set it groups under "python.exe" and shows the Python icon
@@ -218,8 +306,8 @@ def run_gui(app: Application) -> int:
         app.data.update(entry)
 
     window.entry_changed = persist
-    # The confidence control on the filter row writes .env directly, so the resolver
-    # has to be rebuilt against the new value rather than keeping the old threshold.
+    # A setting changed directly from the main window, so rebuild the components that
+    # keep their own settings-derived state.
     window.settings_changed.connect(app.reload_settings)
     # The queue view reads the manager directly rather than being fed a copy, so the
     # badge, the toolbar count and the Queue window can never disagree about it.
@@ -284,27 +372,78 @@ def run_gui(app: Application) -> int:
             return False
         return True
 
-    # --- scan
-    def do_scan():
+    # --- load
+    def do_load(targets=None, keep=None):
+        """The one load action: read the input folder, keeping what was asked for.
+
+        `targets` is the books to load, or None for the whole input folder. `keep` is
+        a KeepOptions; the window decides it (from the dialog, or "keep everything"
+        when the list is empty and there is nothing to decide).
+        """
+        from scripts.load_options import KeepOptions, apply_keep
+
         app.reload_settings()
         window.refresh_mode_label()
         if not require_path('AO_INPUT_DIR', 'input'):
             return
+        keep = keep or KeepOptions.keep_everything()
+
+        def cleared_note(plan):
+            if not plan.cleared:
+                return ''
+            return (f', cleared {plan.cleared} value'
+                    f'{"" if plan.cleared == 1 else "s"} on {plan.books} book'
+                    f'{"" if plan.books == 1 else "s"}')
+
+        def unsaved_note(count):
+            """One sentence, not two: the load count and the warning are one event."""
+            return (f' - {count} with unsaved changes, highlighted' if count else '')
+
+        # Only some rows: no walk of the folder, just those books read again. The
+        # rest of the list is not touched, which is the whole point of the scope.
+        if targets:
+            plan = apply_keep(targets, keep)
+            for entry in targets:
+                window.upsert_entry(entry)
+                app.data.update(entry)
+            waiting = window.flash_unsaved(announce=False)
+            window.show_message(f'Loading {len(targets)} book'
+                                f'{"" if len(targets) == 1 else "s"}'
+                                + cleared_note(plan) + unsaved_note(waiting))
+            do_resolve(targets, ['metadata', 'regex'])
+            return
+
+        # The whole folder. Clearing happens before the scan, because the scan's own
+        # offline pass only re-reads a book that is not marked resolved - which is
+        # exactly what apply_keep has just made true of everything it cleared.
+        plan = apply_keep(app.data.all(), keep)
+        app.data.mark_dirty()
         worker = ScanWorker(app.scanner, app.data,
                             resume=app.settings.get_bool('AO_RESUME_SCANS', True),
-                            resolver=app.resolver)
+                            resolver=app.resolver,
+                            dedupe=app.settings.get_bool('AO_DETECT_DUPLICATES', True),
+                            cache=app.cache)
 
         def done(result):
             entries = result.get('entries', [])
-            flagged = 0
-            if app.settings.get_bool('AO_DETECT_DUPLICATES', True):
-                flagged = mark_duplicates(entries)
+            flagged = result.get('duplicates', 0)
             # One rebuild after the duplicate pass, so the table and the library card
             # on the right both reflect the final statuses.
             window.set_entries(entries)
             window.set_busy(workers.busy)
-            window.show_message(f'Scanned {len(entries)} entries'
-                                + (f' ({flagged} possible duplicates)' if flagged else ''))
+            # The list has just been rebuilt from disk, so both reasons the badge can
+            # be lit are answered - asked rather than assumed, because a cancelled
+            # load proves nothing.
+            window.set_input_folder_changed(None)
+            check_scan_freshness(app, window)
+            waiting = window.flash_unsaved(announce=False)
+            window.show_message(f'Loaded {len(entries)} book'
+                                f'{"" if len(entries) == 1 else "s"}'
+                                + cleared_note(plan)
+                                + (f' ({flagged} identical '
+                                   f'{"copy" if flagged == 1 else "copies"})'
+                                   if flagged else '')
+                                + unsaved_note(waiting))
 
         worker.signals.finished.connect(done)
         wire(worker)
@@ -496,12 +635,60 @@ def run_gui(app: Application) -> int:
             window.show_message(f'Merged, and deleted {removed} chapter files')
 
     # --- settings
+    def input_folder_changed(previous: str) -> None:
+        """The input folder was changed in Settings. Say so, and offer to act on it.
+
+        Nothing about the books already in the list is wrong - they are all still
+        exactly where the list says they are - they are simply somewhere nobody is
+        pointing at any more. No file comparison can detect that, so it is said here,
+        once, at the moment it happens, and the Load Input button carries it
+        afterwards.
+        """
+        from scripts.load_options import KeepOptions, unsaved_entries
+
+        window.set_input_folder_changed(previous or '(nothing)')
+        stale = [entry for entry in app.data.all()
+                 if not _under(entry.folder, app.scanner.input_dir)]
+        if not stale:
+            do_load(None, KeepOptions.keep_everything())
+            return
+
+        unsaved = len(unsaved_entries(stale))
+        box = QMessageBox(QMessageBox.Icon.Warning, 'Input folder changed',
+                          f'The input folder is now:\n\n'
+                          f'    {app.settings.display_path(app.scanner.input_dir)}\n\n'
+                          f'The list still holds {len(stale)} book'
+                          f'{"" if len(stale) == 1 else "s"} from the old folder. They '
+                          f'stay editable and can still be saved, but they are not in '
+                          f'the folder you are now pointing at.'
+                          + (f'\n\n{unsaved} of them have changes you have not saved '
+                             f'yet.' if unsaved else ''),
+                          parent=window)
+        drop = QCheckBox(f'Remove those {len(stale)} books from the list first')
+        # Ticked by default only when nothing would be lost by it. With unsaved work
+        # among them, tidying the list is not a thing to do without being asked.
+        drop.setChecked(not unsaved)
+        box.setCheckBox(drop)
+        load = box.addButton('Load the new folder', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('Later', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        if drop.isChecked():
+            for entry in stale:
+                app.data.remove(entry.entry_id)
+            window.set_entries(app.data.all())
+            window.show_message(f'Removed {len(stale)} book'
+                                f'{"" if len(stale) == 1 else "s"} from the old folder')
+        if box.clickedButton() is load:
+            do_load(None, KeepOptions.keep_everything())
+
     def do_settings(tab: str = ''):
         def restyle():
             """Interface settings preview live, before anything is written."""
             window.refresh_toolbar()
             window.apply_ui_settings()
 
+        before_input = app.settings.get('AO_INPUT_DIR')
         dialog = SettingsDialog(app.settings, window, live_preview=restyle)
         if tab:
             dialog.show_tab(tab)
@@ -511,6 +698,8 @@ def run_gui(app: Application) -> int:
             window.refresh_mode_label()
             restyle()
             window.show_message('Settings saved to .env')
+            if app.settings.get('AO_INPUT_DIR') != before_input:
+                input_folder_changed(before_input)
 
         dialog.saved.connect(saved)
         dialog.layout_reset.connect(window.reset_layout)
@@ -520,7 +709,7 @@ def run_gui(app: Application) -> int:
         restyle()
         window.refresh_mode_label()
 
-    window.scan_requested.connect(do_scan)
+    window.load_requested.connect(do_load)
     window.resolve_requested.connect(do_resolve)
     window.apply_requested.connect(do_apply)
     window.undo_requested.connect(do_undo)
@@ -534,14 +723,33 @@ def run_gui(app: Application) -> int:
 
     window.show()
 
-    # Show whatever the last session left behind, then scan for anything new.
+    # Show whatever the last session left behind, then look for anything new.
     existing = app.data.all()
     if existing:
         window.set_entries(existing)
-        window.show_message(f'Loaded {len(existing)} entries from the last session - '
-                            f'press Ctrl+R to rescan')
+        # A saved list describes the input folder as it was when it was written. If
+        # files have come or gone since, every decision made from here rests on stale
+        # data - so it is checked now, once, and Load Input carries the answer.
+        drift = check_scan_freshness(app, window)
+        # The other way a saved list can be wrong, and the one no file comparison can
+        # see: the input folder was changed to somewhere else entirely, so not one of
+        # these books is in it.
+        moved = (app.settings.is_set('AO_INPUT_DIR')
+                 and not any(_under(entry.folder, app.scanner.input_dir)
+                             for entry in existing))
+        if moved:
+            window.set_input_folder_changed(
+                app.settings.display_path(Path(existing[0].folder).parent))
+        window.show_message(
+            f'Loaded {len(existing)} book'
+            f'{"" if len(existing) == 1 else "s"} from the last session - '
+            + ('none of them are in the input folder; press Ctrl+R to load it'
+               if moved else
+               'the input folder has changed since; press Ctrl+R to load it'
+               if drift else 'press Ctrl+R to load the input folder'))
     elif app.settings.is_set('AO_INPUT_DIR'):
-        do_scan()
+        from scripts.load_options import KeepOptions
+        do_load(None, KeepOptions.keep_everything())
     else:
         # A first run has no input folder yet. The banner above the table says so and
         # links to the page that fixes it; a modal on top of an empty window that the

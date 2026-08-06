@@ -445,21 +445,29 @@ BADGE_FILL = '#e34a4a'
 BADGE_TEXT = '#ffffff'
 
 
-def badged_icon(name: str, colour: str, size: int, count: int,
-                fill: str = BADGE_FILL) -> QIcon:
-    """An icon with a count in a filled circle on its top-right corner.
+def badged_icon(name: str, colour: str, size: int, count, fill: str = BADGE_FILL) -> QIcon:
+    """An icon with a badge in a filled circle on its top-right corner.
 
-    Used for "how many identifications are queued". The badge is drawn into the pixmap
-    rather than laid over the button with a child widget, because a QToolBar reflows
-    its buttons and an overlay widget goes wherever the button used to be.
+    ``count`` is a number - "how many identifications are queued", drawn as a numeral
+    and omitted entirely at zero - or a short string for a badge that counts nothing,
+    such as the "!" that says the table no longer matches what is on disk.
+
+    The badge is drawn into the pixmap rather than laid over the button with a child
+    widget, because a QToolBar reflows its buttons and an overlay widget goes wherever
+    the button used to be.
     """
     pixmap = draw(name, colour, size)
-    if count <= 0:
-        return _with_disabled(pixmap, name, size)
+    if isinstance(count, str):
+        text = count
+        if not text:
+            return _with_disabled(pixmap, name, size)
+    else:
+        if count <= 0:
+            return _with_disabled(pixmap, name, size)
+        text = str(count) if count < 100 else '99+'
 
     from PyQt6.QtGui import QFont
 
-    text = str(count) if count < 100 else '99+'
     # Scaled off the icon, so the badge stays proportionate at every button size.
     diameter = max(12.0, size * 0.46)
     width = max(diameter, diameter * 0.58 * len(text) + diameter * 0.42)

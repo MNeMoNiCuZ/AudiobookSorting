@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from .models import BookEntry
+from .models import STATUS_DUPLICATE, STATUS_PENDING, BookEntry
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +46,30 @@ class DataManager:
 
         if not isinstance(raw, dict):
             return
+        stale_duplicates = 0
         for entry_id, data in raw.items():
             try:
                 entry = BookEntry.from_dict(data)
                 entry.entry_id = entry.entry_id or entry_id
+                # "Duplicate" is derived, not decided: it is recomputed from the files
+                # on disk by every scan, and the files may have moved or been deleted
+                # since this was written. Trusting a saved flag is how a red row
+                # outlived the check that produced it - including the ones the old
+                # name-based check got wrong, which no rescan of the new one would ever
+                # have visited to clear. It is dropped on load and earned again.
+                if entry.status == STATUS_DUPLICATE:
+                    entry.status = STATUS_PENDING
+                    entry.duplicate_of = ''
+                    entry.trace = [step for step in entry.trace
+                                   if step.get('tier') != 'dedupe']
+                    stale_duplicates += 1
                 self.entries[entry_id] = entry
             except Exception as exc:
                 self.logger.warning('Skipping unreadable entry %s: %s', entry_id, exc)
         self.logger.info('Loaded %d entries from %s', len(self.entries), self.save_file)
+        if stale_duplicates:
+            self.logger.info('Dropped %d saved duplicate flag(s) - they are recomputed '
+                             'from the files on disk, never restored', stale_duplicates)
 
     def _backup_corrupt(self) -> None:
         try:

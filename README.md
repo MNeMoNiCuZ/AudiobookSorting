@@ -57,17 +57,26 @@ build.bat
 
 Produces `AudiobookOrganizer.exe` in the project root via PyInstaller, icon included.
 
+**The .exe is the only file you need to distribute.** Everything it keeps is created
+beside it as it is needed — `.env` (written from the built-in defaults, already
+sectioned and commented), `cache.sqlite3` and `audiobook_organizer.log` on the first
+launch; `book_entries.json` on the first scan; `apply_journal.jsonl` and `temp/` when
+you first save or merge. Copy the .exe into an empty folder and it will
+bootstrap there; nothing is read from the source tree, and nothing is written outside
+its own directory. Copying a *stale* `book_entries.json` in beside it is the one thing
+worth avoiding: the table it draws is that file, not the disk.
+
 ## Run
 
 ```bash
 python main.py
 ```
 
-Point it at your unsorted books on the Settings page (**F12**), press **Ctrl+R** to scan,
-then review, approve and save.
+Point it at your unsorted books on the Settings page (**F12**), press **Ctrl+R** to load
+the folder, then review, approve and save.
 
 Both folders start **empty on purpose.** A default of `input/` would quietly aim a fresh
-install at a folder inside the program directory: the first scan appears to work, finds
+install at a folder inside the program directory: the first load appears to work, finds
 nothing, and nobody is ever asked. Empty means unset, and the window says so.
 
 **Copy mode is the default**, so the originals are never touched until you deliberately
@@ -113,11 +122,40 @@ correct answer away.
 - **The folder is the unit of work.** The folder that directly contains audio files is
   one book — unless it contains several full-length books, in which case each file is
   its own entry sharing that folder. Telling those two cases apart is most of the job.
+  There is a third, messier case: a flat folder holding the *chapters of several books
+  at once*. Stripping the numbers out of each filename leaves the title behind, so
+  `06 - Vengeance in Death-1..8` and `04 - Rapture in Death-1..9` in one directory
+  become two books of eight and nine parts rather than seventeen "books". Which number
+  counts is worked out per position, not by taking the first one in the name — in
+  `06 - Vengeance in Death-3` the 6 is the book and the 3 is the part. A file that
+  dwarfs everything beside it (nine parts *and* one file of the whole book) is
+  separated out as its own entry, so a merge cannot play the book twice.
+- **No rule about length, anywhere.** What groups files is what they say they belong
+  to: the **album tag** first, then the **embedded cover**, then what the **filenames**
+  say once their numbers come out. A 14-hour book in two 7-hour files is one book; two
+  7-hour books in one folder are two. "A file over N hours is a book, under N is a
+  chapter" is an arbitrary line that gets one of those wrong whichever way it is drawn,
+  and duration is not evidence of anything, so it is not consulted at all.
+- **A stale list says so.** A saved session describes the input folder as it was when
+  it was written. On start-up the folder is re-listed — paths and sizes only, no tag
+  reads, well under a second on a large library — and if anything has been added,
+  removed or replaced, the Load Input button carries a red **!** and its tooltip names
+  what changed. Changing the input folder itself lights the same badge, since no file
+  comparison can see that: every book in the list is exactly where the list says it
+  is, they are simply somewhere nobody is pointing at any more.
+- **Loading asks what to keep.** With an empty list there is nothing to lose, so Load
+  Input just reads the folder. With work already done on it you are asked once, in one
+  dialog: the whole folder or the selected books, and what survives — the values you
+  typed, values above a confidence you choose, your Approved/Rejected decisions.
+  The counts under the boxes are produced by the code that does the clearing, so what
+  the dialog promises is what happens. Books already saved to the output folder are
+  never touched. Duplicate flags are never restored from the save file at all: they are
+  derived from the files on disk, so they are dropped on load and earned again.
 - **Folder-level reasoning.** A folder holding four books is solved in one LLM call.
   Seeing `Book 1..Book 4` together is what reveals the shared author and the series name
   in the first place. It is cheaper *and* more accurate than asking four times.
 - **Corroboration.** When two independent tiers agree on a value, confidence rises. That
-  is what makes auto-approve-by-confidence trustworthy enough to skip most of the review.
+  makes the optional approve-over and decline-under review actions useful on large lists.
 - **Tiers stop early.** If tags and filenames already agree at high confidence, no
   network call is made at all. `AO_ALWAYS_SEARCH_TO_TIER` sets a floor if you would
   rather it always corroborated against the databases.
@@ -128,15 +166,20 @@ correct answer away.
   end, and the confidence of the affected fields is lowered so they surface for review.
   Nothing is ever silently rewritten; guessing at what the scrape *meant* turns a
   visible problem into an invisible one.
-- **Duplicate detection.** Books whose normalised author + title match one you already
-  have are flagged, with duration as the tie-breaker — the same title at wildly
-  different lengths is usually an abridgement, not a duplicate.
+- **Duplicate detection.** Nothing is flagged as a duplicate without a **matching
+  SHA-256 over every byte of every file**. Names are never consulted, and the cheap
+  tests — same file count and sizes, then a hash of each file's first and last
+  megabyte — exist only to decide what is worth hashing in full; they can rule a pair
+  out, never in. So two editions of one book with different narrators are not
+  duplicates, two parts of one book are not duplicates, and twenty chapters of it are
+  not duplicates of each other. Hashes are cached against path + size + mtime, so a
+  reload pays the I/O once and only survivors are ever read end to end.
 
 ### Caching
 
 Lookups are cached in SQLite. A successful lookup is kept **forever** — an author and a
 series index do not change. A *failed* lookup only means "not found today", so misses
-expire on a short TTL (`AO_CACHE_MISS_TTL`). Scans resume by default, skipping entries
+expire on a short TTL (`AO_CACHE_MISS_TTL`). Loads resume by default, skipping entries
 already resolved in a previous run.
 
 ---
@@ -158,15 +201,18 @@ for the language model the *entire* exchange — system prompt, the exact questi
 the raw reply, and the parsed result. When an identification is wrong, the reply is the
 only thing that explains it. A library card at the top summarises the whole entry set.
 
-**Colour is a language with exactly two words**, spoken consistently everywhere:
+**Colour is used consistently** for three kinds of information:
 
 1. **Status colour** = review status — the row stripe, the pill, the toolbar counts.
 2. **Source colour** = where a value came from — the same hue in the table cell, in the
    fields list, and on that source's card in the panel. Learn "violet = the language
    model" once and it holds everywhere.
+3. **Confidence colour** = the configured red, amber and green bands used only for the
+   confidence number and bar. It never changes the row or its review status.
 
-Nothing else is coloured. Confidence is a number and a grey bar, because a third colour
-system would mean the first two stop meaning anything.
+The confidence boundaries and the approve-over and decline-under bulk thresholds are
+set in Settings. The identification stopping threshold also remains in Settings and is
+separate from these display and review actions.
 
 **Filters** above the table cover review status, confidence (including a custom
 threshold), a search box over author / series / title / folder, and the *shape* of the
@@ -185,6 +231,9 @@ them out. It is fully rearrangeable (Settings → Toolbar, or right-click it): t
 is one string of ids, so reordering and showing/hiding are the same edit. All icons are
 drawn as vectors rather than font glyphs, so they hold their stroke weight at any size
 and take the theme colour.
+
+Approve and Reject use left-click for the selected rows, middle-click for the saved
+threshold, and right-click for the saved or a custom threshold.
 
 **The queue** shows what is stacked up when several identifications are running: which
 book is being worked on right now, how far into it, and how far through the batch — with
@@ -330,7 +379,7 @@ This tool moves files, so:
 
 | Key | Action |
 |-----|--------|
-| **Ctrl+R** | Scan the input folder |
+| **Ctrl+R** | Load the input folder (right-click the button to scope it or change folder) |
 | **F4** | Identify the selected rows with the ticked sources |
 | **F5** | Approve |
 | **F6** | Reject |
@@ -354,8 +403,9 @@ mouse.
 
 Everything lives in `.env` at the project root. The **Settings page (F12)** reads and
 writes that same file, so anything configurable in the UI is a key in `.env` and vice
-versa — you never have to edit it by hand, but you can. Start from
-[`.env.example`](.env.example), which documents every key with its default.
+versa — you never have to edit it by hand, but you can. The app writes that `.env`
+itself on first run, already sectioned and commented, with every key at its default —
+so there is nothing to copy from a template and no `.env.example` to keep in step.
 
 Values resolve as **process environment > `.env` > built-in default**, and saving
 preserves the comments and key order already in the file.

@@ -3,8 +3,7 @@
 One stylesheet plus a matching QPalette - the palette matters because several native
 widgets (tooltips, item-view selections, the text cursor) ignore stylesheets.
 
-Colour is a language with exactly two words here, and each is spoken consistently
-everywhere it appears:
+Colour is used consistently for review decisions, confidence bars and field sources:
 
 1. **Status colour = review status.** Stripe down the row, pill in the Status column,
    counts in the toolbar. Always the same hue for the same status.
@@ -12,8 +11,8 @@ everywhere it appears:
    table cell, in the Fields list, and on that source's card in the explanation panel.
    Learn "violet = the language model" once and it holds everywhere.
 
-Nothing else is coloured. Confidence is a number and a grey bar, because a third
-colour system would mean the first two stop being read as meaning anything.
+Confidence bands colour only the confidence number and bar. They never replace the
+review status or tint the row.
 
 Full-row status washes exist (Interface settings) but are off by default: a screen of
 saturated rows has no emphasis left to spend.
@@ -105,7 +104,7 @@ STATUS_COLORS = {
     'approved': '#1e3628',
     'rejected': '#3a2126',
     'applied': '#1b2f3c',
-    'risky': '#372f1e',
+    'risky': BG_BASE,
     'duplicate': '#4a1a1f',
 }
 STATUS_TEXT = dict(STATUS_HUES)
@@ -155,10 +154,9 @@ def confidence_color(value: float) -> str:
     return TEXT_FAINT
 
 
-# The opt-in traffic light for the confidence bar (AO_UI_CONFIDENCE_COLOR). Deliberately
+# The traffic light for the confidence bar (AO_UI_CONFIDENCE_COLOR). Deliberately
 # more saturated than the status hues: the bar is three pixels tall, and a muted colour
-# at that size is a grey smudge. These are only ever used on the bar and its number, so
-# they cannot be confused with a row's review status.
+# at that size is a grey smudge. These colours are confined to confidence itself.
 CONFIDENCE_HUES = (
     (0.80, '#3ddc84'),   # green  - good enough to file
     (0.55, '#ffc233'),   # amber  - worth a glance
@@ -166,12 +164,14 @@ CONFIDENCE_HUES = (
 )
 
 
-def vivid_confidence_color(value: float) -> str:
+def vivid_confidence_color(value: float, confident: float = 0.80,
+                           doubtful: float = 0.50) -> str:
     """The saturated traffic-light hue for a confidence, for the bar in the table."""
-    for floor, colour in CONFIDENCE_HUES:
-        if value >= floor:
-            return colour
-    return CONFIDENCE_HUES[-1][1]
+    if value >= confident:
+        return CONFIDENCE_HUES[0][1]
+    if value >= doubtful:
+        return CONFIDENCE_HUES[1][1]
+    return CONFIDENCE_HUES[2][1]
 
 
 # ---------------------------------------------------------------------- icons

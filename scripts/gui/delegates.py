@@ -37,6 +37,9 @@ ROLE_KIND = Qt.ItemDataRole.UserRole + 4
 # behind the Files cell, so a book being encoded says so where the book is.
 ROLE_PROGRESS = Qt.ItemDataRole.UserRole + 5
 ROLE_PROGRESS_TEXT = Qt.ItemDataRole.UserRole + 6
+# 0..1 while this row is being pointed out - work you have not saved yet, lit up by
+# MainWindow.flash_unsaved and faded back to nothing. None the rest of the time.
+ROLE_FLASH = Qt.ItemDataRole.UserRole + 7
 
 # What a cell should look like. Set as ROLE_KIND on the item.
 KIND_TEXT = 'text'
@@ -72,6 +75,8 @@ class ReviewDelegate(QStyledItemDelegate):
         self.row_tint = False
         self.show_covers = True
         self.colour_confidence = True
+        self.confident_threshold = 0.80
+        self.doubtful_threshold = 0.50
         # 0..1, advanced by MainWindow's spinner timer. Drives the band that sweeps
         # across an in-progress row - see _paint_progress.
         self.phase = 0.0
@@ -124,6 +129,14 @@ class ReviewDelegate(QStyledItemDelegate):
 
         self._paint_background(painter, rect, status, selected, hovered,
                                index.row() % 2 == 1)
+
+        # Drawn over the fill and under everything else, so it tints the row without
+        # touching the status colour the fill is already carrying.
+        flash = index.data(ROLE_FLASH)
+        if flash:
+            tint = QColor(ACCENT)
+            tint.setAlpha(int(58 * max(0.0, min(1.0, float(flash)))))
+            painter.fillRect(rect, tint)
 
         # The stripe belongs to the leftmost *visible* column - the cover column is
         # hidden in compact rows, and the stripe must not vanish with it.
@@ -352,7 +365,9 @@ class ReviewDelegate(QStyledItemDelegate):
         block = metrics.height() + 4 + bar_height
         top = rect.top() + (rect.height() - block) // 2
 
-        hue = (vivid_confidence_color(value) if self.colour_confidence
+        hue = (vivid_confidence_color(value, self.confident_threshold,
+                                      self.doubtful_threshold)
+               if self.colour_confidence
                else (TEXT if value >= 0.8 else
                      TEXT_DIM if value >= 0.55 else TEXT_FAINT))
         painter.setPen(QColor(hue if self.colour_confidence else hue))

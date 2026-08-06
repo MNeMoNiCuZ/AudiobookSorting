@@ -26,18 +26,26 @@ class ToolItem(NamedTuple):
 # them, decide on them, write them out. The default layout below follows that order,
 # and the separators mark where one stage ends and the next begins.
 TOOL_ITEMS: List[ToolItem] = [
-    ToolItem('scan', '⟳', 'Scan',
-             'With no selection: rescan the whole input folder  (Ctrl+R).\n'
-             'With rows selected: forget what we know about those rows and read\n'
-             'them again from disk.'),
+    # Key stays 'scan' so saved AO_TOOLBAR layouts keep working - only the name the
+    # user reads changed, because "Scan" said nothing about what it did to the list
+    # you already had.
+    ToolItem('scan', '⟳', 'Load Input',
+             'Read the input folder into the list  (Ctrl+R).\n'
+             'With books already loaded you are asked what to keep first.\n'
+             'Right-click for the same thing on the selected rows only, and to\n'
+             'choose a different input folder.'),
     ToolItem('sources', '☰', 'Sources',
              'Choose which sources identification is allowed to use'),
     ToolItem('identify', '▶', 'Identify',
              'Run the ticked sources over the selected rows  (F4)'),
     ToolItem('approve', '✔', 'Approve',
-             'Mark the selected rows as approved, ready to apply  (F5)'),
+             'LMB: Approve selected\n'
+             'MMB: Approve over the saved threshold\n'
+             'RMB: Choose an approve threshold'),
     ToolItem('reject', '✘', 'Reject',
-             'Mark the selected rows as rejected - they are never applied  (F6)'),
+             'LMB: Reject selected\n'
+             'MMB: Decline under the saved threshold\n'
+             'RMB: Choose a decline threshold'),
     ToolItem('reset', '⟲', 'Reset',
              'Clear the decision on the selected rows  (F8)'),
     # Monochrome glyphs only - the emoji codepoints for eye/folder/disk render in

@@ -19,13 +19,14 @@ from PyQt6.QtCore import Qt, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QDoubleValidator, QIntValidator
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout,
+    QFormLayout, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..paths import PROJECT_ROOT
 from ..settings import SCHEMA, Settings
+from ..version import APP_VERSION
 from ..workers import FunctionWorker
 from .icons import icon as make_icon
 from .theme import ACCENT, LINK, STATUS_TEXT, TEXT, TEXT_DIM
@@ -49,17 +50,14 @@ CREDENTIAL_KEYS = ('AO_SEARCH_BRAVE_KEY', 'AO_GOOGLE_BOOKS_KEY')
 # of anything on screen - the button on that page just says Enable.
 SECRET_HINTS: Dict[str, str] = {
     'AO_SEARCH_BRAVE_KEY':
-        'Free, 2,000 searches a month: sign up at '
-        '<a href="https://brave.com/search/api">brave.com/search/api</a>, subscribe '
-        'to the Free "Data for Search" plan, then copy the key from its dashboard.',
+        'Create a key at '
+        '<a href="https://brave.com/search/api">brave.com/search/api</a>.',
     'AO_GOOGLE_BOOKS_KEY':
-        'Free, two steps. 1: open '
+        'Enable '
         '<a href="https://console.cloud.google.com/apis/library/'
-        'books.googleapis.com">the Books API page</a> and press <b>Enable</b> '
-        '(pick or create a project if it asks). 2: open '
+        'books.googleapis.com">Google Books API</a>, then create a key under '
         '<a href="https://console.cloud.google.com/apis/credentials">Credentials</a>, '
-        'press <b>Create credentials</b> and choose <b>API key</b>. Leave '
-        'Application restrictions on None - a desktop app sends no referrer.',
+        'using <b>Create credentials</b>.',
 }
 
 # Which schema keys live on which tab, in display order.
@@ -76,7 +74,8 @@ TABS: Dict[str, list] = {
         # authenticates. See _build_credentials_box.
         'AO_ENABLE_LLM', 'AO_API_SOURCES', 'AO_CONFIDENCE_SCORE',
         'AO_ALWAYS_SEARCH_TO_TIER', 'AO_REQUIRE_COVER', 'AO_FOLDER_REASONING',
-        'AO_AUTO_APPROVE_THRESHOLD', 'AO_DETECT_DUPLICATES', 'AO_WARN_DIRTY_OUTPUT',
+        'AO_REVIEW_APPROVE_THRESHOLD', 'AO_REVIEW_REJECT_THRESHOLD',
+        'AO_DETECT_DUPLICATES', 'AO_WARN_DIRTY_OUTPUT',
     ],
     'Output': [
         'AO_COPY_MODE', 'AO_OUTPUT_TEMPLATE', 'AO_RENAME_FILES',
@@ -95,12 +94,18 @@ TABS: Dict[str, list] = {
     'Interface': [
         'AO_UI_DENSITY', 'AO_UI_ICON_SIZE', 'AO_UI_TOOLBAR_LABELS',
         'AO_UI_SHOW_COVERS', 'AO_UI_STATUS_STRIPE', 'AO_UI_CONFIDENCE_COLOR',
+        'AO_UI_CONFIDENT_THRESHOLD', 'AO_UI_DOUBTFUL_THRESHOLD',
         'AO_UI_COLOR_BY_SOURCE', 'AO_UI_ROW_TINT', 'AO_UI_SHOW_FILTERS',
         'AO_UI_SHOW_PANEL', 'AO_UI_COPY_RECENTS', 'AO_UI_RESORT_LIVE',
         'AO_UI_ADVANCE_AFTER_DECISION', 'AO_UI_CONFIRM_APPLY',
         'AO_UI_REMEMBER_LAYOUT',
     ],
-    'General': ['AO_INPUT_DIR', 'AO_OUTPUT_DIR', 'AO_LOG_LEVEL', 'AO_THREADS'],
+    # The load keys sit under the input folder because that is what they are about:
+    # what survives when you load that folder over work you have already done. The
+    # Load Input dialog writes the same keys, so the two always agree.
+    'General': ['AO_INPUT_DIR', 'AO_OUTPUT_DIR', 'AO_LOAD_KEEP_MANUAL',
+                'AO_LOAD_KEEP_CONFIDENT', 'AO_LOAD_KEEP_ABOVE',
+                'AO_LOAD_KEEP_DECISIONS', 'AO_LOG_LEVEL', 'AO_THREADS'],
 }
 
 # Settings that genuinely cannot take effect until the program is restarted, because
@@ -112,6 +117,16 @@ TABS: Dict[str, list] = {
 # on it is marked with a * and explained at the foot of its tab; if you find yourself
 # adding to it, fix the setting instead.
 RESTART_KEYS = {'AO_THREADS', 'AO_CACHE_DB'}
+
+
+class SettingsComboBox(QComboBox):
+    """A settings dropdown that only consumes wheel input while it is open."""
+
+    def wheelEvent(self, event) -> None:
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
 
 
 class SettingsDialog(QDialog):
@@ -192,6 +207,7 @@ class SettingsDialog(QDialog):
         # "Providers", not "LLM Provider": this page is where every outside service is
         # configured, and the book databases have credentials of their own.
         self.tabs.addTab(self._build_provider_tab(), 'Providers')
+        self.tabs.addTab(self._build_help_tab(), 'Help')
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -218,6 +234,76 @@ class SettingsDialog(QDialog):
             if self.tabs.tabText(index).lower() == title.lower():
                 self.tabs.setCurrentIndex(index)
                 return
+
+    def _build_help_tab(self) -> QWidget:
+        """Quick start, keyboard reference and version information."""
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        quickstart = QGroupBox('Quick start')
+        quick_layout = QVBoxLayout(quickstart)
+        steps = (
+            '1. Open General and choose the input and output folders.',
+            '2. Press Ctrl+R to load the input folder.',
+            '3. Choose identification sources, select rows, and press F4.',
+            '4. Review the results and edit any incorrect fields with F2.',
+            '5. Approve or reject rows. Press F7 to preview before saving.',
+        )
+        for text in steps:
+            label = QLabel(text)
+            label.setWordWrap(True)
+            quick_layout.addWidget(label)
+        layout.addWidget(quickstart)
+
+        shortcuts = (
+            ('Ctrl+R', 'Load the input folder'),
+            ('F2', 'Edit the current field or open the grid editor'),
+            ('F3 / Ctrl+F', 'Focus search'),
+            ('F4', 'Identify selected rows'),
+            ('F5', 'Approve selected rows'),
+            ('F6', 'Reject selected rows'),
+            ('F7', 'Preview the save operation'),
+            ('F8', 'Reset selected rows to Pending'),
+            ('F12', 'Open Settings'),
+            ('Ctrl+A', 'Select all rows'),
+            ('Ctrl+Z', 'Undo'),
+            ('Ctrl+Y / Ctrl+Shift+Z', 'Redo'),
+            ('Ctrl+H', 'Open undo history'),
+            ('Esc', 'Cancel the running operation'),
+        )
+        hotkeys = QGroupBox('Keyboard shortcuts')
+        hotkey_layout = QGridLayout(hotkeys)
+        hotkey_layout.setColumnStretch(1, 1)
+        for row, (keys, action) in enumerate(shortcuts):
+            key_label = QLabel(keys)
+            key_label.setStyleSheet(f'color: {TEXT}; font-weight: 700;')
+            action_label = QLabel(action)
+            action_label.setWordWrap(True)
+            hotkey_layout.addWidget(key_label, row, 0,
+                                    Qt.AlignmentFlag.AlignTop)
+            hotkey_layout.addWidget(action_label, row, 1)
+        layout.addWidget(hotkeys)
+
+        about = QGroupBox('About')
+        about_layout = QVBoxLayout(about)
+        version = QLabel(f'Audiobook Organizer {APP_VERSION}')
+        version.setObjectName('version')
+        version.setStyleSheet(f'color: {TEXT}; font-weight: 700;')
+        about_layout.addWidget(version)
+        layout.addWidget(about)
+        layout.addStretch(1)
+
+        scroll.setWidget(content)
+        wrapper_layout.addWidget(scroll)
+        return wrapper
 
     def _build_schema_tab(self, keys, drop: str = '') -> QWidget:
         container = QWidget()
@@ -345,9 +431,16 @@ class SettingsDialog(QDialog):
             # The stored value is a lower-case id ("underscore", "openlibrary"); the
             # label is written the way a person writes it. A drop-down reading
             # "smart / dash / underscore" is a list of variable names on show.
-            widget = QComboBox()
+            widget = SettingsComboBox()
+            stage_labels = {
+                '1': '1 - Audio tags',
+                '2': '2 - File and folder names',
+                '3': '3 - Book databases',
+                '4': '4 - Web search',
+                '5': '5 - Language model',
+            } if key == 'AO_ALWAYS_SEARCH_TO_TIER' else {}
             for value in kind.split(':', 1)[1].split('|'):
-                widget.addItem(_choice_label(value), value)
+                widget.addItem(stage_labels.get(value, _choice_label(value)), value)
             return widget
 
         if kind == 'secret':
@@ -488,7 +581,7 @@ class SettingsDialog(QDialog):
 
         select_box = QGroupBox('Language model - active provider')
         select_form = QFormLayout(select_box)
-        self.provider_combo = QComboBox()
+        self.provider_combo = SettingsComboBox()
         self.provider_combo.addItems(self.settings.provider_names())
         self.provider_combo.currentTextChanged.connect(self._provider_changed)
         select_form.addRow('Provider', self.provider_combo)
@@ -511,7 +604,7 @@ class SettingsDialog(QDialog):
 
         # The model is picked from what GET /models advertises, never typed by hand -
         # a typo'd id fails at request time with an opaque provider error.
-        self.model_combo = QComboBox()
+        self.model_combo = SettingsComboBox()
         self.model_combo.setToolTip('Populated from the provider\'s /models endpoint.')
         # A provider can advertise fifty models; ten visible rows is a peephole.
         self.model_combo.setMaxVisibleItems(18)
@@ -866,7 +959,8 @@ class SettingsDialog(QDialog):
                 widget.setCurrentIndex(max(0, widget.findData(value)))
             elif kind == 'percent':
                 widget.findChild(QLineEdit, 'value').setText(
-                    str(int(round(self.settings.get_float(key) * 100))))
+                    str(int(round(self.settings.get_float(key) * 100)))
+                    if value.strip() else '')
             elif kind in ('path', 'secret'):
                 widget.findChild(QLineEdit, 'value').setText(value)
             else:
@@ -1092,7 +1186,7 @@ class SettingsDialog(QDialog):
                 widget.setCurrentIndex(max(0, widget.findData(default)))
             elif kind == 'percent':
                 widget.findChild(QLineEdit, 'value').setText(
-                    str(int(round(float(default) * 100))))
+                    str(int(round(float(default) * 100))) if default else '')
             elif kind in ('path', 'secret'):
                 widget.findChild(QLineEdit, 'value').setText(default)
             else:

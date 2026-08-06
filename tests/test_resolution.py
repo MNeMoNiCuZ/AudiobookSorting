@@ -258,17 +258,118 @@ def test_cache_remembers_misses_distinctly(tmp_path):
 
 # -------------------------------------------------------------------- dedupe
 
-def test_duplicate_detection():
-    def book(entry_id, author, title):
-        entry = BookEntry(entry_id=entry_id)
+def _book(folder, entry_id, files, author='', title=''):
+    entry = BookEntry(entry_id=entry_id, folder=str(folder), audio_files=list(files))
+    if author:
         entry.set_field('author', author, 'metadata')
+    if title:
         entry.set_field('title', title, 'metadata')
-        return entry
+    return entry
+
+
+def _write(path, payload, size=200_000):
+    """A file of `size` bytes whose content is decided by `payload`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = (payload * (size // len(payload) + 1))[:size]
+    path.write_bytes(body)
+
+
+def test_identical_copies_are_duplicates(tmp_path):
+    """The same audio in two places, filed under different names, is one duplicate."""
+    for folder in ('library/final empire', 'downloads/BS - Mistborn 1'):
+        _write(tmp_path / folder / 'book.m4b', b'the final empire audio ')
 
     found = find_duplicates([
-        book('a', 'Brandon Sanderson', 'The Final Empire'),
-        book('b', 'Brandon Sanderson', 'the final empire'),
-        book('c', 'Patrick Rothfuss', 'The Name of the Wind'),
+        _book(tmp_path / 'library/final empire', 'a', ['book.m4b']),
+        _book(tmp_path / 'downloads/BS - Mistborn 1', 'b', ['book.m4b']),
     ])
-    assert 'b' in found
-    assert 'c' not in found
+    assert list(found) == ['b']          # the shorter path is the copy we keep
+    assert found['b'] == ['a']
+
+
+def test_chapters_of_one_book_are_not_duplicates(tmp_path):
+    """The bug in the screenshot: every chapter resolved to the same author+title.
+
+    Identity is identical across all three, and they sit in one folder. None of that
+    makes them duplicates - only identical bytes would, and chapters differ.
+    """
+    folder = tmp_path / '1-20 and SS'
+    entries = []
+    for index in range(1, 4):
+        name = f'06 - Vengeance in Death-{index}.mp3'
+        _write(folder / name, f'chapter {index} audio '.encode())
+        entries.append(_book(folder, name, [name],
+                             author='J.D. Robb', title='06 Vengeance in Death'))
+
+    assert find_duplicates(entries) == {}
+
+
+def test_same_title_different_edition_is_not_a_duplicate(tmp_path):
+    """Two encodes of one book agree on every field and differ on disk. Not duplicates."""
+    _write(tmp_path / 'a' / 'book.m4b', b'narrator one ', size=200_000)
+    _write(tmp_path / 'b' / 'book.m4b', b'narrator two ', size=300_000)
+
+    assert find_duplicates([
+        _book(tmp_path / 'a', 'a', ['book.m4b'], 'Brandon Sanderson', 'The Final Empire'),
+        _book(tmp_path / 'b', 'b', ['book.m4b'], 'Brandon Sanderson', 'the final empire'),
+    ]) == {}
+
+
+def test_same_size_different_content_is_not_a_duplicate(tmp_path):
+    """Matching sizes get as far as the hash and no further."""
+    _write(tmp_path / 'a' / 'book.m4b', b'aaaaaaaa', size=200_000)
+    _write(tmp_path / 'b' / 'book.m4b', b'bbbbbbbb', size=200_000)
+
+    assert find_duplicates([_book(tmp_path / 'a', 'a', ['book.m4b']),
+                            _book(tmp_path / 'b', 'b', ['book.m4b'])]) == {}
+
+
+def test_duplicate_multi_file_copies(tmp_path):
+    """A whole chapter run copied twice is one duplicate, not one per chapter."""
+    names = [f'{index:02d}.mp3' for index in range(1, 6)]
+    for folder in ('lib/book', 'dupes/book copy'):
+        for name in names:
+            _write(tmp_path / folder / name, f'chapter {name} '.encode())
+
+    found = find_duplicates([_book(tmp_path / 'lib/book', 'a', names),
+                             _book(tmp_path / 'dupes/book copy', 'b', names)])
+    assert found == {'b': ['a']}
+
+
+def test_only_a_full_sha_match_counts(tmp_path):
+    """Files that agree on size and on both ends, but differ in the middle, are not
+    duplicates. The cheap tests can only rule a pair out; the full hash decides."""
+    size = 4 * 1024 * 1024
+    head_and_tail = (b'H' * (1024 * 1024), b'T' * (1024 * 1024))
+    middle = size - 2 * 1024 * 1024
+
+    for folder, filler in (('a', b''), ('b', b''), ('c', b'')):
+        path = tmp_path / folder / 'book.m4b'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(head_and_tail[0] + filler * middle + head_and_tail[1])
+
+    entries = [_book(tmp_path / name, name, ['book.m4b']) for name in ('a', 'b', 'c')]
+    # All three are the same size with identical first and last megabytes, so all three
+    # survive to the full hash - and only the two that really match are flagged.
+    assert find_duplicates(entries) == {'b': ['a']}
+
+
+def test_missing_files_are_never_duplicates(tmp_path):
+    """An entry whose files are gone cannot be compared, so it is left alone."""
+    assert find_duplicates([_book(tmp_path / 'gone', 'a', ['book.m4b']),
+                            _book(tmp_path / 'also gone', 'b', ['book.m4b'])]) == {}
+
+
+def test_stale_duplicate_flag_is_cleared(tmp_path):
+    """A flag left by the old name-based check does not survive a rescan."""
+    from scripts.dedupe import mark_duplicates
+    from scripts.models import STATUS_DUPLICATE, STATUS_PENDING
+
+    _write(tmp_path / 'a' / 'book.m4b', b'unique audio ')
+    entry = _book(tmp_path / 'a', 'a', ['book.m4b'])
+    entry.status = STATUS_DUPLICATE
+    entry.duplicate_of = 'something else'
+
+    assert mark_duplicates([entry]) == 0
+    assert entry.status == STATUS_PENDING
+    assert entry.duplicate_of == ''
