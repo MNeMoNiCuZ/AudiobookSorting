@@ -11,8 +11,9 @@ you already know, and they invite click-click-click instead of typing.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from PyQt6.QtCore import Qt, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QDoubleValidator, QIntValidator
@@ -27,11 +28,39 @@ from ..paths import PROJECT_ROOT
 from ..settings import SCHEMA, Settings
 from ..workers import FunctionWorker
 from .icons import icon as make_icon
-from .theme import ACCENT, STATUS_TEXT, TEXT, TEXT_DIM
+from .theme import ACCENT, LINK, STATUS_TEXT, TEXT, TEXT_DIM
 from .toolbar import (DEFAULT_LAYOUT, ITEMS_BY_KEY, SEPARATOR, TOOL_ITEMS,
                       format_layout, parse_layout)
 
 logger = logging.getLogger(__name__)
+
+SECRET_PLACEHOLDERS: Dict[str, str] = {
+    'AO_SEARCH_BRAVE_KEY': 'BSA... - leave empty to search Goodreads only',
+    'AO_GOOGLE_BOOKS_KEY': 'AIza... - leave empty to skip Google Books',
+}
+
+# Service keys, in the order they appear in the Credentials group. Not derived from
+# SCHEMA's 'secret' kind: the order is a judgement, and the LLM provider's own key is
+# deliberately not here - it belongs to the selected provider, not to the app.
+CREDENTIAL_KEYS = ('AO_SEARCH_BRAVE_KEY', 'AO_GOOGLE_BOOKS_KEY')
+
+# Where to get the key, as links. Each names the page it opens and the button to
+# press on it, because "enable the Books API" is the name of the task, not the name
+# of anything on screen - the button on that page just says Enable.
+SECRET_HINTS: Dict[str, str] = {
+    'AO_SEARCH_BRAVE_KEY':
+        'Free, 2,000 searches a month: sign up at '
+        '<a href="https://brave.com/search/api">brave.com/search/api</a>, subscribe '
+        'to the Free "Data for Search" plan, then copy the key from its dashboard.',
+    'AO_GOOGLE_BOOKS_KEY':
+        'Free, two steps. 1: open '
+        '<a href="https://console.cloud.google.com/apis/library/'
+        'books.googleapis.com">the Books API page</a> and press <b>Enable</b> '
+        '(pick or create a project if it asks). 2: open '
+        '<a href="https://console.cloud.google.com/apis/credentials">Credentials</a>, '
+        'press <b>Create credentials</b> and choose <b>API key</b>. Leave '
+        'Application restrictions on None - a desktop app sends no referrer.',
+}
 
 # Which schema keys live on which tab, in display order.
 #
@@ -42,8 +71,9 @@ logger = logging.getLogger(__name__)
 TABS: Dict[str, list] = {
     'Identification': [
         'AO_ENABLE_METADATA', 'AO_ENABLE_REGEX', 'AO_ENABLE_API', 'AO_ENABLE_SEARCH',
-        # The Google Books key lives on the Providers tab with the other service
-        # credentials, not here among the toggles.
+        # Credentials are not here. Every API key lives on the Providers tab, in one
+        # Credentials group at the top of it - one place to look for anything that
+        # authenticates. See _build_credentials_box.
         'AO_ENABLE_LLM', 'AO_API_SOURCES', 'AO_CONFIDENCE_SCORE',
         'AO_ALWAYS_SEARCH_TO_TIER', 'AO_REQUIRE_COVER', 'AO_FOLDER_REASONING',
         'AO_AUTO_APPROVE_THRESHOLD', 'AO_DETECT_DUPLICATES', 'AO_WARN_DIRTY_OUTPUT',
@@ -320,6 +350,9 @@ class SettingsDialog(QDialog):
                 widget.addItem(_choice_label(value), value)
             return widget
 
+        if kind == 'secret':
+            return self._make_secret_widget(key)
+
         if kind == 'path':
             widget = QWidget()
             row = QHBoxLayout(widget)
@@ -338,6 +371,66 @@ class SettingsDialog(QDialog):
             return widget
 
         return QLineEdit()
+
+    def _make_secret_widget(self, key: str) -> QWidget:
+        """An API-key field: the box, a Test button, and a line of feedback.
+
+        Self-contained in one form row so a credential can sit on whichever tab the
+        feature it belongs to lives on, rather than being exiled to Providers where
+        nobody thinks to look for it.
+        """
+        widget = QWidget()
+        column = QVBoxLayout(widget)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        edit = QLineEdit()
+        edit.setObjectName('value')
+        edit.setPlaceholderText(SECRET_PLACEHOLDERS.get(key, ''))
+        # Masked. A settings page gets opened over a shared screen, and a key sitting
+        # in plain text is a key read by whoever is watching.
+        edit.setEchoMode(QLineEdit.EchoMode.Password)
+        row.addWidget(edit, stretch=1)
+
+        # ...but you still have to be able to check what you pasted, so masking is a
+        # default rather than a wall.
+        reveal = QPushButton('Show')
+        reveal.setObjectName('reveal')
+        reveal.setCheckable(True)
+        reveal.setFixedWidth(64)
+        reveal.setToolTip('Show the key in plain text')
+        reveal.toggled.connect(
+            lambda shown, e=edit, b=reveal: self._reveal_secret(e, b, shown))
+        row.addWidget(reveal)
+
+        test = QPushButton('Test')
+        test.setFixedWidth(90)
+        test.setToolTip('Make one real request with this key')
+        test.clicked.connect(lambda _=False, k=key: self._test_secret(k))
+        row.addWidget(test)
+        column.addLayout(row)
+
+        status = QLabel(SECRET_HINTS.get(key, ''))
+        status.setObjectName('status')
+        status.setWordWrap(True)
+        status.setOpenExternalLinks(True)
+        # `a { color }` in the sheet, not just the palette's Link role: a rich-text
+        # QLabel honours this, and it keeps the link legible even if the label is
+        # restyled later with a dimmer colour for its own text.
+        status.setStyleSheet(
+            f'color: {TEXT_DIM}; font-size: 11px;')
+        status.setText(_link_coloured(status.text()))
+        # Added to the layout *before* the visibility is set, and that order matters:
+        # showing a widget that has no parent yet promotes it to a top-level window,
+        # so it flashes up as a stray little frame and vanishes again the moment
+        # addWidget reparents it. Layout first, then decide whether it shows.
+        column.addWidget(status)
+        # A key with nothing to say about it should not reserve a blank line.
+        status.setVisible(bool(status.text()))
+        return widget
 
     def _make_sources_widget(self) -> QWidget:
         """One checkbox per known book database.
@@ -367,11 +460,31 @@ class SettingsDialog(QDialog):
             if box is not None:
                 yield key, box
 
+    def _build_credentials_box(self) -> QWidget:
+        """Every service key, in one group at the top of the Providers tab.
+
+        First on the tab, because a credential is the one setting that cannot be
+        defaulted for you - and the only reason to open this page on a fresh install.
+        The LLM provider's own key stays in the Connection group below, since it
+        belongs to whichever provider is selected rather than to the app.
+        """
+        box = QGroupBox('Credentials')
+        form = QFormLayout(box)
+        for key in CREDENTIAL_KEYS:
+            default, kind, help_text = SCHEMA[key]
+            widget = self._make_widget(key, kind, default)
+            widget.setToolTip(help_text)
+            self.widgets[key] = widget
+            form.addRow(_pretty(key), widget)
+        return box
+
     def _build_provider_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
+
+        layout.addWidget(self._build_credentials_box())
 
         select_box = QGroupBox('Language model - active provider')
         select_form = QFormLayout(select_box)
@@ -443,7 +556,6 @@ class SettingsDialog(QDialog):
         self.provider_status.setStyleSheet(f'color: {TEXT_DIM};')
         layout.addWidget(self.provider_status)
 
-        layout.addWidget(self._build_book_database_box())
         layout.addStretch(1)
 
         # Scrolled, exactly like every schema tab. Unwrapped, this page's 737px of
@@ -458,81 +570,82 @@ class SettingsDialog(QDialog):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         return scroll
 
-    def _build_book_database_box(self) -> QWidget:
-        """The book databases' own credentials.
+    @staticmethod
+    def _reveal_secret(edit: QLineEdit, button: QPushButton, shown: bool) -> None:
+        edit.setEchoMode(QLineEdit.EchoMode.Normal if shown
+                         else QLineEdit.EchoMode.Password)
+        button.setText('Hide' if shown else 'Show')
 
-        Only one of the five needs anything, and it needs it absolutely: Google Books
-        answers every anonymous request with HTTP 429 because the shared project's daily
-        quota is zero. Without a key that source cannot return a single row, so the key
-        belongs somewhere you would look for it - beside the other service credentials -
-        rather than among the identification toggles.
-        """
-        box = QGroupBox('Book databases')
-        form = QFormLayout(box)
+    def _secret_status(self, key: str) -> Optional[QLabel]:
+        """The feedback label inside a 'secret' field's composite widget."""
+        widget = self.widgets.get(key)
+        return widget.findChild(QLabel, 'status') if widget is not None else None
 
-        key = 'AO_GOOGLE_BOOKS_KEY'
-        default, kind, help_text = SCHEMA[key]
-        widget = self._make_widget(key, kind, default)
-        widget.setToolTip(help_text)
-        if isinstance(widget, QLineEdit):
-            widget.setPlaceholderText('AIza... - leave empty to skip Google Books')
-        # Registered in self.widgets like every other setting, so it loads and saves
-        # with the rest of the page without any special handling.
-        self.widgets[key] = widget
+    def _say(self, key: str, message: str, mood: str = '') -> None:
+        colour = STATUS_TEXT[mood] if mood else TEXT_DIM
+        if (label := self._secret_status(key)) is not None:
+            label.setText(message)
+            label.setStyleSheet(f'color: {colour}; font-size: 11px;')
+            # It may have been built hidden (no hint text). A label hidden on the
+            # widget stays hidden until something shows it again, so a Test result
+            # would otherwise be written into an invisible label.
+            label.setVisible(bool(message))
 
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(6)
-        row_layout.addWidget(widget, stretch=1)
-        test = QPushButton('Test')
-        test.setFixedWidth(90)
-        test.setToolTip('Make one real request to Google Books with this key')
-        test.clicked.connect(self._test_google_books)
-        row_layout.addWidget(test)
-        form.addRow('Google Books API key', row)
+    def _test_secret(self, key: str) -> None:
+        """Spend one real request proving a key works, here rather than mid-scan."""
+        widget = self.widgets.get(key)
+        edit = widget.findChild(QLineEdit, 'value') if widget is not None else None
+        typed = edit.text().strip() if edit is not None else ''
+        if not typed:
+            self._say(key, 'Enter a key first - there is nothing to test.', 'risky')
+            return
 
-        self.google_status = QLabel(
-            'Free from console.cloud.google.com: enable the Books API, then create an '
-            'API key. Without one, Google Books is refused before it is even searched - '
-            'the other four databases need nothing.')
-        self.google_status.setWordWrap(True)
-        self.google_status.setStyleSheet(f'color: {TEXT_DIM}; font-size: 11px;')
-        form.addRow('', self.google_status)
-        return box
-
-    def _test_google_books(self) -> None:
-        """One real request, so a bad key is found here rather than mid-scan."""
-        from ..api_query import BookAPIClient
-
-        widget = self.widgets.get('AO_GOOGLE_BOOKS_KEY')
-        typed = widget.text().strip() if isinstance(widget, QLineEdit) else ''
-        self.google_status.setText('Asking Google Books...')
-        self.google_status.setStyleSheet(f'color: {TEXT_DIM}; font-size: 11px;')
+        self._say(key, 'Testing...')
         QApplication.processEvents()
+        try:
+            ok, message = self._probe_secret(key, typed)
+        except Exception as exc:  # a broken probe must not take the dialog with it
+            self._say(key, f'Could not test it: {exc}', 'rejected')
+            return
+        self._say(key, message, 'approved' if ok else 'rejected')
 
-        client = BookAPIClient(cache=None, sources=['googlebooks'], timeout=15,
-                              google_key=typed)
-        rows = client._search_googlebooks({'title': 'Dune', 'author': 'Frank Herbert'})
-        error = client.last_errors.get('googlebooks')
-        if rows:
-            self.google_status.setText(
-                f'Works - Google Books answered with {len(rows)} row(s) for a test '
-                f'lookup of Dune.')
-            colour = STATUS_TEXT['approved']
-        elif error:
-            # "Set a key in Settings" is the right advice in the panel and in the demo.
-            # Here, you are in Settings, looking at the field.
-            self.google_status.setText(error.replace(
-                ' Set a Google Books API key in Settings to use this source.',
-                ' Paste one into the field above.'))
-            colour = STATUS_TEXT['rejected']
-        else:
-            self.google_status.setText(
-                'The request went through but matched nothing, which is odd for Dune - '
-                'see the log.')
-            colour = STATUS_TEXT['risky']
-        self.google_status.setStyleSheet(f'color: {colour}; font-size: 11px;')
+    def _probe_secret(self, key: str, typed: str) -> tuple:
+        """Make the one request that proves ``key``, and describe what came back."""
+        if key == 'AO_SEARCH_BRAVE_KEY':
+            from ..web_search import WebSearchClient
+
+            client = WebSearchClient(cache=None, timeout=15)
+            client.brave_key = typed
+            try:
+                rows = client._brave('Dune Frank Herbert goodreads series')
+            except Exception as exc:
+                return False, f'Brave refused: {exc}'
+            if rows:
+                return True, (f'Works - Brave answered with {len(rows)} result(s) '
+                              f'for a test search.')
+            return False, ('The key was accepted but the search matched nothing, '
+                           'which is odd for Dune - see the log.')
+
+        if key == 'AO_GOOGLE_BOOKS_KEY':
+            from ..api_query import BookAPIClient
+
+            client = BookAPIClient(cache=None, sources=['googlebooks'], timeout=15,
+                                   google_key=typed)
+            rows = client._search_googlebooks({'title': 'Dune',
+                                               'author': 'Frank Herbert'})
+            if rows:
+                return True, (f'Works - Google Books answered with {len(rows)} '
+                              f'row(s) for a test lookup of Dune.')
+            if error := client.last_errors.get('googlebooks'):
+                # "Set a key in Settings" is right advice elsewhere. Here you are in
+                # Settings, looking at the field.
+                return False, error.replace(
+                    ' Set a Google Books API key in Settings to use this source.',
+                    ' Paste one into the field above.')
+            return False, ('The request went through but matched nothing, which is '
+                           'odd for Dune - see the log.')
+
+        return False, f'No test is wired up for {key}.'
 
     def _show_example(self, key: str) -> None:
         """Render the template being typed against a stand-in book."""
@@ -754,7 +867,7 @@ class SettingsDialog(QDialog):
             elif kind == 'percent':
                 widget.findChild(QLineEdit, 'value').setText(
                     str(int(round(self.settings.get_float(key) * 100))))
-            elif kind == 'path':
+            elif kind in ('path', 'secret'):
                 widget.findChild(QLineEdit, 'value').setText(value)
             else:
                 widget.setText(value)
@@ -917,7 +1030,7 @@ class SettingsDialog(QDialog):
                     values[key] = str(round(min(100, max(0, int(text))) / 100.0, 4))
                 except ValueError:
                     values[key] = SCHEMA[key][0]
-            elif kind == 'path':
+            elif kind in ('path', 'secret'):
                 values[key] = widget.findChild(QLineEdit, 'value').text().strip()
             else:
                 values[key] = widget.text().strip()
@@ -980,7 +1093,7 @@ class SettingsDialog(QDialog):
             elif kind == 'percent':
                 widget.findChild(QLineEdit, 'value').setText(
                     str(int(round(float(default) * 100))))
-            elif kind == 'path':
+            elif kind in ('path', 'secret'):
                 widget.findChild(QLineEdit, 'value').setText(default)
             else:
                 widget.setText(default)
@@ -1086,6 +1199,18 @@ _CHOICE_LABELS = {
     'comfortable': 'Comfortable',
     'large': 'Large',
 }
+
+
+def _link_coloured(html: str) -> str:
+    """Force every anchor to the theme's link colour.
+
+    Qt's built-in default is a dark blue intended for white backgrounds; on this
+    palette it renders as near-black on near-black. The palette's Link role covers
+    most of it, but a QLabel carrying its own ``color:`` in a stylesheet can still
+    win, so the colour goes on the anchors themselves.
+    """
+    return re.sub(r'<a\s+href=', f'<a style="color: {LINK}" href=', html or '',
+                  flags=re.I)
 
 
 def _choice_label(value: str) -> str:

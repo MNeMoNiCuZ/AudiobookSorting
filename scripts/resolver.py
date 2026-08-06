@@ -85,7 +85,8 @@ class Resolver:
         if self._search is None:
             from .web_search import WebSearchClient
             self._search = WebSearchClient(
-                cache=self.cache, timeout=self.settings.get_int('AO_TIMEOUT', 20))
+                cache=self.cache, timeout=self.settings.get_int('AO_TIMEOUT', 20),
+                settings=self.settings)
         return self._search
 
     @property

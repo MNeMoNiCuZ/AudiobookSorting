@@ -2,10 +2,19 @@
 
 Two complementary strategies:
 
-1. **Structured scrape** - fetch Goodreads/Audible/StoryGraph result pages directly and
-   pull metadata out of their JSON-LD blocks. Precise when it works.
-2. **Search snippets** - DuckDuckGo results, whose titles are often literally
-   "Title (Series, #3) by Author". Broad, noisier, but catches the long tail.
+1. **Structured scrape** - fetch the Goodreads search page directly and read the
+   book's own ``__NEXT_DATA__`` blob. Goodreads renders its React state into the
+   HTML server-side, so a plain HTTP GET already carries the fully-typed record -
+   title, series, position in series, author, ISBN - with no browser and no
+   guessing from markup. This is the precise route and it needs no JavaScript.
+2. **Search snippets** - a general web search, whose result titles are often
+   literally "Title (Series, #3) by Author". Broad, noisier, but catches the long
+   tail of books Goodreads misses.
+
+For (2), DuckDuckGo's endpoints now answer every request with an anti-bot
+challenge (HTTP 202 and no rows), so it cannot be relied on. Set a Brave Search
+API key to get a real engine back; DuckDuckGo is still tried last in case it
+recovers.
 
 Everything here is best-effort: any failure returns nothing and the resolver moves on.
 """
@@ -38,10 +47,15 @@ _SERIES_HASH = re.compile(r'\((?P<series>[^,)]+?),?\s*#(?P<index>\d+(?:\.\d+)?)\
 class WebSearchClient:
     """Best-effort metadata recovery from the open web."""
 
-    def __init__(self, cache=None, timeout: int = 20, scrape: bool = True):
+    def __init__(self, cache=None, timeout: int = 20, scrape: bool = True,
+                 settings=None):
         self.cache = cache
         self.timeout = timeout
         self.scrape = scrape
+        self.settings = settings
+        self.brave_key = ''
+        if settings is not None:
+            self.brave_key = (settings.get('AO_SEARCH_BRAVE_KEY', '') or '').strip()
         self.logger = logging.getLogger(__name__)
         self._last_request = 0.0
         self.min_interval = 1.0  # be polite; these are not APIs
@@ -75,11 +89,16 @@ class WebSearchClient:
                 return cached
 
         result: Dict[str, Any] = {}
-        for strategy in (self._from_goodreads, self._from_duckduckgo):
-            if not self.scrape and strategy is self._from_goodreads:
+        # Paired with a label rather than compared by identity: `self._from_goodreads`
+        # builds a fresh bound method on every attribute access, so `strategy is
+        # self._from_goodreads` was never true - which silently mislabelled every
+        # scrape as a search, and left scrape=False unable to switch scraping off.
+        engine = 'brave' if self.brave_key else 'duckduckgo'
+        for label, strategy in (('goodreads', self._from_goodreads),
+                                (engine, self._from_duckduckgo)):
+            if not self.scrape and label == 'goodreads':
                 continue
-            self.last_sites.append(
-                'goodreads' if strategy is self._from_goodreads else 'duckduckgo')
+            self.last_sites.append(label)
             try:
                 found = strategy(hints)
             except Exception as exc:
@@ -126,8 +145,12 @@ class WebSearchClient:
         return self._parse_book_page(book_html)
 
     def _parse_book_page(self, html: str) -> Dict[str, str]:
-        """Pull fields out of a book page's JSON-LD, falling back to its <title>."""
-        result: Dict[str, str] = {}
+        """Pull fields out of a book page, best source first.
+
+        ``__NEXT_DATA__`` is tried ahead of JSON-LD because it carries the position
+        in the series, which nothing else on the page states outright.
+        """
+        result = self._parse_next_data(html)
 
         for blob in re.findall(
                 r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
@@ -156,13 +179,77 @@ class WebSearchClient:
             for key, value in parsed.items():
                 result.setdefault(key, value)
 
-        # Goodreads renders the series as a link to /series/<id>-<name>
+        # Goodreads renders the series as a link to /series/<id>-<slug>, where the
+        # slug is the whole name hyphenated - "145951-arkham-horror". Stopping the
+        # capture at the first hyphen would yield just "arkham".
         if 'series' not in result:
-            series_match = re.search(r'/series/\d+[-_]([A-Za-z0-9_]+)', html)
+            series_match = re.search(r'/series/\d+-([A-Za-z0-9_-]+)', html)
             if series_match:
-                result['series'] = series_match.group(1).replace('_', ' ').strip()
+                slug = series_match.group(1).replace('_', ' ').replace('-', ' ')
+                result['series'] = slug.strip().title()
 
-        return result
+        return {k: _clean(v) for k, v in result.items() if _clean(v)}
+
+    def _parse_next_data(self, html: str) -> Dict[str, str]:
+        """Read Goodreads' server-rendered Apollo cache.
+
+        The page embeds the same normalised GraphQL store the site's own React app
+        runs on. Entities point at each other by ``__ref``, so the book's author and
+        series have to be followed by key rather than read inline.
+        """
+        match = re.search(
+            r'id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.S)
+        if not match:
+            return {}
+        try:
+            state = (json.loads(match.group(1))
+                     ['props']['pageProps']['apolloState'])
+        except (ValueError, KeyError, TypeError):
+            return {}
+        if not isinstance(state, dict):
+            return {}
+
+        def deref(node: Any) -> Dict[str, Any]:
+            """Follow a ``{'__ref': key}`` pointer into the store."""
+            if isinstance(node, dict):
+                if '__ref' in node:
+                    target = state.get(node['__ref'])
+                    return target if isinstance(target, dict) else {}
+                return node
+            return {}
+
+        # The page's own book is the only Book entity carrying a title; the rest are
+        # stubs for "readers also enjoyed" and similar rails.
+        book = next((v for v in state.values()
+                     if isinstance(v, dict) and v.get('__typename') == 'Book'
+                     and v.get('title')), None)
+        if not book:
+            return {}
+
+        result: Dict[str, str] = {'title': str(book['title'])}
+
+        author = deref(deref(book.get('primaryContributorEdge')).get('node'))
+        if author.get('name'):
+            result['author'] = str(author['name'])
+
+        series_list = book.get('bookSeries') or []
+        if isinstance(series_list, list) and series_list:
+            entry = series_list[0] if isinstance(series_list[0], dict) else {}
+            series = deref(entry.get('series'))
+            if series.get('title'):
+                result['series'] = str(series['title'])
+            # "10", but also "1-3" for omnibuses and "" when unnumbered.
+            position = str(entry.get('userPosition') or '').strip()
+            if re.fullmatch(r'\d+(?:\.\d+)?', position):
+                result['series_index'] = position
+
+        details = book.get('details')
+        if isinstance(details, dict):
+            for key in ('isbn', 'publisher'):
+                if details.get(key):
+                    result[key] = str(details[key])
+
+        return {k: _clean(v) for k, v in result.items() if _clean(v)}
 
     def _from_duckduckgo(self, hints: Dict[str, str]) -> Dict[str, str]:
         """Mine search-result titles, which frequently embed the series and index."""
@@ -193,31 +280,48 @@ class WebSearchClient:
         return merged
 
     def _ddg(self, query: str) -> List[Dict[str, str]]:
-        """DuckDuckGo results via the library if present, else the HTML endpoint.
+        """Search results from the best engine currently available.
 
-        Both routes get blocked or rate-limited in the real world. When that happens
-        the caller must be able to say *"the engine refused"* rather than *"there are
-        no results"* - they look identical from here, and only one of them is our
-        fault.
+        Brave first when a key is configured - it is a real API and answers
+        reliably. DuckDuckGo is only a fallback: its endpoints now return an
+        anti-bot challenge (HTTP 202, zero rows) to unattended callers, so it
+        usually contributes nothing.
+
+        When every engine refuses, the caller must be able to say *"the engine
+        refused"* rather than *"there are no results"* - they look identical from
+        here, and only one of them is our fault.
         """
         self.last_error = ''
+
+        if self.brave_key:
+            try:
+                results = self._brave(query)
+                if results:
+                    return results
+                self.last_error = 'Brave returned no rows'
+            except Exception as exc:
+                self.last_error = f'Brave search failed: {exc}'
+                self.logger.debug('Brave failed (%s), falling back to DuckDuckGo', exc)
+        else:
+            self.last_error = ('no AO_SEARCH_BRAVE_KEY set, so only DuckDuckGo is '
+                               'available and it blocks automated callers')
+
         try:
             from duckduckgo_search import DDGS
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=8)) or []
             if results:
                 return results
-            self.last_error = 'duckduckgo_search returned no rows'
+            self._note('duckduckgo_search returned no rows')
         except ImportError:
-            self.last_error = 'duckduckgo-search is not installed'
+            self._note('duckduckgo-search is not installed')
         except Exception as exc:
-            self.last_error = f'duckduckgo_search failed: {exc}'
+            self._note(f'duckduckgo_search failed: {exc}')
             self.logger.debug('duckduckgo_search failed (%s), falling back to HTML', exc)
 
         html = self._get_text(f'https://html.duckduckgo.com/html/?q={quote_plus(query)}')
         if not html:
-            self.last_error = (f'{self.last_error}; the HTML endpoint returned nothing '
-                               f'(blocked or rate-limited)').lstrip('; ')
+            self._note('the HTML endpoint returned nothing (blocked or rate-limited)')
             return []
         results = []
         for match in re.finditer(
@@ -230,7 +334,45 @@ class WebSearchClient:
             })
             if len(results) >= 8:
                 break
+        if not results:
+            self._note('the HTML endpoint served a page with no results in it')
         return results
+
+    def _note(self, message: str) -> None:
+        """Append to the running explanation of why a search came back empty.
+
+        Each engine gets to say why it failed, so "no Brave key, and DuckDuckGo
+        blocked us" reads as one story rather than only its last line.
+        """
+        self.last_error = f'{self.last_error}; {message}'.lstrip('; ')
+
+    def _brave(self, query: str) -> List[Dict[str, str]]:
+        """Query the Brave Search API, normalised to the same shape as the others."""
+        import requests
+
+        wait = self.min_interval - (time.time() - self._last_request)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request = time.time()
+
+        response = requests.get(
+            'https://api.search.brave.com/res/v1/web/search',
+            params={'q': query, 'count': 8},
+            timeout=self.timeout,
+            headers={'Accept': 'application/json',
+                     'X-Subscription-Token': self.brave_key})
+        if response.status_code == 429:
+            raise RuntimeError('rate limited (the free tier allows one query/second)')
+        if response.status_code in (401, 403):
+            raise RuntimeError(f'HTTP {response.status_code} - the API key was rejected')
+        if response.status_code != 200:
+            raise RuntimeError(f'HTTP {response.status_code}')
+
+        payload = response.json()
+        return [{'title': _clean(row.get('title')),
+                 'body': _clean(_strip_tags(row.get('description') or '')),
+                 'href': row.get('url') or ''}
+                for row in (payload.get('web', {}).get('results') or [])][:8]
 
     @staticmethod
     def _parse_result_title(text: str) -> Dict[str, str]:
@@ -313,3 +455,12 @@ def _strip_tags(html: str) -> str:
 def _unescape(text: str) -> str:
     import html as html_module
     return html_module.unescape(text or '').strip()
+
+
+def _clean(text: Any) -> str:
+    """Unescape entities and collapse runs of whitespace.
+
+    Both are needed on scraped fields: page titles arrive as "Wrath of N&apos;kai"
+    and Goodreads stores some author names with doubled spaces ("Joshua   Reynolds").
+    """
+    return re.sub(r'\s+', ' ', _unescape(str(text or ''))).strip()

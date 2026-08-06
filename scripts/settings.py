@@ -49,12 +49,20 @@ SCHEMA: Dict[str, tuple] = {
                        'Book databases to query, in order. Available: audnexus '
                        '(Audible), itunes (Apple Books), googlebooks, openlibrary, '
                        'librivox (public domain only).'),
-    'AO_GOOGLE_BOOKS_KEY': ('', 'str',
+    'AO_GOOGLE_BOOKS_KEY': ('', 'secret',
                             'Google Books API key. Without one that source cannot be '
                             'used at all: anonymous callers share a project whose daily '
                             'quota is zero, so every request comes back HTTP 429. A key '
                             'is free from console.cloud.google.com - enable the Books '
                             'API and create an API key.'),
+    'AO_SEARCH_BRAVE_KEY': ('', 'secret',
+                            'Brave Search API key, used by tier 4. Without one that '
+                            'tier can only fall back to DuckDuckGo, which now answers '
+                            'automated callers with an anti-bot challenge instead of '
+                            'results - so in practice tier 4 is reduced to scraping '
+                            'Goodreads directly. A key is free from '
+                            'brave.com/search/api (the free plan allows 2,000 queries '
+                            'a month, one per second).'),
     'AO_CONFIDENCE_SCORE': ('0.80', 'percent',
                             'How sure an identification must be before searching '
                             'stops. Lower it to accept looser matches, raise it to '
@@ -394,11 +402,15 @@ class Settings:
             for key, value in remaining.items():
                 lines.append(f'{key}={_quote(value)}')
 
+        self.env_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write('\n'.join(lines) + '\n')
+
+    def _write(self, text: str) -> None:
+        """Replace .env atomically, so an interrupted save cannot truncate it."""
         # with_suffix() is wrong for dotfiles: Path('.env').with_suffix('.tmp') is
         # '.tmp', not '.env.tmp'. Build the sibling name explicitly.
-        self.env_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.env_path.with_name(self.env_path.name + '.tmp')
-        tmp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        tmp.write_text(text, encoding='utf-8')
         tmp.replace(self.env_path)
         logger.info('Saved settings to %s', self.env_path)
 
@@ -437,7 +449,12 @@ class Settings:
         return {key: self.get(key) for key in SCHEMA}
 
     def ensure_file(self) -> None:
-        """Create .env from the built-in defaults if it does not exist yet."""
+        """Create .env from the built-in defaults if it does not exist yet.
+
+        Written through the shared layout, so a fresh install's file is already
+        sectioned and commented rather than a flat wall of keys. :meth:`save`
+        preserves that structure from then on.
+        """
         if self.env_path.exists():
             return
         self.set('AO_PROVIDERS', list(DEFAULT_PROVIDERS))
@@ -445,7 +462,10 @@ class Settings:
             self.set_provider(name, fields)
         for key, (default, _type, _help) in SCHEMA.items():
             self._values.setdefault(key, default)
-        self.save()
+
+        from .env_layout import render
+        self.env_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write(render(self._values))
 
 
 def _quote(value: str) -> str:

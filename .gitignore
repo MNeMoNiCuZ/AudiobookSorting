@@ -47,7 +47,12 @@ dmypy.json
 .ruff_cache/
 
 # Environments
+# .env.* as well as .env: the Settings page writes .env.tmp while saving, and a
+# hand-made .env.backup or .env.local holds exactly the same real keys the plain
+# name does. Only the committed template is exempt.
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/

@@ -11,6 +11,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.settings import Settings  # noqa: E402
 
+# The one QApplication for the whole session, and a module-level reference to it.
+#
+# Both matter. Qt allows exactly one application object per process, and a
+# function-scoped fixture that merely *returns* it holds the only Python reference to
+# it - so once that test finishes, the garbage collector is free to destroy the
+# running QApplication underneath every later test. The symptom is not an error; it
+# is the interpreter dying part-way through an unrelated file, at a different point
+# each run.
+_QT_APP = None
+
+
+@pytest.fixture(scope='session')
+def qt_app():
+    """A QApplication that outlives every test in the session."""
+    global _QT_APP
+    if _QT_APP is None:
+        from PyQt6.QtWidgets import QApplication
+        _QT_APP = QApplication.instance() or QApplication([])
+    return _QT_APP
+
 
 # Real MP3 frame headers, so mutagen can open these without decoding anything.
 # 32 frames of silence at 32kbps/44.1kHz - enough for a readable duration.

@@ -24,11 +24,6 @@ from scripts.gui.main_window import SHAPE_FILTERS, MainWindow         # noqa: E4
 from scripts.models import BookEntry, Field                           # noqa: E402
 
 
-@pytest.fixture(scope='session')
-def qt_app():
-    return QApplication.instance() or QApplication([])
-
-
 @pytest.fixture
 def window(qt_app, settings):
     win = MainWindow(settings)

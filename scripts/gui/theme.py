@@ -47,6 +47,12 @@ TEXT_SECONDARY = '#cbd2df'
 TEXT_DIM = '#98a1b2'
 TEXT_FAINT = '#69717f'
 
+# Hyperlinks. White rather than an accent tint: a link is usually the brightest thing
+# in a line of dim helper text, and Qt's own default is a near-black blue that is
+# invisible on this background. Underlined by Qt, so colour is not carrying the whole
+# signal on its own.
+LINK = '#ffffff'
+
 # "You cannot press this." Deliberately darker than TEXT_FAINT: a disabled control has
 # to be distinguishable from a merely quiet one at a glance, across the width of a
 # toolbar, without comparing it to its neighbour. Kept in step with
@@ -481,6 +487,10 @@ def apply_theme(app) -> None:
     palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(BG_RAISED))
     palette.setColor(QPalette.ColorRole.ToolTipText, QColor(TEXT))
     palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(TEXT_FAINT))
+    # Qt defaults this to a dark blue meant for white backgrounds, which on this
+    # palette renders a link as near-black text on near-black.
+    palette.setColor(QPalette.ColorRole.Link, QColor(LINK))
+    palette.setColor(QPalette.ColorRole.LinkVisited, QColor(LINK))
     # TEXT_FAINT was not faint enough to read as "unavailable" - it is the same grey
     # used for values that are merely absent. Disabled controls get their own, darker
     # colour, on every role Fusion reaches for.
