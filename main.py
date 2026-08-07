@@ -760,8 +760,20 @@ def run_gui(app: Application) -> int:
             app.reload_settings()
             window.refresh_mode_label()
             restyle()
+            # The naming settings are applied as a value is set, so books already in
+            # the list keep the old shape until they are re-cleaned. Do it here, or
+            # changing the style looks like it did nothing.
+            from scripts.models import renormalize
+            renamed = [entry for entry in app.data.all() if renormalize(entry)]
+            for entry in renamed:
+                app.data.update(entry)
+            if renamed:
+                window.set_entries(app.data.all())
             window._validate_entries()
-            window.show_message('Settings saved to .env')
+            window.show_message('Settings saved to .env'
+                                + (f', {len(renamed)} name'
+                                   f'{"" if len(renamed) == 1 else "s"} re-cleaned'
+                                   if renamed else ''))
             if app.settings.get('AO_INPUT_DIR') != before_input:
                 input_folder_changed(before_input)
 

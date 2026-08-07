@@ -401,6 +401,26 @@ def apply_text_filters(text: str) -> str:
     return text.strip()
 
 
+def renormalize(entry: 'BookEntry') -> bool:
+    """Re-clean an entry's name fields in place. True if anything moved.
+
+    Values are cleaned as they are set, so a name style changed afterwards would
+    otherwise only reach books identified from then on - the setting appears to do
+    nothing to the list in front of you. Called when the Settings page saves.
+
+    A field that cleans down to nothing is left alone: it is already on screen and
+    silently emptying it is worse than leaving it looking odd.
+    """
+    changed = False
+    for name in FILTERED_FIELDS:
+        field = getattr(entry, name)
+        cleaned = clean_value(name, field.value)
+        if cleaned and cleaned != field.value:
+            field.value = cleaned
+            changed = True
+    return changed
+
+
 def clean_value(name: str, value: Any) -> str:
     """Normalise a candidate value, rejecting the junk models and tags like to emit."""
     if value is None:
@@ -430,6 +450,11 @@ def clean_value(name: str, value: Any) -> str:
         text = apply_text_filters(text)
         if _tidy_punctuation:
             text = tidy_text(text)
+    if name == 'author':
+        # Imported here rather than at the top: quality is a leaf today, and a name
+        # style is not worth making models depend on it for good.
+        from .quality import format_author_initials
+        text = format_author_initials(text)
     return text
 
 

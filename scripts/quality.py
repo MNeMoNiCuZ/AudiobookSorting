@@ -50,6 +50,9 @@ _JOINED_WORDS = re.compile(r'^[A-Za-z]{24,}$')
 _SINGLE_LETTER_NAME = re.compile(r'(?<![\w.])([A-Za-z])(?![\w.])')
 _SPACED_INITIALS = re.compile(r'(?<=\b[A-Za-z]\.)\s+(?=[A-Za-z]\.)')
 _COMPACT_INITIALS = re.compile(r'(?<=\b[A-Za-z]\.)(?=[A-Za-z]\.)')
+# The surname run onto the last initial: "J.R.R.Tolkien". The lookbehind wants a
+# single letter, so "St.Clair" and "Dr.Who" are none of its business.
+_INITIAL_THEN_NAME = re.compile(r'(?<=\b[A-Za-z]\.)(?=[A-Za-z]{2,})')
 _author_initial_style = 'compact'
 
 # How much of the field's confidence each kind of finding costs. Multiplicative, so
@@ -103,8 +106,10 @@ def format_author_initials(author: str) -> str:
     """Add missing periods and apply the configured consecutive-initial style."""
     text = _SINGLE_LETTER_NAME.sub(r'\1.', str(author or '').strip())
     if _author_initial_style == 'spaced':
-        return _COMPACT_INITIALS.sub(' ', text)
-    return _SPACED_INITIALS.sub('', text)
+        text = _COMPACT_INITIALS.sub(' ', text)
+    else:
+        text = _SPACED_INITIALS.sub('', text)
+    return _INITIAL_THEN_NAME.sub(' ', text)
 
 
 def inspect_value(field: str, value: str) -> List[Finding]:

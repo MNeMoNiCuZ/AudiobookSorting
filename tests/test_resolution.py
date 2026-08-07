@@ -387,6 +387,50 @@ def test_author_initial_warning_follows_the_configured_style(style, author, fixe
         set_author_initial_style('compact')
 
 
+@pytest.mark.parametrize('style,author,expected', [
+    ('compact', 'J. R. R. Tolkien', 'J.R.R. Tolkien'),
+    ('compact', 'J R R Tolkien', 'J.R.R. Tolkien'),
+    ('compact', 'J.R.R.Tolkien', 'J.R.R. Tolkien'),
+    ('compact', 'J.R.R. Tolkien', 'J.R.R. Tolkien'),
+    ('spaced', 'J.R.R. Tolkien', 'J. R. R. Tolkien'),
+    ('spaced', 'J.R.R.Tolkien', 'J. R. R. Tolkien'),
+    ('spaced', 'J. R. R. Tolkien', 'J. R. R. Tolkien'),
+    # Not initials, and not to be touched.
+    ('compact', 'Emily St. John Mandel', 'Emily St. John Mandel'),
+    ('spaced', 'Ursula K. Le Guin', 'Ursula K. Le Guin'),
+])
+def test_author_initial_style_is_applied_to_the_value(style, author, expected):
+    """The style is a naming rule, not only a warning: it reaches the stored value."""
+    from scripts.models import clean_value
+    from scripts.quality import set_author_initial_style
+
+    try:
+        set_author_initial_style(style)
+        assert clean_value('author', author) == expected
+    finally:
+        set_author_initial_style('compact')
+
+
+def test_renormalize_applies_a_changed_style_to_books_already_listed():
+    from scripts.models import renormalize
+    from scripts.quality import set_author_initial_style
+
+    try:
+        set_author_initial_style('compact')
+        entry = BookEntry(author=Field('J.R.R. Tolkien', 'user', 0.9),
+                          title=Field('The Hobbit', 'metadata', 0.8))
+        assert not renormalize(entry)
+
+        set_author_initial_style('spaced')
+        assert renormalize(entry)
+        assert entry.author.value == 'J. R. R. Tolkien'
+        # Provenance survives a reshaping: it is the same value, spelled the way
+        # the settings now ask for.
+        assert entry.author.source == 'user'
+    finally:
+        set_author_initial_style('compact')
+
+
 @pytest.mark.parametrize('author', [
     'Amy S. Exampleton', 'F. Scott Exampleton', 'A.B. Exampleton',
     'Emily St. Exampleton', 'George R.R. Exampleton',
