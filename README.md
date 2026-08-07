@@ -316,9 +316,15 @@ Also available:
 - **`AO_BLOCKED_WORDS`** — a comma-separated list of words and phrases struck out of
   author, series and title as they are identified. Blocking `series` turns
   `The Expanse Series` into `The Expanse`. Whole words only, case-insensitive, so
-  `Seriously Funny` survives.
+  `Seriously Funny` survives. Defaults to
+  `unabridged, audiobook, series, full-cast, 2nd edition`; clear it to block nothing.
 - **`AO_STRIP_PARENTHESES`** — drop bracketed asides: `Mistborn (Unabridged) [Audiobook]`
   becomes `Mistborn`. On by default; `()`, `[]` and `{}` are all treated the same.
+- **`AO_TIDY_PUNCTUATION`** — the last step, run after everything above has had its say:
+  closes the seams the removals leave behind. Empty brackets (`Mistborn () - Book 1` →
+  `Mistborn - Book 1`), brackets left half-open, runs of commas and dashes, a space in
+  front of a comma, punctuation dangling at either end. Punctuation that is part of the
+  name is left alone, so `Spider-Man: No Way Home` and `Jr.` survive. On by default.
 - **`AO_RENAME_SUPPORT_FILES`** — rename the files that travel with the book (cover art,
   `.epub`, `.pdf`, `.nfo`, `.cue`, `.txt`) to match the audio. Only when a file is the
   only one of its extension in the folder, because two `.jpg`s renamed to one stem would

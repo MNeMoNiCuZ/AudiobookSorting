@@ -302,6 +302,33 @@ def test_blocked_words_and_brackets_are_stripped():
         set_text_filters('', strip_parentheses=True)
 
 
+def test_punctuation_left_by_the_filters_is_tidied():
+    from scripts.models import clean_value, set_text_filters
+
+    try:
+        # Brackets kept, so the tidy is the only thing closing the seams.
+        set_text_filters('unabridged, audiobook, series', strip_parentheses=False)
+        assert clean_value('title', 'Mistborn (Unabridged) - Book 1') == 'Mistborn - Book 1'
+        assert clean_value('title', 'Mistborn [Audiobook], , Vol. 2') == 'Mistborn, Vol. 2'
+        assert clean_value('title', 'The Expanse Series -- Book 3') == 'The Expanse - Book 3'
+        assert clean_value('title', 'A - Audiobook - B') == 'A - B'
+        assert clean_value('author', 'Smith, Unabridged.') == 'Smith.'
+        # A bracket whose partner went with the words is not left half-open.
+        assert clean_value('title', 'Mistborn (Unabridged') == 'Mistborn'
+        # Removing a bracket wedged between two words leaves the word boundary.
+        assert clean_value('title', 'Title(Unabridged)Sub') == 'Title Sub'
+        # Punctuation that belongs to the name is not touched.
+        assert clean_value('title', 'Spider-Man: No Way Home') == 'Spider-Man: No Way Home'
+        assert clean_value('author', 'Neil Gaiman & Terry Pratchett') == \
+            'Neil Gaiman & Terry Pratchett'
+
+        # Off, and the same seams are left exactly as they were found.
+        set_text_filters('unabridged', strip_parentheses=False, tidy_punctuation=False)
+        assert clean_value('title', 'Mistborn (Unabridged) - Book 1') == 'Mistborn ( ) - Book 1'
+    finally:
+        set_text_filters('', strip_parentheses=True)
+
+
 def test_reserved_names_are_escaped():
     assert sanitize_component('CON') == '_CON'
     assert sanitize_component('NUL') == '_NUL'

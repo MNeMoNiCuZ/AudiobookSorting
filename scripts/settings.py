@@ -101,11 +101,14 @@ SCHEMA: Dict[str, tuple] = {
                                 'Rename companion files to match the audio files.'),
     'AO_COLLISION_POLICY': ('suffix', 'choice:suffix|skip|merge|overwrite',
                             'What to do when the destination already exists.'),
-    'AO_BLOCKED_WORDS': ('', 'str',
+    'AO_BLOCKED_WORDS': ('unabridged, audiobook, series, full-cast, 2nd edition', 'str',
                          'Comma-separated words removed from author, series and '
                          'title. Example: series, unabridged, audiobook.'),
     'AO_STRIP_PARENTHESES': ('true', 'bool',
                              'Remove bracketed asides such as (Unabridged) from names.'),
+    'AO_TIDY_PUNCTUATION': ('true', 'bool',
+                            'Last step: close the seams the removals leave - empty '
+                            'brackets, stray commas and dashes.'),
     'AO_ILLEGAL_CHARS': ('smart', 'choice:smart|dash|underscore|space|remove',
                          'How unsupported filename characters are replaced.'),
     'AO_WARN_DIRTY_OUTPUT': ('true', 'bool',

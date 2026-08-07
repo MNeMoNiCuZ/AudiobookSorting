@@ -270,14 +270,17 @@ def pretty_status(status: str) -> str:
 # Settings to hand - the same reasoning as paths.set_illegal_char_mode.
 _blocked: tuple = ()
 _strip_parentheses = True
+_tidy_punctuation = True
 
 # The fields a name filter has any business touching. Numbers are not names.
 FILTERED_FIELDS = ('author', 'series', 'title')
 
 
-def set_text_filters(blocked: Any = '', strip_parentheses: bool = True) -> None:
+def set_text_filters(blocked: Any = '', strip_parentheses: bool = True,
+                     tidy_punctuation: bool = True) -> None:
     """Configure the blocked words and bracket stripping for the whole process."""
-    global _blocked, _strip_parentheses
+    global _blocked, _strip_parentheses, _tidy_punctuation
+    _tidy_punctuation = bool(tidy_punctuation)
     if isinstance(blocked, str):
         # A comma-separated list is what people type; newlines are what they get when
         # they paste one. Both work, and a term may be several words long.
@@ -296,6 +299,85 @@ def strip_parentheses_enabled() -> bool:
     return _strip_parentheses
 
 
+def tidy_punctuation_enabled() -> bool:
+    return _tidy_punctuation
+
+
+# Brackets, and the punctuation a removed word can leave stranded. The backslash is
+# there so the hyphen is a literal inside the character classes these build.
+_CLOSER_OF = {'(': ')', '[': ']', '{': '}'}
+_OPENER_OF = {v: k for k, v in _CLOSER_OF.items()}
+_SEPARATOR = ',;:\\-–—'
+
+
+def _remove_brackets(text: str, inner: str) -> str:
+    """Delete bracketed spans whose contents match ``inner``, innermost-out.
+
+    Two passes per round because a bracket wedged between two words is a word
+    boundary: dropping it from "Title(Unabridged)Sub" must leave "Title Sub", not
+    "TitleSub", while the ordinary case takes the space in front of it with it.
+    """
+    span = r'[\(\[\{]%s[\)\]\}]' % inner
+    while True:
+        shrunk = re.sub(r'(?<=\w)\s*%s\s*(?=\w)' % span, ' ', text)
+        shrunk = re.sub(r'\s*%s' % span, '', shrunk)
+        if shrunk == text:
+            return text
+        text = shrunk
+
+
+def _drop_unbalanced_brackets(text: str) -> str:
+    """Remove brackets with no partner: "Mistborn (" is a wound, not a name."""
+    stack: list = []
+    doomed: set = set()
+    for index, char in enumerate(text):
+        if char in _CLOSER_OF:
+            stack.append(index)
+        elif char in _OPENER_OF:
+            if stack and text[stack[-1]] == _OPENER_OF[char]:
+                stack.pop()
+            else:
+                doomed.add(index)
+    doomed.update(stack)
+    if not doomed:
+        return text
+    return ''.join(c for i, c in enumerate(text) if i not in doomed)
+
+
+def tidy_text(text: str) -> str:
+    """The last-step tidy: what is left once words have been struck out of a name.
+
+    Blocking "unabridged" in "Mistborn (Unabridged) - Book 1" empties the brackets
+    and orphans the dash. This closes those seams - empty and half-open brackets,
+    doubled separators, space before a comma - without touching punctuation that is
+    part of the name, so "Spider-Man" and "Vol. 2" come through unchanged.
+    """
+    # Emptied brackets go first, innermost-out: clearing "(Book One ())" leaves
+    # "(Book One)" on the first pass and needs a second to see nothing is left.
+    text = _remove_brackets(text, r'[\s%s._·|/]*' % _SEPARATOR)
+    text = _drop_unbalanced_brackets(text)
+    if text.count('"') == 1:
+        text = text.replace('"', '')
+
+    # A run of separators is the scar of a removed word; the first one survives.
+    text = re.sub(r'([%s])(?:\s*[%s])+' % (_SEPARATOR, _SEPARATOR), r'\1', text)
+
+    # A separator running into a full stop loses to the full stop: "Smith,." is "Smith."
+    text = re.sub(r'[%s]+\s*([.!?])' % _SEPARATOR, r'\1', text)
+    text = re.sub(r'\s*([,;:])\s*', r'\1 ', text)
+    text = re.sub(r'\s+([.!?])', r'\1', text)
+    text = re.sub(r'([\(\[\{])\s+', r'\1', text)
+    text = re.sub(r'\s+([\)\]\}])', r'\1', text)
+    text = re.sub(r'(\w)([\(\[\{])', r'\1 \2', text)
+    # A separator against a bracket edge had its other side removed with the word.
+    text = re.sub(r'([\(\[\{])[\s%s]+' % _SEPARATOR, r'\1', text)
+    text = re.sub(r'[\s%s]+([\)\]\}])' % _SEPARATOR, r'\1', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    # Trailing "." and "!" stay: "Jr." and "Hello!" are how the name is written.
+    text = re.sub(r'^[\s%s._]+|[\s%s_]+$' % (_SEPARATOR, _SEPARATOR), '', text)
+    return text.strip()
+
+
 def apply_text_filters(text: str) -> str:
     """Drop bracketed asides and blocked terms from one name, then tidy the seam.
 
@@ -304,12 +386,7 @@ def apply_text_filters(text: str) -> str:
     punctuation, and the caller treats that as an empty field.
     """
     if _strip_parentheses:
-        # Innermost-out, so "Title (Book One (Unabridged))" clears in one pass.
-        while True:
-            stripped = re.sub(r'\s*[\(\[\{][^\(\)\[\]\{\}]*[\)\]\}]', '', text)
-            if stripped == text:
-                break
-            text = stripped
+        text = _remove_brackets(text, r'[^\(\)\[\]\{\}]*')
 
     for term in _blocked:
         # Whole words only: blocking "series" must not gut "Seriously".
@@ -351,6 +428,8 @@ def clean_value(name: str, value: Any) -> str:
     text = re.sub(r'\s+', ' ', text)
     if name in FILTERED_FIELDS:
         text = apply_text_filters(text)
+        if _tidy_punctuation:
+            text = tidy_text(text)
     return text
 
 
