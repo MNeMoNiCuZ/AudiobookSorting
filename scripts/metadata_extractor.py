@@ -106,6 +106,10 @@ class MetadataExtractor:
         raw: Dict[str, str] = {}
         try:
             for key, value in dict(audio.tags).items():
+                normal_key = str(key).casefold()
+                if any(name in normal_key for name in
+                       ('covr', 'apic', 'metadata_block_picture')):
+                    continue
                 text = _stringify(value)
                 if text:
                     raw[str(key)] = text

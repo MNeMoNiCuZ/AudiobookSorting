@@ -20,11 +20,11 @@ from scripts.gui.settings_dialog import (CREDENTIAL_KEYS, TABS, SettingsComboBox
 # Keys that are state rather than settings: window geometry, column widths, the toolbar
 # layout and the recent-folder list are all written by the UI as you use it.
 NOT_ON_A_TAB = {'AO_UI_HIDDEN_COLUMNS', 'AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS',
-                'AO_UI_COPY_RECENT_LIST', 'AO_TOOLBAR', 'AO_PROVIDER'}
+                'AO_UI_COPY_RECENT_LIST', 'AO_TOOLBAR', 'AO_PROVIDER',
+                'AO_TEMPERATURE', 'AO_MAX_TOKENS', 'AO_TIMEOUT', 'AO_MAX_RETRIES'}
 
 # Built by the Providers tab rather than listed in TABS.
-PROVIDER_TAB_KEYS = {'AO_TEMPERATURE', 'AO_MAX_TOKENS', 'AO_TIMEOUT', 'AO_MAX_RETRIES',
-                     'AO_GOOGLE_BOOKS_KEY', 'AO_SEARCH_BRAVE_KEY'}
+PROVIDER_TAB_KEYS = {'AO_GOOGLE_BOOKS_KEY', 'AO_SEARCH_BRAVE_KEY'}
 
 
 @pytest.fixture
@@ -68,6 +68,13 @@ def test_identification_stage_names_live_in_the_menu(dialog):
     assert [combo.itemText(index) for index in range(combo.count())] == [
         '1 - Audio tags', '2 - File and folder names', '3 - Book databases',
         '4 - Web search', '5 - Language model']
+
+
+def test_identification_threshold_name_and_default(dialog):
+    assert SCHEMA['AO_CONFIDENCE_SCORE'][0] == '0.80'
+    label = next(label for label in dialog.findChildren(QLabel)
+                 if label.text() == 'Identification Threshold')
+    assert label.toolTip() == SCHEMA['AO_CONFIDENCE_SCORE'][2]
 
 
 def test_closed_settings_dropdown_ignores_wheel_input(dialog):
@@ -126,6 +133,28 @@ def test_the_provider_tab_gathers_every_credential(dialog):
     for key in CREDENTIAL_KEYS:
         widget = dialog.widgets[key]
         assert tab.isAncestorOf(widget), f'{key} is not on the Providers tab'
+
+
+def test_provider_tab_only_exposes_user_connection_fields(dialog):
+    assert set(dialog.provider_widgets) == {'BASE_URL', 'API_KEY'}
+    groups = [group.title() for group in dialog.findChildren(QGroupBox)]
+    assert 'Generation' not in groups
+
+
+def test_model_selection_enables_save_and_is_persisted(dialog, settings):
+    models = [
+        {'id': 'model/one', 'label': 'One', 'description': '',
+         'is_collection': False, 'member_count': None, 'members': []},
+        {'id': 'model/two', 'label': 'Two', 'description': '',
+         'is_collection': False, 'member_count': None, 'members': []},
+    ]
+    dialog._models_arrived(dialog.provider_combo.currentText(), models, False)
+    dialog.model_combo.setCurrentIndex(dialog.model_combo.findData('model/two'))
+
+    assert dialog.save_button.isEnabled()
+    dialog._save()
+    settings.reload()
+    assert settings.provider(dialog.provider_combo.currentText())['MODEL'] == 'model/two'
 
 
 def test_the_google_books_key_round_trips(dialog):

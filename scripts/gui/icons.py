@@ -170,6 +170,16 @@ def _approve(painter: QPainter, colour: str) -> None:
     painter.drawPath(tick)
 
 
+def _checkmark(painter: QPainter, colour: str) -> None:
+    """Plain checkmark used by compact confirmation buttons."""
+    tick = QPainterPath()
+    tick.moveTo(5.2, 12.0)
+    tick.lineTo(10.0, 16.8)
+    tick.lineTo(18.8, 7.2)
+    painter.setPen(_pen(colour, STROKE * 1.15))
+    painter.drawPath(tick)
+
+
 def _reject(painter: QPainter, colour: str) -> None:
     """Cross in a circle - the exact counterpart of approve, same weight, same ring."""
     painter.setPen(_pen(colour))
@@ -189,6 +199,22 @@ def _reset(painter: QPainter, colour: str) -> None:
     painter.setPen(_pen(colour))
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawEllipse(QPointF(12, 12), 8.8, 8.8)
+
+
+def _warning(painter: QPainter, colour: str) -> None:
+    """Lightweight warning triangle for ignored-warning menu actions."""
+    path = QPainterPath()
+    path.moveTo(12.0, 2.8)
+    path.lineTo(21.0, 20.4)
+    path.lineTo(3.0, 20.4)
+    path.closeSubpath()
+    painter.setPen(_pen(colour, 1.8))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(path)
+    painter.drawLine(QPointF(12.0, 8.0), QPointF(12.0, 14.2))
+    painter.setBrush(QBrush(QColor(colour)))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(QPointF(12.0, 17.2), 1.1, 1.1)
 
 
 def _preview(painter: QPainter, colour: str) -> None:
@@ -368,6 +394,7 @@ SHAPES: Dict[str, Callable[[QPainter, str], None]] = {
     'sources': _sources,
     'identify': _identify,
     'approve': _approve,
+    'checkmark': _checkmark,
     'reject': _reject,
     'reset': _reset,
     'preview': _preview,
@@ -376,6 +403,8 @@ SHAPES: Dict[str, Callable[[QPainter, str], None]] = {
     'goodreads': _goodreads,
     'settings': _settings,
     'cancel': _reject,
+    'warning': _warning,
+    'warnings': _warning,
 }
 
 

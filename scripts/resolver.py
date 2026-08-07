@@ -285,19 +285,15 @@ class Resolver:
             # tags we couldn't map are very different problems for the user.
             if raw:
                 entry.log('metadata',
-                          f'{Path(entry.primary_audio).name} has {len(raw)} tag(s), none '
-                          f'naming a title/author/series: {", ".join(sorted(raw))}',
+                          'No book identity tags',
                           {'tags': dict(raw)})
             else:
-                entry.log('metadata',
-                          f'{Path(entry.primary_audio).name} carries no tags at all')
+                entry.log('metadata', 'No embedded tags')
             return
         changed = [name for name in ('author', 'title', 'series', 'series_index')
                    if name in found and entry.set_field(name, found[name], 'metadata')]
         entry.log('metadata',
-                  'Read from the tags embedded in '
-                  + Path(entry.primary_audio).name + ':\n'
-                  + '\n'.join(f'  {name}: "{value}"' for name, value in found.items()),
+                  'Read embedded tags',
                   {'applied': changed, 'result': dict(found)})
 
     def _tier_regex(self, entry: BookEntry) -> None:
@@ -317,20 +313,12 @@ class Resolver:
         contributions = found.pop('_from', {})
         if not found:
             entry.log('regex',
-                      f'Nothing parseable in "{relative}". Every component was '
-                      f'examined ({" / ".join(considered) or "none"}) and none of them '
-                      f'has an author/series/title structure. The path is still used '
-                      f'as a search query by the tiers below.',
+                      'No identity fields parsed',
                       {'path': relative, 'considered': considered})
             return
         changed = [name for name in ('author', 'title', 'series', 'series_index')
                    if name in found and entry.set_field(name, found[name], 'regex')]
-        detail = '\n'.join(
-            f'  {name}: "{value}"'
-            + (f'   (from "{contributions[name]}")' if contributions.get(name) else '')
-            for name, value in found.items())
-        entry.log('regex',
-                  f'Parsed "{relative}" as {pattern or "a bare title"}:\n{detail}',
+        entry.log('regex', 'Parsed filename and folders',
                   {'applied': changed, 'path': relative, 'considered': considered,
                    'from': contributions, 'result': dict(found)})
 
@@ -492,7 +480,8 @@ class Resolver:
         if held:
             summary += '\nKept the existing value for ' + '; '.join(held)
         entry.log('search', summary,
-                  {'applied': changed, 'held': held, 'results': raw[:8]})
+                  {'applied': changed, 'held': held, 'result': dict(result),
+                   'results': raw[:10]})
 
     def _tier_llm(self, entry: BookEntry) -> None:
         if self._llm_failed:
@@ -722,6 +711,8 @@ class Resolver:
         threshold and turns up in the review queue where a person can look at it.
         """
         entry.warnings = []
+        entry.warnings_checked_values = {
+            name: entry.value(name) for name in ('author', 'series', 'title')}
         # Whatever was docked last time is given back first, so this is a fresh
         # judgement of the values as they stand rather than another round of the same
         # punishment. Re-running identification must not erode a field's confidence.
@@ -748,6 +739,7 @@ class Resolver:
             return
 
         entry.warnings = [finding.message for finding in findings]
+        entry.warnings_silenced = False
         for name, factor in penalties(findings).items():
             field = entry.get_field(name)
             # A value you typed yourself is never second-guessed: you looked at the
@@ -757,9 +749,7 @@ class Resolver:
             field.confidence = round(field.confidence * factor, 3)
             entry.quality_penalties[name] = [str(field.value), factor]
         entry.log('quality',
-                  'These values look like a search result that came back malformed. '
-                  'Their confidence has been lowered so they surface for review:\n'
-                  + '\n'.join(f'  - {message}' for message in entry.warnings),
+                  '\n'.join(entry.warnings),
                   {'findings': entry.warnings})
 
     def _finalise(self, entry: BookEntry) -> None:

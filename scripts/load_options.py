@@ -16,7 +16,7 @@ from dataclasses import field as dataclass_field
 from typing import Dict, Iterable, List, Optional
 
 from .models import (IDENTITY_FIELDS, STATUS_APPLIED, STATUS_APPROVED,
-                     STATUS_PENDING, BookEntry, Field)
+                     STATUS_PENDING, STATUS_RISKY, BookEntry, Field)
 
 
 @dataclass
@@ -153,25 +153,23 @@ def apply_keep(entries: Iterable[BookEntry], keep: KeepOptions) -> LoadPlan:
         entry.pending_overwrites = []
         entry.quality_penalties = {}
         entry.warnings = []
+        entry.warnings_silenced = False
+        entry.warnings_checked_values = {}
         entry.resolved = False
-        entry.log('user', f'Cleared on load: {", ".join(losing)}')
     return plan
 
 
 def unsaved_entries(entries: Iterable[BookEntry]) -> List[BookEntry]:
     """Books carrying work that has not been written to the output folder yet.
 
-    "Saved" is what the Save button does - files moved into place - so unsaved means
-    a book you typed into, or approved, that is still only a row in this table.
-    Rejected rows are decided but are never written anywhere, so they are not waiting
-    on anything and do not count.
+    Unsaved means work has been run on a book after loading it, but the result has not
+    received an approve or reject decision. Finalization is deliberately unrelated.
     """
     out = []
     for entry in entries:
         if is_applied(entry):
             continue
-        typed = any(entry.get_field(name).source == 'user'
-                    for name in IDENTITY_FIELDS)
-        if typed or entry.status == STATUS_APPROVED:
+        if (entry.explicit_work_pending
+                and entry.status in (STATUS_PENDING, STATUS_RISKY)):
             out.append(entry)
     return out

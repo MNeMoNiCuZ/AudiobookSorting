@@ -19,18 +19,22 @@ rather than on the toolbar, so the toolbar stays short enough to read at a glanc
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from PyQt6.QtCore import QEvent, QObject, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import (QAction, QColor, QFont, QKeySequence,
+from PyQt6.QtGui import (QAction, QColor, QFont, QIcon, QKeySequence, QPainter,
                          QPixmap, QShortcut)
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QGridLayout,
+    QHBoxLayout, QHeaderView,
     QInputDialog,
-    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+    QProgressBar,
     QPushButton, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
-    QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QTextEdit, QToolBar, QToolButton, QToolTip, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from ..models import (IDENTITY_FIELDS, STATUS_APPROVED, STATUS_PENDING,
@@ -38,6 +42,7 @@ from ..models import (IDENTITY_FIELDS, STATUS_APPROVED, STATUS_PENDING,
 from .delegates import (KIND_CONFIDENCE, KIND_COVER, KIND_FILES, KIND_STATUS,
                         ROLE_CONFIDENCE, ROLE_ENTRY_ID, ROLE_FLASH, ROLE_KIND,
                         ROLE_PROGRESS, ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
+                        ROLE_WARNING, ROLE_WARNING_IGNORED,
                         ReviewDelegate)
 from .cover_viewer import CoverViewer
 from .icons import badged_icon
@@ -115,7 +120,7 @@ SHAPE_FILTERS = [
     # read the whole table.
     ('Unsaved changes', lambda e: not e.applied_path and any(
         getattr(e, name).source == 'user' for name in IDENTITY_FIELDS)),
-    ('Flagged as odd', lambda e: bool(getattr(e, 'warnings', None))),
+    ('Has Warnings', lambda e: bool(getattr(e, 'warnings', None))),
 ]
 
 # The identification sources the user can switch on and off per run. The key is the
@@ -181,6 +186,95 @@ class _KeyedItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+ROLE_WARNING_SORT = int(Qt.ItemDataRole.UserRole) + 20
+ROLE_WARNING_VALUE = int(Qt.ItemDataRole.UserRole) + 21
+
+
+class _WarningItem(QTreeWidgetItem):
+    """Sort warning file cells by folder first and filename second."""
+
+    def __lt__(self, other) -> bool:
+        tree = self.treeWidget()
+        column = tree.sortColumn() if tree is not None else -1
+        if column == 0:
+            return tuple(self.data(0, ROLE_WARNING_SORT) or ()) < tuple(
+                other.data(0, ROLE_WARNING_SORT) or ())
+        if 1 <= column <= 6:
+            return str(self.data(column, ROLE_WARNING_VALUE) or '').casefold() < str(
+                other.data(column, ROLE_WARNING_VALUE) or '').casefold()
+        return super().__lt__(other)
+
+
+class _ElidingLineEdit(QLineEdit):
+    """Left-aligned editor that elides long inactive text instead of centering it."""
+
+    def paintEvent(self, event) -> None:
+        if self.hasFocus():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        text_rect = self.rect().adjusted(5, 0, -5, 0)
+        text = self.fontMetrics().elidedText(
+            self.text(), Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            text)
+
+
+class _WarningTree(QTreeWidget):
+    """Keep warning columns proportional to the main table after Qt polishes them."""
+
+    ACTION_WIDTH = 16
+    BASE_WIDTHS = (DEFAULT_WIDTHS[COL_FILES], DEFAULT_WIDTHS[COL_AUTHOR],
+                   DEFAULT_WIDTHS[COL_SERIES], DEFAULT_WIDTHS[COL_INDEX],
+                   DEFAULT_WIDTHS[COL_TITLE], 178, ACTION_WIDTH, ACTION_WIDTH)
+    SHARES = (STRETCH[COL_FILES], STRETCH[COL_AUTHOR], STRETCH[COL_SERIES],
+              0.0, STRETCH[COL_TITLE], STRETCH[COL_TITLE], 0.0, 0.0)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fitting_columns = False
+        self.header().sectionResized.connect(self._column_resized)
+
+    def _fit_columns(self, fixed_column: Optional[int] = None) -> None:
+        available = self.viewport().width()
+        if available <= 0 or self._fitting_columns:
+            return
+        widths = [self.columnWidth(column) for column in range(self.columnCount())]
+        spare = available - sum(widths) - 2
+        flexible = [column for column, share in enumerate(self.SHARES)
+                    if share > 0 and column != fixed_column]
+        total_share = sum(self.SHARES[column] for column in flexible)
+        if not flexible or total_share <= 0 or abs(spare) < 1:
+            return
+        self._fitting_columns = True
+        try:
+            remaining = spare
+            for column in flexible[:-1]:
+                change = round(spare * self.SHARES[column] / total_share)
+                self.setColumnWidth(column, max(44, widths[column] + change))
+                remaining -= self.columnWidth(column) - widths[column]
+            column = flexible[-1]
+            self.setColumnWidth(column, max(44, widths[column] + remaining))
+        finally:
+            self._fitting_columns = False
+
+    def _column_resized(self, column: int, _old_size: int, _new_size: int) -> None:
+        if not self._fitting_columns and self.isVisible():
+            self._fit_columns(column)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._fit_columns)
+
+    def resizeEvent(self, event) -> None:
+        self._window_resize_pending = True
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._fit_columns)
+
+
 class _RightClickFilter(QObject):
     """Turns a right-click on one widget into a call, whatever Qt calls the event."""
 
@@ -213,6 +307,50 @@ class _RightClickFilter(QObject):
                 and kind == QEvent.Type.MouseButtonRelease
                 and event.button() == Qt.MouseButton.MiddleButton):
             return True
+        return super().eventFilter(watched, event)
+
+
+class _WarningBadgeFilter(QObject):
+    """Give the painted confidence warning badge its own mouse interactions."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self._hovering = False
+
+    def eventFilter(self, watched, event) -> bool:
+        kind = event.type()
+        if kind == QEvent.Type.MouseMove:
+            position = event.position().toPoint()
+            index = self.window.table.indexAt(position)
+            if self.window._warning_badge_hit(index, position):
+                QToolTip.showText(event.globalPosition().toPoint(),
+                                  index.data(Qt.ItemDataRole.ToolTipRole), watched)
+                self._hovering = True
+            elif self._hovering:
+                QToolTip.hideText()
+                self._hovering = False
+        if kind == QEvent.Type.ToolTip:
+            position = event.pos()
+            index = self.window.table.indexAt(position)
+            if self.window._warning_badge_hit(index, position):
+                QToolTip.showText(event.globalPos(), index.data(Qt.ItemDataRole.ToolTipRole),
+                                  watched)
+                return True
+        elif kind == QEvent.Type.MouseButtonRelease:
+            position = event.position().toPoint()
+            index = self.window.table.indexAt(position)
+            if (event.button() == Qt.MouseButton.LeftButton
+                    and self.window._warning_badge_hit(index, position)):
+                self.window._show_warning_menu(
+                    index, event.globalPosition().toPoint())
+                return True
+        elif kind == QEvent.Type.ContextMenu:
+            position = event.pos()
+            index = self.window.table.indexAt(position)
+            if self.window._warning_badge_hit(index, position):
+                self.window._show_warning_menu(index, event.globalPos())
+                return True
         return super().eventFilter(watched, event)
 
 
@@ -293,6 +431,7 @@ class MainWindow(QMainWindow):
         self._spinner.setInterval(110)
         self._spinner.timeout.connect(self._tick_spinner)
         self._custom_confidence = 0.8
+        self._folder_filter: Optional[Path] = None
         # Set by the controller: returns the undoable transactions, newest last.
         self.history_provider: Callable[[], List[str]] = lambda: []
         # Undo history for edits made in the table - typing, clearing, filling down,
@@ -333,6 +472,7 @@ class MainWindow(QMainWindow):
         # entry_id -> (fraction 0..1, short label), for the bar drawn across a row
         # while a long job - a chapter merge - is working on that one book.
         self._row_progress: Dict[str, tuple] = {}
+        self._row_progress_animations: Dict[str, tuple] = {}
 
         self.setWindowTitle('Audiobook Organizer')
         # Wide enough that every column fits beside the explanation panel.
@@ -378,7 +518,7 @@ class MainWindow(QMainWindow):
         self.splitter = splitter
         # Dragging the splitter resizes the table without resizing the window, so the
         # window's resizeEvent never fires and the columns used to just sit there.
-        splitter.splitterMoved.connect(lambda *_: self._fit_columns())
+        splitter.splitterMoved.connect(self._splitter_moved)
         outer.addWidget(splitter, stretch=1)
         self.setCentralWidget(central)
 
@@ -391,6 +531,8 @@ class MainWindow(QMainWindow):
         self._deselect_filter = _DeselectFilter(self)
         for widget in (self.toolbar, self.filter_bar, self.table.viewport()):
             widget.installEventFilter(self._deselect_filter)
+        self._warning_badge_filter = _WarningBadgeFilter(self)
+        self.table.viewport().installEventFilter(self._warning_badge_filter)
 
         # Now the table exists, so the toolbar can finally say what is available.
         self.refresh_action_states()
@@ -450,9 +592,16 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 0, 0, 0)
 
         self.status_filter = self._filter_combo(
-            ['All statuses', 'Likely', 'Uncertain', 'Unlikely', 'Approved',
-             'Rejected', 'Applied', 'Duplicate'],
+            ['All statuses', 'Pending', 'Unsure', 'Approved', 'Rejected',
+             'Applied', 'Duplicate', 'Has Warning'],
             'Show only rows with this review status')
+        for index, key in enumerate(
+                ('pending', 'risky', 'approved', 'rejected', 'applied', 'duplicate'),
+                start=1):
+            self.status_filter.setItemData(
+                index, QColor(STATUS_TEXT[key]), Qt.ItemDataRole.ForegroundRole)
+        self.status_filter.setItemData(
+            7, QColor(STATUS_TEXT['risky']), Qt.ItemDataRole.ForegroundRole)
         row.addWidget(self.status_filter)
 
         self.missing_filter = self._filter_combo(
@@ -463,11 +612,15 @@ class MainWindow(QMainWindow):
             minimum_extra=20)
         row.addWidget(self.missing_filter)
 
+        confident_percent = round(self.settings.get_float(
+            'AO_UI_CONFIDENT_THRESHOLD', 0.80) * 100)
+        doubtful_percent = round(self.settings.get_float(
+            'AO_UI_DOUBTFUL_THRESHOLD', 0.50) * 100)
         self.confidence_filter = self._filter_combo(
-            ['Any confidence', 'Likely', 'Uncertain', 'Unlikely',
-             'Custom threshold...'],
-            'Show rows in a configured confidence colour band. '
-            '"Custom threshold" asks for your own number.')
+            ['Any confidence', f'{confident_percent}% and above',
+             f'{doubtful_percent}% to {confident_percent - 1}%',
+             f'Below {doubtful_percent}%', '...'],
+            'Filter by confidence threshold. "..." asks for a custom minimum.')
         for index, colour in ((1, CONFIDENCE_HUES[0][1]),
                               (2, CONFIDENCE_HUES[1][1]),
                               (3, CONFIDENCE_HUES[2][1])):
@@ -494,11 +647,20 @@ class MainWindow(QMainWindow):
         # Twice the width it had: this is the control that gets used most, and 180px
         # showed about three words of a query. It still yields before the panel beside
         # it, being Expanding rather than fixed.
-        self.search_box.setMinimumWidth(360)
-        self.search_box.setSizePolicy(QSizePolicy.Policy.Expanding,
+        self.search_box.setMinimumWidth(288)
+        self.search_box.setMaximumWidth(480)
+        self.search_box.setSizePolicy(QSizePolicy.Policy.Preferred,
                                       QSizePolicy.Policy.Fixed)
         self.search_box.textChanged.connect(self._apply_filters)
-        row.addWidget(self.search_box, stretch=2)
+        row.addWidget(self.search_box)
+
+        self.unsaved_filter = QCheckBox('Unsaved')
+        self.unsaved_filter.setChecked(False)
+        self.unsaved_filter.setToolTip(
+            'Show only identified or processed books that still need an approve or '
+            'reject decision')
+        self.unsaved_filter.toggled.connect(self._apply_filters)
+        row.addWidget(self.unsaved_filter)
 
         # Stretch, count, stretch: two equal springs centre the readout in the space
         # left by the filters.
@@ -523,11 +685,10 @@ class MainWindow(QMainWindow):
         # and four of them side by side held the whole left-hand pane at 1590px -
         # which meant the explanation panel could not be given the width it was
         # saved at on anything narrower. The closed box elides; the popup does not.
-        combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        combo.setMinimumContentsLength(10)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        widest = max(combo.fontMetrics().horizontalAdvance(text) for text in items)
+        combo.setMinimumWidth(widest + 34)
         if minimum_extra:
-            widest = max(combo.fontMetrics().horizontalAdvance(text) for text in items)
             combo.setMinimumWidth(max(combo.sizeHint().width() + minimum_extra,
                                       widest + 40))
         combo.view().setMinimumWidth(
@@ -757,10 +918,31 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        # QSplitter applies its stretch factors after the window resize. Re-apply
+        # the last explicit panel width afterward so the main table receives the
+        # window-size change instead of becoming narrower across launches.
+        QTimer.singleShot(0, self._finish_window_resize)
         # Narrowing the window must shrink the columns, not push Status out of sight.
         if self._columns_fitted:
             QTimer.singleShot(0, self._fit_columns)
         self._fit_toolbar()
+
+    def _finish_window_resize(self) -> None:
+        # The central layout and its splitter are updated in separate queued passes.
+        # Waiting for the second pass prevents Qt from stretching the panel after us.
+        QTimer.singleShot(0, self._restore_split_after_layout)
+
+    def _restore_split_after_layout(self) -> None:
+        self._restore_split()
+        self._window_resize_pending = False
+
+    def _splitter_moved(self, _position: int, _index: int) -> None:
+        sizes = self.splitter.sizes()
+        if (QApplication.mouseButtons() & Qt.MouseButton.LeftButton
+                and not getattr(self, '_window_resize_pending', False)
+                and len(sizes) > 1 and sizes[1] > 0):
+            self._wanted_split = sizes[1]
+        self._fit_columns()
 
     def _fit_toolbar(self) -> None:
         """Drop the toolbar labels before the toolbar drops the status cluster.
@@ -892,6 +1074,7 @@ class MainWindow(QMainWindow):
         handlers = {
             'scan': lambda: self._request_load(),
             'identify': lambda: self._request_resolve(),
+            'warnings': self._show_warnings_dialog,
             'approve': lambda: self._set_status_selected(STATUS_APPROVED),
             'reject': lambda: self._set_status_selected(STATUS_REJECTED),
             'reset': lambda: self._set_status_selected(STATUS_PENDING),
@@ -1027,6 +1210,8 @@ class MainWindow(QMainWindow):
             # Identify needs entries, not a selection - with none it identifies the
             # lot, like Load Input and Preview.
             'identify': anything,
+            'warnings': any(e.warnings and not e.warnings_silenced
+                            for e in self.entries.values()),
             'approve': anything,
             'reject': anything,
             'reset': selected,
@@ -1039,6 +1224,7 @@ class MainWindow(QMainWindow):
         }
         reasons = {
             'identify': 'Nothing is loaded yet - press Ctrl+R',
+            'warnings': 'No warnings to review',
             'approve': 'Nothing is loaded yet',
             'reject': 'Nothing is loaded yet',
             'reset': 'Select some rows first',
@@ -1192,6 +1378,31 @@ class MainWindow(QMainWindow):
         self.show_message(
             f'{len(matches)} entr{"y" if len(matches) == 1 else "ies"} '
             f'{"approved" if key == "approve" else "rejected"} {description}')
+
+    def _first_input_folder(self, entry: BookEntry) -> tuple[str, Path]:
+        """First folder below the configured input root for this book."""
+        folder = Path(entry.folder).resolve()
+        root = self.settings.get_path('AO_INPUT_DIR').resolve()
+        try:
+            relative = folder.relative_to(root)
+        except ValueError:
+            return folder.name, folder
+        if relative.parts:
+            target = root / relative.parts[0]
+            return relative.parts[0], target
+        return folder.name, folder
+
+    def _set_folder_filter(self, name: str, folder: Path) -> None:
+        self._folder_filter = folder.resolve()
+        self.shape_filter.blockSignals(True)
+        for item_index in range(self.shape_filter.count() - 1, -1, -1):
+            if self.shape_filter.itemText(item_index).startswith('Folder: '):
+                self.shape_filter.removeItem(item_index)
+        label = f'Folder: {name}'
+        self.shape_filter.addItem(label)
+        self.shape_filter.setCurrentText(label)
+        self.shape_filter.blockSignals(False)
+        self._filter_changed(self.shape_filter, self.shape_filter.currentIndex())
 
     def _tighten_toolbar(self, _icon: int) -> None:
         """Take the dead space out of the toolbar row.
@@ -1466,6 +1677,7 @@ class MainWindow(QMainWindow):
         self.refresh_stats()
 
     def _fill_row(self, row: int, entry: BookEntry) -> None:
+        self._validate_entry(entry)
         previous = self._updating
         self._updating = True
         # Writing into a sorted table makes Qt re-sort on the spot, so approving one
@@ -1528,14 +1740,24 @@ class MainWindow(QMainWindow):
         conf_item = _NumericItem(f'{confidence:.0%}', confidence)
         conf_item.setData(ROLE_CONFIDENCE, confidence)
         conf_item.setData(ROLE_KIND, KIND_CONFIDENCE)
+        warning = bool(entry.warnings and not entry.warnings_silenced)
+        conf_item.setData(ROLE_WARNING, warning)
+        conf_item.setData(ROLE_WARNING_IGNORED, False)
+        if warning:
+            warning_tip = ('Ignored Warning\n' if entry.warnings_silenced
+                           else 'Warning\n') + '\n'.join(entry.warnings)
+            warning_tip += ('\n\nLeft-click to view. Right-click for options.')
+            conf_item.setToolTip(warning_tip)
+        else:
+            conf_item.setToolTip('How sure the identification is, averaged over the fields')
         conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         conf_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        conf_item.setToolTip('How sure the identification is, averaged over the fields')
         self.table.setItem(row, COL_CONF, conf_item)
 
         status_key, status_label = self._display_status(entry)
         status = QTableWidgetItem(status_label)
         status.setData(ROLE_KIND, KIND_STATUS)
+        status.setData(ROLE_WARNING, False)
         status.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         status.setToolTip(f'Status: {status_label}. The stripe '
                           f'down the left of '
@@ -1554,7 +1776,7 @@ class MainWindow(QMainWindow):
 
     def _confidence_filter_chosen(self, _index: int) -> None:
         """"Custom threshold..." asks for a number and becomes a real filter entry."""
-        if not self.confidence_filter.currentText().startswith('Custom'):
+        if self.confidence_filter.currentText() != '...':
             return
 
         percent, ok = QInputDialog.getInt(
@@ -1572,8 +1794,8 @@ class MainWindow(QMainWindow):
             if self.confidence_filter.itemText(index).startswith('At least'):
                 self.confidence_filter.removeItem(index)
                 break
-        self.confidence_filter.insertItem(4, label)
-        self.confidence_filter.setCurrentIndex(4)
+        self.confidence_filter.insertItem(self.confidence_filter.count() - 1, label)
+        self.confidence_filter.setCurrentText(label)
         self._apply_filters()
 
     def _field_colour(self, entry: BookEntry, field) -> str:
@@ -1595,15 +1817,8 @@ class MainWindow(QMainWindow):
         return TEXT
 
     def _display_status(self, entry: BookEntry) -> tuple[str, str]:
-        """Visible status: confidence until the user or filesystem decides it."""
-        if entry.status not in (STATUS_PENDING, STATUS_RISKY):
-            return entry.status, pretty_status(entry.status)
-        confidence = entry.confidence()
-        confident = self.settings.get_float('AO_UI_CONFIDENT_THRESHOLD', 0.80)
-        doubtful = self.settings.get_float('AO_UI_DOUBTFUL_THRESHOLD', 0.50)
-        key = ('likely' if confidence >= confident else
-               'uncertain' if confidence >= doubtful else 'unlikely')
-        return key, pretty_status(key)
+        """Return the stored review status and its display label."""
+        return entry.status, pretty_status(entry.status)
 
     def _files_summary(self, entry: BookEntry):
         """(filename, path-from-root) - the delegate draws them as two lines.
@@ -1688,6 +1903,596 @@ class MainWindow(QMainWindow):
         if index.column() == COL_COVER:
             self._open_cover_viewer(index.row())
 
+    def _warning_badge_hit(self, index, position) -> bool:
+        if not index.isValid() or not index.data(ROLE_WARNING):
+            return False
+        if index.column() != COL_CONF:
+            return False
+        return self.delegate.warning_badge_rect(
+            self.table.visualRect(index)).contains(position)
+
+    def _open_warning(self, index) -> None:
+        entry = self._entry_at(index.row())
+        if entry is None:
+            return
+        self.table.clearSelection()
+        self.table.setCurrentCell(index.row(), COL_CONF)
+        self.table.item(index.row(), COL_CONF).setSelected(True)
+        self.why_panel.show_entry(entry)
+        self.why_panel.focus_warning()
+
+    def _show_warning_menu(self, index, global_position) -> None:
+        entry = self._entry_at(index.row())
+        if entry is None or not entry.warnings:
+            return
+        menu = QMenu(self)
+        menu.setMinimumWidth(460)
+
+        panel = QWidget(menu)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(8)
+        for reason in entry.warnings:
+            label = QLabel(reason)
+            label.setWordWrap(True)
+            label.setMinimumWidth(410)
+            label.setStyleSheet(f'color: {TEXT}; font-weight: 700;')
+            layout.addWidget(label)
+
+        information = QWidgetAction(menu)
+        information.setDefaultWidget(panel)
+        menu.addAction(information)
+        menu.addSeparator()
+        from ..quality import inspect_entry, suggest_fix
+        findings = inspect_entry(entry)
+        proposals = []
+        seen_proposals = set()
+        by_field = {}
+        for finding in findings:
+            current = by_field.get(finding.field, entry.value(finding.field))
+            proposed = suggest_fix(finding.field, current, finding.kind)
+            by_field[finding.field] = proposed
+            key = (finding.field, proposed)
+            if key not in seen_proposals:
+                proposals.append((finding, proposed))
+                seen_proposals.add(key)
+        fix_all = menu.addAction('Fix All')
+        fix_all.triggered.connect(
+            lambda: self._apply_warning_fixes(entry, list(by_field.items()), 'all warnings'))
+        selected = self.selected_entries()
+        warned = [candidate for candidate in selected if candidate.warnings]
+        warning_count = sum(len(candidate.warnings) for candidate in warned)
+        if len(warned) > 1:
+            fix_selected = menu.addAction(f'Fix all {warning_count} warnings')
+            fix_selected.triggered.connect(
+                lambda: self._apply_all_warning_fixes(warned))
+        menu.addSeparator()
+        for finding, proposed in proposals:
+            field_label = finding.field.replace('_', ' ').title()
+            fix = menu.addAction(f'{field_label}: {proposed}')
+            fix.triggered.connect(
+                lambda _=False, f=finding.field, value=proposed:
+                self._apply_warning_fixes(entry, [(f, value)], f))
+        if entry.warnings:
+            menu.addSeparator()
+        action = menu.addAction('Ignore')
+        action.triggered.connect(lambda: self._silence_warning(entry))
+        menu.exec(global_position)
+
+    def _suggested_warning_fixes(self, entry: BookEntry):
+        from ..quality import inspect_entry, suggest_fix
+
+        by_field = {}
+        for finding in inspect_entry(entry):
+            current = by_field.get(finding.field, entry.value(finding.field))
+            by_field[finding.field] = suggest_fix(
+                finding.field, current, finding.kind)
+        return list(by_field.items())
+
+    def _apply_all_warning_fixes(self, entries: List[BookEntry]) -> None:
+        for entry in entries:
+            self._apply_warning_fixes(
+                entry, self._suggested_warning_fixes(entry), 'all warnings')
+        self._apply_filters()
+        self.refresh_stats()
+
+    def _show_warnings_dialog(self) -> None:
+        self._validate_entries()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Warnings')
+        dialog.resize(1860, 680)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        summary = QLabel()
+        layout.addWidget(summary)
+
+        tree = _WarningTree()
+        tree.setColumnCount(8)
+        tree.setHeaderLabels(
+            ['File', 'Author', 'Series', '#', 'Title', 'Fixed', 'Fix', 'Ignore'])
+        tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        tree.setAlternatingRowColors(True)
+        tree.setUniformRowHeights(False)
+        tree.setRootIsDecorated(False)
+        tree.setIndentation(0)
+        tree.setItemDelegate(ReviewDelegate(tree))
+        header = tree.header()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(tree.ACTION_WIDTH)
+        for column in range(6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        for column in (6, 7):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        for column, width in enumerate(tree.BASE_WIDTHS):
+            tree.setColumnWidth(column, width)
+        tree.setToolTip(
+            'Red text is the warned value. Edit the Fixed value, then use its Fix '
+            'button to apply it. Use Ignore to dismiss the warning without changing '
+            'the value. Right-click a finding to apply or ignore it. '
+            'Click a heading to sort. '
+            'Ctrl-click or Shift-click to select multiple warnings.')
+        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree.setSortingEnabled(True)
+        layout.addWidget(tree, stretch=1)
+
+        buttons = QGridLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+
+        left_buttons = QWidget(dialog)
+        left_layout = QHBoxLayout(left_buttons)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        select_all = QPushButton('Select all')
+        select_all.setToolTip('Select every finding')
+        clear_selection = QPushButton('Clear selection')
+        clear_selection.setToolTip('Clear the current selection')
+        left_layout.addWidget(select_all)
+        left_layout.addWidget(clear_selection)
+
+        filter_buttons = QWidget(dialog)
+        filter_layout = QHBoxLayout(filter_buttons)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_label = QLabel('Filter:')
+        filter_label.setToolTip('Choose which warning field to show')
+        filter_label.setStyleSheet('background: transparent;')
+        filter_layout.addWidget(filter_label)
+        warning_filter = None
+        warning_filter_buttons = {}
+        for field, label in (('author', 'Author'), ('series', 'Series'),
+                             ('title', 'Title')):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setToolTip(f'Show only {label.lower()} warnings')
+            button.clicked.connect(
+                lambda _checked=False, name=field: toggle_warning_filter(name))
+            warning_filter_buttons[field] = button
+            filter_layout.addWidget(button)
+
+        right_buttons = QWidget(dialog)
+        right_layout = QHBoxLayout(right_buttons)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        fix = QPushButton('Fix selected')
+        fix.setToolTip('Apply each selected proposed solution')
+        ignore = QPushButton('Ignore selected')
+        ignore.setToolTip('Sign off the selected findings without changing values')
+        close = QPushButton('Close')
+        close.setToolTip('Close this review list')
+        for button in (fix, ignore):
+            right_layout.addWidget(button)
+        right_layout.addWidget(close)
+
+        side_width = max(left_buttons.sizeHint().width(),
+                         right_buttons.sizeHint().width())
+        buttons.setColumnMinimumWidth(0, side_width)
+        buttons.setColumnMinimumWidth(2, side_width)
+        buttons.setColumnStretch(0, 1)
+        buttons.setColumnStretch(2, 1)
+        buttons.addWidget(left_buttons, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        buttons.addWidget(filter_buttons, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        buttons.addWidget(right_buttons, 0, 2, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(buttons)
+
+        def selected_findings():
+            return [item for item in tree.selectedItems()
+                    if item.data(0, Qt.ItemDataRole.UserRole) is not None]
+
+        def selected_entries():
+            ids = {item.data(0, Qt.ItemDataRole.UserRole)
+                   for item in selected_findings()}
+            return [self.entries[entry_id] for entry_id in ids
+                    if entry_id in self.entries]
+
+        def update_selection():
+            findings = selected_findings()
+            count = len(findings)
+            enabled = count > 0
+            fixable = sum(item.data(0, int(Qt.ItemDataRole.UserRole) + 2)
+                          is not None for item in findings)
+            fix.setText(
+                f'Fix selected ({fixable})' if fixable else 'Fix selected')
+            ignore.setText(
+                f'Ignore selected ({count})' if enabled else 'Ignore selected')
+            fix.setEnabled(fixable > 0)
+            ignore.setEnabled(enabled)
+
+        def toggle_warning_filter(field):
+            nonlocal warning_filter
+            warning_filter = None if warning_filter == field else field
+            for name, button in warning_filter_buttons.items():
+                active = name == warning_filter
+                button.setChecked(active)
+                button.setProperty('accent', active)
+                button.style().unpolish(button)
+                button.style().polish(button)
+                button.update()
+            refill()
+
+        def refill():
+            from ..quality import inspect_entry, suggest_fix
+
+            tree.clear()
+            finding_count = 0
+            book_count = 0
+            for candidate in self.entries.values():
+                if candidate.warnings_silenced:
+                    continue
+                findings = inspect_entry(candidate)
+                if warning_filter is not None:
+                    findings = [finding for finding in findings
+                                if finding.field == warning_filter]
+                if not findings:
+                    continue
+                book_count += 1
+                proposed_by_field = {}
+                for finding in findings:
+                    current = proposed_by_field.get(
+                        finding.field, candidate.value(finding.field))
+                    proposed = suggest_fix(finding.field, current, finding.kind)
+                    proposed_by_field[finding.field] = proposed
+                    filename, folder = self._files_summary(candidate)
+                    values = [filename, candidate.value('author'),
+                              candidate.value('series'),
+                              candidate.value('series_index'),
+                              candidate.value('title'),
+                              proposed if proposed != current else '', '', '']
+                    columns = {'file': 0, 'author': 1, 'series': 2,
+                               'series_index': 3, 'title': 4}
+                    warned_column = columns.get(finding.field, 0)
+                    values[warned_column] = current
+                    item = _WarningItem([filename, '', '', '', '', '', '', ''])
+                    for column in range(1, 6):
+                        item.setData(column, ROLE_WARNING_VALUE, values[column])
+                    item.setData(0, Qt.ItemDataRole.UserRole, candidate.entry_id)
+                    item.setData(
+                        0, int(Qt.ItemDataRole.UserRole) + 1, finding.field)
+                    item.setData(
+                        0, int(Qt.ItemDataRole.UserRole) + 2,
+                        proposed if proposed != current else None)
+                    item.setData(
+                        0, ROLE_WARNING_SORT,
+                        (folder.casefold(), filename.casefold()))
+                    item.setData(0, ROLE_KIND, KIND_FILES)
+                    item.setData(0, ROLE_SECONDARY, folder)
+                    item.setSizeHint(0, QSize(0, 58))
+                    item.setForeground(
+                        warned_column, QColor(STATUS_TEXT['rejected']))
+                    item.setForeground(
+                        5, QColor(STATUS_TEXT['approved']
+                                  if proposed != current else TEXT_DIM))
+                    item.setToolTip(
+                        0, f'{self.settings.display_path(candidate.folder)}\n\n'
+                        + '\n'.join(candidate.audio_files))
+                    item.setToolTip(warned_column, finding.message)
+                    item.setToolTip(
+                        5, f'Suggested fix for: {finding.message}'
+                        if proposed != current
+                        else 'No suggested fix available')
+                    tree.addTopLevelItem(item)
+
+                    identity_columns = {
+                        1: 'author', 2: 'series', 3: 'series_index', 4: 'title'}
+                    for column, field_name in identity_columns.items():
+                        field_editor = _ElidingLineEdit(values[column], tree)
+                        field_editor.setFrame(False)
+                        field_editor.setAlignment(
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                        field_editor.setToolTip(
+                            finding.message if column == warned_column
+                            else f'Edit {FIELD_LABELS[field_name]}')
+                        colour = (STATUS_TEXT['rejected']
+                                  if column == warned_column else TEXT)
+                        field_editor.setStyleSheet(
+                            f'QLineEdit {{ color: {colour}; background: transparent; '
+                            'border: none; border-radius: 0; padding: 0 5px; '
+                            'min-height: 0; } QLineEdit:focus { border: none; }')
+                        tree.setItemWidget(item, column, field_editor)
+                        field_editor.textChanged.connect(
+                            lambda text, row=item, target_column=column:
+                            row.setData(target_column, ROLE_WARNING_VALUE, text))
+                        field_editor.editingFinished.connect(
+                            lambda row=item, name=field_name, field=field_editor:
+                            save_identity_value(row, name, field.text()))
+                        field_editor.setContextMenuPolicy(
+                            Qt.ContextMenuPolicy.CustomContextMenu)
+                        field_editor.customContextMenuRequested.connect(
+                            lambda position, row=item, field=field_editor:
+                            show_finding_menu(
+                                row, field.mapToGlobal(position),
+                                field.createStandardContextMenu()))
+
+                    editor = _ElidingLineEdit(values[5], tree)
+                    editor.setFrame(False)
+                    editor.setAlignment(
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    editor.setToolTip(item.toolTip(5))
+                    editor.setStyleSheet(
+                        f'QLineEdit {{ color: {STATUS_TEXT["approved"]}; '
+                        'background: transparent; border: none; border-radius: 0; '
+                        'padding: 0 5px; min-height: 0; } '
+                        'QLineEdit:focus { border: none; }')
+                    tree.setItemWidget(item, 5, editor)
+
+                    approval = QToolButton(tree)
+                    approval.setAutoRaise(True)
+                    approval.setIconSize(QSize(44, 44))
+                    approval.setSizePolicy(
+                        QSizePolicy.Policy.Expanding,
+                        QSizePolicy.Policy.Expanding)
+                    approval.setToolTip('Apply the value in Fixed for this warning')
+                    tree.setItemWidget(item, 6, approval)
+
+                    ignore_button = QToolButton(tree)
+                    ignore_button.setAutoRaise(True)
+                    ignore_button.setIcon(make_icon(
+                        'reject', STATUS_TEXT['rejected'], 44))
+                    ignore_button.setIconSize(QSize(44, 44))
+                    ignore_button.setSizePolicy(
+                        QSizePolicy.Policy.Expanding,
+                        QSizePolicy.Policy.Expanding)
+                    ignore_button.setToolTip('Ignore this warning')
+                    tree.setItemWidget(item, 7, ignore_button)
+
+                    def update_fixed_value(text, row=item, original=current,
+                                           button=approval):
+                        fixed_value = text.strip()
+                        usable = bool(fixed_value and fixed_value != original)
+                        row.setData(5, ROLE_WARNING_VALUE, text)
+                        row.setData(
+                            0, int(Qt.ItemDataRole.UserRole) + 2,
+                            fixed_value if usable else None)
+                        # Fixable rows sort first on the initial ascending click.
+                        row.setData(6, ROLE_WARNING_VALUE, '0' if usable else '1')
+                        button.setIcon(
+                            make_icon('checkmark', STATUS_TEXT['approved'], 44)
+                            if usable else QIcon())
+                        button.setEnabled(usable)
+
+                    editor.textChanged.connect(update_fixed_value)
+                    editor.setContextMenuPolicy(
+                        Qt.ContextMenuPolicy.CustomContextMenu)
+                    editor.customContextMenuRequested.connect(
+                        lambda position, row=item, field=editor:
+                        show_finding_menu(
+                            row, field.mapToGlobal(position),
+                            field.createStandardContextMenu()))
+                    approval.clicked.connect(
+                        lambda _checked=False, row=item: apply_finding(row))
+                    ignore_button.clicked.connect(
+                        lambda _checked=False, row=item: ignore_finding(row))
+                    update_fixed_value(editor.text())
+                    finding_count += 1
+            tree.sortItems(tree.sortColumn(), header.sortIndicatorOrder())
+            summary.setText(
+                f'<b>{finding_count}</b> finding'
+                f'{"" if finding_count == 1 else "s"} in '
+                f'<b>{book_count}</b> book{"" if book_count == 1 else "s"}')
+            update_selection()
+            self.refresh_action_states()
+
+        def fix_selected():
+            fixes = {}
+            for item in selected_findings():
+                entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+                field = item.data(0, int(Qt.ItemDataRole.UserRole) + 1)
+                proposed = item.data(0, int(Qt.ItemDataRole.UserRole) + 2)
+                if proposed is None:
+                    continue
+                fixes.setdefault(entry_id, {})[field] = proposed
+            for entry_id, fields in fixes.items():
+                if entry_id in self.entries:
+                    self._apply_warning_fixes(
+                        self.entries[entry_id], list(fields.items()), 'selected warnings')
+            self._apply_filters()
+            self.refresh_stats()
+            refill()
+
+        def apply_finding(item):
+            entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+            field = item.data(0, int(Qt.ItemDataRole.UserRole) + 1)
+            proposed = item.data(0, int(Qt.ItemDataRole.UserRole) + 2)
+            if entry_id not in self.entries or proposed is None:
+                return
+            self._apply_warning_fixes(
+                self.entries[entry_id], [(field, proposed)], field)
+            self._apply_filters()
+            self.refresh_stats()
+            refill()
+
+        def save_identity_value(item, field, value):
+            entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if entry_id not in self.entries:
+                return
+            if self._edit_warning_field(self.entries[entry_id], field, value):
+                self._apply_filters()
+                self.refresh_stats()
+                refill()
+
+        def ignore_finding(item):
+            entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if entry_id not in self.entries:
+                return
+            self._silence_warning(self.entries[entry_id])
+            refill()
+
+        def show_finding_menu(item, global_position, menu=None):
+            if item is None:
+                return
+            menu = menu or QMenu(tree)
+            if menu.actions():
+                menu.addSeparator()
+            apply_fix = menu.addAction('Apply fix')
+            apply_fix.setEnabled(
+                item.data(0, int(Qt.ItemDataRole.UserRole) + 2) is not None)
+            apply_fix.triggered.connect(
+                lambda _checked=False, row=item: apply_finding(row))
+            ignore_fix = menu.addAction('Ignore fix')
+            ignore_fix.triggered.connect(
+                lambda _checked=False, row=item: ignore_finding(row))
+            menu.exec(global_position)
+
+        def show_tree_menu(position):
+            item = tree.itemAt(position)
+            show_finding_menu(
+                item, tree.viewport().mapToGlobal(position))
+
+        def ignore_selected():
+            for candidate in selected_entries():
+                self._silence_warning(candidate)
+            refill()
+
+        tree.itemSelectionChanged.connect(update_selection)
+        tree.customContextMenuRequested.connect(show_tree_menu)
+        select_all.clicked.connect(tree.selectAll)
+        clear_selection.clicked.connect(tree.clearSelection)
+        fix.clicked.connect(fix_selected)
+        ignore.clicked.connect(ignore_selected)
+        close.clicked.connect(dialog.accept)
+        refill()
+        dialog.exec()
+        self.refresh_action_states()
+
+    def _apply_warning_fixes(self, entry: BookEntry, fixes, label: str) -> None:
+        from ..models import Field, clean_value
+
+        changed = [(field, clean_value(field, value.strip()))
+                   for field, value in fixes
+                   if clean_value(field, value.strip()) != entry.value(field)]
+        if not changed:
+            return
+        self._record_edit(f'fixed {label}',
+                          [(entry.entry_id, field, entry.get_field(field))
+                           for field, _value in changed])
+        for field, value in changed:
+            setattr(entry, field, Field(value=value, source='user', confidence=1.0))
+            entry.log('user', f'{field} fixed to "{value}"')
+        self._mark_warning_change_pending(entry)
+        self._validate_entry(entry, force=True)
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        self.why_panel.show_entry(entry)
+        self.show_message(f'Fixed {len(changed)} value'
+                          f'{"" if len(changed) == 1 else "s"}')
+
+    def _edit_warning_field(self, entry: BookEntry, field: str, value: str) -> bool:
+        from ..models import Field, clean_value
+
+        cleaned = clean_value(field, value.strip())
+        if cleaned == entry.value(field):
+            return False
+        self._record_edit(
+            f'{field} typed in warnings',
+            [(entry.entry_id, field, entry.get_field(field))])
+        setattr(entry, field, Field(value=cleaned, source='user', confidence=1.0))
+        entry.log('user', f'{field} set to "{cleaned}" in warnings')
+        self._mark_warning_change_pending(entry)
+        self._validate_entry(entry, force=True)
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        self.why_panel.show_entry(entry)
+        self.show_message(f'Updated {FIELD_LABELS[field]}')
+        return True
+
+    @staticmethod
+    def _mark_warning_change_pending(entry: BookEntry) -> None:
+        """A warning edit is new work and always needs a fresh review decision."""
+        entry.explicit_work_pending = True
+        entry.status = STATUS_PENDING
+
+    def _silence_warning(self, entry: BookEntry) -> None:
+        entry.warnings_silenced = True
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        if self.entry_is_selected(entry):
+            self.why_panel.show_entry(entry)
+        self.show_message('Content warning silenced')
+        self.refresh_action_states()
+
+    def _unignore_warning(self, entry: BookEntry) -> None:
+        entry.warnings_silenced = False
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        if self.entry_is_selected(entry):
+            self.why_panel.show_entry(entry)
+        self.show_message('Content warning restored')
+
+    def _unignore_warnings(self, entries: List[BookEntry]) -> None:
+        restored = [entry for entry in entries
+                    if entry.warnings and entry.warnings_silenced]
+        for entry in restored:
+            entry.warnings_silenced = False
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+        if restored:
+            self.why_panel.show_entry(restored[0], extra_selected=len(restored) - 1)
+        self.show_message(f'Restored {len(restored)} content warning'
+                          f'{"" if len(restored) == 1 else "s"}')
+
+    def _validate_entry(self, entry: BookEntry, force: bool = False) -> None:
+        from ..quality import inspect_entry
+
+        current = {name: entry.value(name) for name in ('author', 'series', 'title')}
+        if not force and not entry.warnings_checked_values and entry.warnings:
+            # Older cache files already contain useful warnings but predate the value
+            # fingerprint. Adopt their current values without discarding that cache.
+            entry.warnings_checked_values = current
+            return
+        if not force and current == entry.warnings_checked_values:
+            return
+        warnings = [finding.message for finding in inspect_entry(entry)]
+        if warnings != entry.warnings:
+            entry.warnings = warnings
+            entry.warnings_silenced = False
+        entry.warnings_checked_values = current
+        if warnings and entry.status == STATUS_PENDING:
+            entry.status = STATUS_RISKY
+
+    def _validate_entries(self) -> None:
+        for entry in self.entries.values():
+            self._validate_entry(entry, force=True)
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+        self._apply_filters()
+        self.refresh_stats()
+        self.refresh_action_states()
+        self.show_message(f'Validated {len(self.entries)} book'
+                          f'{"" if len(self.entries) == 1 else "s"}')
+
     def _cover_sources(self, entry: BookEntry) -> List:
         """Every image this book has, embedded art first, then the folder's files.
 
@@ -1766,6 +2571,12 @@ class MainWindow(QMainWindow):
         missing = self.missing_filter.currentText()
         confidence = self.confidence_filter.currentText()
         shape = dict(SHAPE_FILTERS).get(self.shape_filter.currentText())
+        folder_filter = (self._folder_filter
+                         if self.shape_filter.currentText().startswith('Folder: ')
+                         else None)
+        from ..load_options import unsaved_entries
+        unsaved_ids = ({entry.entry_id for entry in unsaved_entries(self.entries.values())}
+                       if self.unsaved_filter.isChecked() else set())
         visible = 0
 
         for row in range(self.table.rowCount()):
@@ -1779,7 +2590,8 @@ class MainWindow(QMainWindow):
                                      entry.value('title'), entry.entry_id]).lower()
                 show = text in haystack
             if show and status != 'All statuses':
-                show = self._display_status(entry)[1] == status
+                show = (bool(entry.warnings) if status == 'Has Warning'
+                        else self._display_status(entry)[1] == status)
             if show and missing != 'Any completeness':
                 gaps = entry.missing_fields()
                 if missing == 'Missing any field':
@@ -1797,16 +2609,26 @@ class MainWindow(QMainWindow):
                     'AO_UI_CONFIDENT_THRESHOLD', 0.80)
                 doubtful = self.settings.get_float(
                     'AO_UI_DOUBTFUL_THRESHOLD', 0.50)
-                if confidence == 'Likely':
+                if confidence == f'{round(confident * 100)}% and above':
                     show = value >= confident
-                elif confidence == 'Uncertain':
+                elif confidence == (f'{round(doubtful * 100)}% to '
+                                    f'{round(confident * 100) - 1}%'):
                     show = doubtful <= value < confident
-                elif confidence == 'Unlikely':
+                elif confidence == f'Below {round(doubtful * 100)}%':
                     show = value < doubtful
                 elif confidence.startswith('At least'):
                     show = value >= self._custom_confidence
             if show and shape is not None:
                 show = bool(shape(entry))
+            if show and folder_filter is not None:
+                try:
+                    entry_folder = Path(entry.folder).resolve()
+                    show = (entry_folder == folder_filter
+                            or folder_filter in entry_folder.parents)
+                except OSError:
+                    show = False
+            if show and self.unsaved_filter.isChecked():
+                show = entry.entry_id in unsaved_ids
 
             self.table.setRowHidden(row, not show)
             visible += show
@@ -1856,6 +2678,7 @@ class MainWindow(QMainWindow):
 
     def _show_context_menu(self, position) -> None:
         """Everything here acts on the *whole* selection, never on just the first row."""
+        index = self.table.indexAt(position)
         entries = self.selected_entries()
         if not entries:
             return
@@ -1918,6 +2741,12 @@ class MainWindow(QMainWindow):
             lambda: self._request_load(selected_only=True),
             'Read these books from disk again. You choose what to keep of what we '
             'already worked out.')
+        clicked_entry = self._entry_at(index.row()) if index.isValid() else None
+        if clicked_entry is not None:
+            folder_name, folder_path = self._first_input_folder(clicked_entry)
+            add(f'Filter by {folder_name}',
+                lambda: self._set_folder_filter(folder_name, folder_path),
+                f'Show only books under the first input subfolder named {folder_name}')
         # One source per entry rather than a dialog with a dropdown: picking a
         # source is one click, not a click, a scroll and an OK.
         sources = menu.addMenu('Identify with...')
@@ -1935,9 +2764,11 @@ class MainWindow(QMainWindow):
         add(f'Preview{suffix}  (F7)',
             lambda: self.apply_requested.emit(entries, True),
             'Show where the selected rows would end up, without touching any files')
-        add(f'Search Goodreads{suffix}',
-            lambda: self._search_goodreads(entries),
-            'Open a Goodreads search for each selected book in your browser')
+        goodreads_field = clicked if clicked in ('author', 'title', 'series') else None
+        goodreads_target = FIELD_LABELS[goodreads_field] if goodreads_field else 'All fields'
+        add(f'Search Goodreads for {goodreads_target}{suffix}',
+            lambda: self._search_goodreads(entries, goodreads_field),
+            f'Open a Goodreads search using {goodreads_target.lower()}')
 
         section('EDIT')
         # "Rename cell" named the widget rather than the thing: you clicked Author,
@@ -1997,6 +2828,18 @@ class MainWindow(QMainWindow):
             lambda: self._open_folders(applied),
             'Open the output folder these rows were written to',
             enabled=bool(applied))
+
+        ignored_warnings = [entry for entry in entries
+                            if entry.warnings and entry.warnings_silenced]
+        if ignored_warnings:
+            section('WARNING')
+            unignore = add(
+                'Unignore warning' + (f' ({len(ignored_warnings)})'
+                                      if len(ignored_warnings) > 1 else ''),
+                lambda: self._unignore_warnings(ignored_warnings),
+                'Show the ignored warning badge again')
+            if unignore is not None:
+                unignore.setIcon(make_icon('warning', STATUS_TEXT['risky'], 18))
 
         menu.exec(self.table.viewport().mapToGlobal(position))
 
@@ -2161,12 +3004,22 @@ class MainWindow(QMainWindow):
         self._write_field(entries[1:], field, str(value))
 
     def set_row_progress(self, entry_id: str, fraction: Optional[float],
-                         label: str = '') -> None:
+                         label: str = '', animate: bool = False) -> None:
         """Show (or clear, with ``fraction=None``) a progress wash across one row."""
         if fraction is None:
+            self._row_progress_animations.pop(entry_id, None)
             self._row_progress.pop(entry_id, None)
         else:
-            self._row_progress[entry_id] = (max(0.0, min(1.0, fraction)), label)
+            target = max(0.0, min(1.0, fraction))
+            current = self._row_progress.get(entry_id, (0.0, ''))[0]
+            if animate and target > current:
+                self._row_progress_animations[entry_id] = (
+                    current, target, time.monotonic(), label)
+                fraction = current
+            else:
+                self._row_progress_animations.pop(entry_id, None)
+                fraction = target
+            self._row_progress[entry_id] = (fraction, label)
 
         row = self._row_for(entry_id)
         if row is None:
@@ -2179,6 +3032,39 @@ class MainWindow(QMainWindow):
         item.setData(ROLE_PROGRESS_TEXT, label)
         self._updating = previous
         self.table.viewport().update()
+
+    def _advance_row_progress_animations(self) -> None:
+        """Move tier jumps to their reported position over two seconds."""
+        now = time.monotonic()
+        for entry_id, (start, target, started, label) in list(
+                self._row_progress_animations.items()):
+            elapsed = min(1.0, (now - started) / 2.0)
+            value = start + (target - start) * elapsed
+            self._row_progress[entry_id] = (value, label)
+            row = self._row_for(entry_id)
+            if row is not None:
+                item = self.table.item(row, COL_FILES)
+                if item is not None:
+                    item.setData(ROLE_PROGRESS, value)
+                    item.setData(ROLE_PROGRESS_TEXT, label)
+            if elapsed >= 1.0:
+                self._row_progress_animations.pop(entry_id, None)
+
+    def update_identification_progress(self, entry: BookEntry, fraction: float,
+                                       tier: str, label: str) -> None:
+        """Refresh both progress displays when an identification tier reports."""
+        self.set_row_progress(entry.entry_id, fraction, label, animate=True)
+        self.why_panel.set_running(entry, tier)
+
+    def finish_identification_entry(self, entry: BookEntry) -> None:
+        self.set_row_progress(entry.entry_id, None)
+        self.why_panel.clear_running(entry)
+
+    def set_identification_queued(self, entry: BookEntry, tier: str) -> None:
+        self.why_panel.set_queued(entry, tier)
+
+    def clear_identification_queued(self, entry_id: str) -> None:
+        self.why_panel.clear_queued(entry_id)
 
     def _merge_selected(self, entries: List[BookEntry]) -> None:
         """Set the merges up in one dialog, then queue them like any other job."""
@@ -2533,6 +3419,12 @@ class MainWindow(QMainWindow):
         if not entries:
             self.show_message('Select some rows first')
             return
+        self._set_entries_status(entries, status, advance=True)
+
+    def _set_entries_status(self, entries: List[BookEntry], status: str,
+                            advance: bool = False) -> None:
+        if not entries:
+            return
         for entry in entries:
             entry.status = status
             row = self._row_for(entry.entry_id)
@@ -2553,7 +3445,8 @@ class MainWindow(QMainWindow):
                         f'{self.status_filter.currentText()}" filter and are hidden, '
                         f'not lost')
         self.show_message(message)
-        self._advance_selection()
+        if advance:
+            self._advance_selection()
 
     def _advance_selection(self) -> None:
         """After a decision, move to the next visible row - keeps review flowing."""
@@ -2864,6 +3757,11 @@ class MainWindow(QMainWindow):
             one.triggered.connect(lambda: self._request_load(selected_only=True))
 
         menu.addSeparator()
+        validate = menu.addAction('Scan for warnings')
+        validate.setToolTip('Check the current values for suspicious content')
+        validate.triggered.connect(self._validate_entries)
+
+        menu.addSeparator()
         folder = menu.addAction('Choose input folder...')
         folder.setToolTip('Open Settings and pick the folder to load from')
         folder.triggered.connect(lambda: self.settings_requested_on_tab.emit('General'))
@@ -2962,7 +3860,8 @@ class MainWindow(QMainWindow):
             self.settings_changed.emit()
         self.apply_requested.emit(entries, False)
 
-    def _search_goodreads(self, entries: Optional[List[BookEntry]] = None) -> None:
+    def _search_goodreads(self, entries: Optional[List[BookEntry]] = None,
+                          field: Optional[str] = None) -> None:
         """Open Goodreads for every selected row, using whatever we currently know.
 
         Goodreads has no usable public API any more, so this is the honest version of
@@ -2988,16 +3887,18 @@ class MainWindow(QMainWindow):
         elapsed = 0.0
         for entry in entries:
             QTimer.singleShot(int(elapsed * 1000),
-                              lambda e=entry: self._open_goodreads(e))
+                              lambda e=entry, f=field: self._open_goodreads(e, f))
             elapsed += random.uniform(*GOODREADS_DELAY)
         self.show_message(f'Opening Goodreads for {len(entries)} book'
                           f'{"" if len(entries) == 1 else "s"}')
 
-    def _open_goodreads(self, entry: BookEntry) -> None:
+    def _open_goodreads(self, entry: BookEntry, field: Optional[str] = None) -> None:
         import webbrowser
         from urllib.parse import quote_plus
 
-        query = ' '.join(filter(None, [entry.value('title'), entry.value('author')]))
+        query = (entry.value(field) if field else
+                 ' '.join(filter(None, [entry.value('title'), entry.value('author'),
+                                        entry.value('series')])))
         if not query:
             query = Path(entry.primary_audio).stem
         webbrowser.open(
@@ -3149,6 +4050,7 @@ class MainWindow(QMainWindow):
         # thing distinguishing a slow job from a dead one, and it has to be
         # somewhere the eye already is: the bar, the row, and the sentence.
         self.delegate.phase = (self.delegate.phase + 0.055) % 1.0
+        self._advance_row_progress_animations()
         self._animate_progress_bar()
         if self._row_progress:
             self.table.viewport().update()

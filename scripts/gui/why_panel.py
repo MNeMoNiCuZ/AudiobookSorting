@@ -18,7 +18,7 @@ import html
 import json
 from typing import Dict, Iterable, List, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout,
     QWidget,
@@ -62,7 +62,7 @@ TIER_LABELS = {
     'llm': 'Language model',
     'folder': 'Folder siblings',
     'dedupe': 'Duplicate check',
-    'quality': 'Looks wrong',
+    'quality': 'Warning Reason',
     'auto': 'Auto-approval',
     'user': 'Manual edit',
     'cancelled': 'Cancelled',
@@ -209,6 +209,9 @@ class WhyPanel(QWidget):
         self._extra_selected = 0
         self._open: Dict[str, bool] = {key: True for key in DEFAULT_OPEN}
         self._stats: Dict[str, int] = {}
+        self._running_entry = ''
+        self._running_tier = ''
+        self._queued: Dict[str, str] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -255,6 +258,51 @@ class WhyPanel(QWidget):
         self._extra_selected = max(0, extra_selected)
         self._rebuild()
 
+    def focus_warning(self) -> None:
+        """Open and scroll to the selected book's Content Warning card."""
+        self._open['quality'] = True
+        self._rebuild()
+
+        def reveal() -> None:
+            for card in self.container.findChildren(CollapsibleCard):
+                if card.key == 'quality':
+                    card.header.setChecked(True)
+                    card._sync()
+                    self.scroll.ensureWidgetVisible(card, 0, 12)
+                    break
+
+        QTimer.singleShot(0, reveal)
+
+    def set_running(self, entry: BookEntry, tier: str = '') -> None:
+        """Show the selected entry's active source and refresh its latest trace."""
+        self._queued.pop(entry.entry_id, None)
+        self._running_entry = entry.entry_id
+        self._running_tier = tier
+        if self.entry is not None and self.entry.entry_id == entry.entry_id:
+            self.entry = entry
+            self._rebuild()
+
+    def set_queued(self, entry: BookEntry, tier: str) -> None:
+        """Mark a manually requested source that is waiting behind another job."""
+        self._queued[entry.entry_id] = tier
+        if self.entry is not None and self.entry.entry_id == entry.entry_id:
+            self._rebuild()
+
+    def clear_queued(self, entry_id: str) -> None:
+        if self._queued.pop(entry_id, None) is None:
+            return
+        if self.entry is not None and self.entry.entry_id == entry_id:
+            self._rebuild()
+
+    def clear_running(self, entry: BookEntry) -> None:
+        if self._running_entry != entry.entry_id:
+            return
+        self._running_entry = ''
+        self._running_tier = ''
+        if self.entry is not None and self.entry.entry_id == entry.entry_id:
+            self.entry = entry
+            self._rebuild()
+
     # -------------------------------------------------------------- rendering
 
     def _rebuild(self) -> None:
@@ -297,10 +345,12 @@ class WhyPanel(QWidget):
                  else 'missing ' + ', '.join(missing))
         if self._extra_selected:
             badge += f'   ·   +{self._extra_selected} more selected'
+        tier_cards = self._tier_cards(entry)
+        cards.extend(card for card in tier_cards if card.key == 'quality')
         cards.append(self._add(
             'fields', 'Fields', self._fields_html(entry), badge=badge,
             colour=STATE_COLOURS[GOOD if not missing else PARTIAL]))
-        cards.extend(self._tier_cards(entry))
+        cards.extend(card for card in tier_cards if card.key != 'quality')
         cards.append(self._add('files', 'Files', self._files_html(entry),
                                badge=f'{len(entry.audio_files)} audio', colour=TEXT))
         if entry.raw_tags:
@@ -324,36 +374,81 @@ class WhyPanel(QWidget):
                 order.append(tier)
             grouped[tier].append(step)
 
+        if entry.warnings:
+            grouped['quality'] = [{
+                'tier': 'quality',
+                'message': '\n'.join(entry.warnings),
+                'data': {'findings': list(entry.warnings)},
+            }]
+            if 'quality' not in order:
+                order.insert(0, 'quality')
+
         # The five configurable sources always appear, in resolver order, followed by
         # anything else that turned up in the trace (folder reasoning, dedupe, edits).
         sequence = [t for t in SOURCE_ORDER]
-        sequence += [t for t in order if t not in sequence]
+        sequence += [t for t in order if t not in sequence and t != 'user']
+        sequence.append('user')
 
         cards = []
         for tier in sequence:
             steps = grouped.get(tier, [])
             label = TIER_LABELS.get(tier, tier.title())
             runnable = tier in SOURCE_ORDER
+            running = (self._running_entry == entry.entry_id
+                       and self._running_tier == tier)
+            queued = self._queued.get(entry.entry_id, '').partition(':')[0] == tier
+            if tier == 'user':
+                cards.append(self._manual_card(entry))
+                continue
             if not steps:
                 # Header only, folded shut: the card exists so you can see the source
                 # and press Run, not to tell you at length that nothing happened.
-                card = self._add(tier, label, '', badge='not run',
-                                 colour=STATE_COLOURS[NOT_RUN],
+                card = self._add(tier, label, '',
+                                 badge=('running' if running else
+                                        'queued' if queued else ''),
+                                 colour=(STATE_COLOURS[PARTIAL] if running or queued
+                                         else TEXT),
                                  run=label if runnable else '', has_run=False)
-                card.header.setChecked(False)
+                card.header.setChecked(running)
                 card._sync()
                 cards.append(card)
                 continue
 
             state, badge = self._tier_verdict(entry, tier, steps)
+            if running:
+                state, badge = PARTIAL, 'running'
+            elif queued:
+                state, badge = PARTIAL, 'queued'
             if tier == 'api':
                 body = self._api_widget(steps)
+            elif tier == 'search':
+                body = self._search_widget(steps)
             else:
                 body = ''.join(self._step_html(step) for step in steps)
             cards.append(self._add(
                 tier, label, body, badge=badge, colour=STATE_COLOURS[state],
                 run=label if runnable else '', has_run=True))
         return cards
+
+    def _manual_card(self, entry: BookEntry) -> CollapsibleCard:
+        fields = [(name, entry.get_field(name)) for name in IDENTITY_FIELDS
+                  if entry.get_field(name).source == 'user'
+                  and not entry.get_field(name).is_empty()]
+        if not fields:
+            card = self._add('user', TIER_LABELS['user'], '', colour=TEXT)
+            card.header.setChecked(False)
+            card._sync()
+            return card
+
+        body = ''.join(
+            f'<div><span style="color:{TEXT_DIM};">'
+            f'{html.escape(name.replace("_", " "))}:</span> '
+            f'<b>{html.escape(str(field.value))}</b></div>'
+            for name, field in fields)
+        return self._add('user', TIER_LABELS['user'], body,
+                         badge=f'{len(fields)} field'
+                               + ('' if len(fields) == 1 else 's'),
+                         colour=STATE_COLOURS[GOOD])
 
     # ------------------------------------------------------------- card verdicts
 
@@ -500,25 +595,6 @@ class WhyPanel(QWidget):
         column.setContentsMargins(8, 8, 8, 8)
         column.setSpacing(6)
 
-        summary = QLabel(f'<div style="color:{TEXT};">{html.escape(message)}</div>')
-        summary.setWordWrap(True)
-        summary.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        column.addWidget(summary)
-
-        if refined:
-            # Worth saying out loud: the answer below was not found with the query we
-            # started from, and which title the second pass used decides everything
-            # after it.
-            note = QLabel(
-                f'<div style="color:{TEXT_DIM};">Searched again using '
-                f'<b>{html.escape(str(refined.get("title", "")))}</b>'
-                + (f' by {html.escape(str(refined.get("author", "")))}'
-                   if refined.get('author') else '')
-                + ' - the first pass only had the filename to go on.</div>')
-            note.setWordWrap(True)
-            column.addWidget(note)
-
         winner = (chosen or {}).get('source', '')
         for source in (asked or sorted(by_source)):
             rows = sorted(by_source.get(source) or [],
@@ -568,8 +644,13 @@ class WhyPanel(QWidget):
         listing = ['<table style="border-collapse:collapse; width:100%;">']
         for row in rows[:8]:
             score = row.get('score', 0)
-            hue = (STATUS_HUES['approved'] if score >= threshold
-                   else STATUS_HUES['risky'])
+            from ..quality import inspect_value
+            suspicious = [finding.message
+                          for field in ('title', 'author', 'series')
+                          for finding in inspect_value(field, str(row.get(field) or ''))]
+            hue = (STATUS_HUES['risky'] if suspicious else
+                   STATUS_HUES['approved'] if score >= threshold else
+                   STATUS_HUES['risky'])
             series = (f' <span style="color:{TEXT_FAINT}">'
                       f'({html.escape(str(row.get("series")))} '
                       f'#{html.escape(str(row.get("series_index") or "?"))})</span>'
@@ -577,7 +658,10 @@ class WhyPanel(QWidget):
             listing.append(
                 f'<tr>'
                 f'<td style="color:{hue}; padding:2px 10px 2px 0; '
-                f'vertical-align:top; white-space:nowrap;">{score:.0%}</td>'
+                f'vertical-align:top; white-space:nowrap;">{score:.0%}'
+                + (f' <span title="{html.escape(chr(10).join(suspicious), quote=True)}">'
+                   f'!</span>' if suspicious else '')
+                + '</td>'
                 f'<td style="padding:2px 0;">{html.escape(str(row.get("title") or "?"))}'
                 f'{series}<br>'
                 f'<span style="color:{TEXT_DIM}; font-size:11px;">'
@@ -587,10 +671,6 @@ class WhyPanel(QWidget):
         if len(rows) > 8:
             listing.append(f'<div style="color:{TEXT_FAINT}; padding-top:4px;">'
                            f'...and {len(rows) - 8} more</div>')
-        listing.append(self._block('Its best row, parsed', json.dumps(
-            {k: v for k, v in rows[0].items() if k not in ('raw',)},
-            ensure_ascii=False, indent=1)))
-
         badge = f'{len(rows)} result(s) · best {best:.0%}'
         if won:
             badge += ' · used'
@@ -599,6 +679,59 @@ class WhyPanel(QWidget):
                                                    else PARTIAL],
                               key=f'api::{source}', expanded=won or best >= threshold,
                               **run_kwargs)
+
+    def _search_widget(self, steps: List[Dict]) -> QWidget:
+        """Show parsed web data and ranked links without repeating search prose."""
+        parsed: Dict = {}
+        results: List[Dict] = []
+        for step in steps:
+            data = step.get('data')
+            if not isinstance(data, dict):
+                continue
+            parsed = data.get('result') or parsed
+            results = data.get('results') or results
+
+        host = QWidget()
+        column = QVBoxLayout(host)
+        column.setContentsMargins(8, 8, 8, 8)
+        column.setSpacing(6)
+
+        if parsed:
+            parsed_step = {'data': {'result': parsed}}
+            label = QLabel(self._step_html(parsed_step))
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setWordWrap(True)
+            column.addWidget(label)
+
+        if results:
+            first = QLabel(self._search_results_html(results[:3]))
+            first.setTextFormat(Qt.TextFormat.RichText)
+            first.setOpenExternalLinks(True)
+            first.setWordWrap(True)
+            column.addWidget(first)
+            if len(results) > 3:
+                column.addWidget(self._sub_card(
+                    'More results', self._search_results_html(results[3:]),
+                    badge=str(len(results) - 3), colour=TEXT,
+                    key='search::more', expanded=False))
+        elif not parsed:
+            label = QLabel(f'<span style="color:{TEXT};">No results</span>')
+            column.addWidget(label)
+        return host
+
+    @staticmethod
+    def _search_results_html(results: List[Dict]) -> str:
+        rows = ['<table cellspacing="0" cellpadding="3" width="100%">']
+        for index, result in enumerate(results, start=1):
+            title = html.escape(str(result.get('title') or 'Untitled result'))
+            href = html.escape(str(result.get('href') or result.get('url') or ''),
+                               quote=True)
+            title_html = f'<a href="{href}">{title}</a>' if href else title
+            rows.append(
+                f'<tr><td style="color:{TEXT}; padding-right:8px; '
+                f'vertical-align:top;">{index}</td><td>{title_html}</td></tr>')
+        rows.append('</table>')
+        return ''.join(rows)
 
     def _sub_card(self, title: str, body: str, badge: str, colour: str, key: str,
                   expanded: bool, run: str = '', has_run: bool = False,
@@ -624,23 +757,74 @@ class WhyPanel(QWidget):
     def _step_html(self, step: Dict) -> str:
         message = html.escape(str(step.get('message', '')))
         data = step.get('data') if isinstance(step.get('data'), dict) else {}
-        parts = [f'<div style="margin-bottom:4px;">{message}</div>']
-
-        applied = data.get('applied')
-        if applied:
-            parts.append(
-                f'<div style="color:{TEXT}; margin-bottom:4px;">'
-                f'used for: <b>{html.escape(", ".join(applied))}</b></div>')
-
-        if data.get('result'):
-            parts.append(self._block('Parsed result',
-                                     json.dumps(data['result'], ensure_ascii=False,
-                                                indent=1)))
+        result = data.get('result')
+        if isinstance(result, dict):
+            origins = data.get('from') if isinstance(data.get('from'), dict) else {}
+            applied = set(data.get('applied') or [])
+            rows = ['<table cellspacing="0" cellpadding="2">']
+            for name, value in result.items():
+                label = html.escape(name.replace('_', ' ').title())
+                rows.append(
+                    f'<tr><td style="color:{TEXT}; padding-right:10px;">{label}</td>'
+                    f'<td><b>{html.escape(str(value))}</b></td>'
+                    f'<td style="color:{TEXT}; padding-left:10px;">'
+                    f'{"Used" if name in applied else "Found"}</td></tr>')
+                source = origins.get(name)
+                if source and str(source) != str(value):
+                    rows.append(
+                        f'<tr><td></td><td colspan="2" style="color:{TEXT};">'
+                        f'From: {html.escape(str(source))}</td></tr>')
+            rows.append('</table>')
+            parts = [''.join(rows)]
+        elif data.get('findings'):
+            findings = data.get('findings') or []
+            parts = ['<div style="color:' + TEXT + ';">'
+                     + '<br><br>'.join('<b>' + html.escape(
+                         self._compact_finding(item)) + '</b>' for item in findings)
+                     + '</div>']
+        elif 'tags' in data:
+            parts = [f'<div style="color:{TEXT};">No book identity tags</div>']
+        elif 'path' in data and 'considered' in data:
+            parts = [f'<div style="color:{TEXT};">No identity fields parsed</div>']
+        else:
+            parts = [f'<div style="margin-bottom:4px; color:{TEXT};">{message}</div>']
 
         exchange = data.get('exchange')
         if isinstance(exchange, dict):
             parts.append(self._exchange_html(exchange))
         return ''.join(parts)
+
+    @staticmethod
+    def _compact_finding(finding) -> str:
+        """Convert current and previously saved quality findings to short labels."""
+        if isinstance(finding, dict):
+            field = str(finding.get('field', 'Value')).replace('_', ' ').title()
+            kind = str(finding.get('kind', ''))
+        else:
+            text = str(finding)
+            field = text.partition(':')[0].replace('_', ' ').title()
+            kind = next((key for key, phrase in (
+                ('length', 'characters long'), ('brackets', 'unclosed'),
+                ('html', 'HTML'), ('file_words', 'describes the file'),
+                ('punctuation', 'repeated punctuation'), ('edges', 'stray punctuation'),
+                ('truncated', 'truncated'), ('shouting', 'upper case'),
+                ('numeric', 'only digits'), ('part_number', 'part number'))
+                if phrase.lower() in text.lower()), '')
+            if ':' not in text:
+                return text
+        labels = {
+            'length': 'is very long', 'brackets': 'has unclosed brackets',
+            'html': 'contains HTML', 'file_words': 'contains file details',
+            'punctuation': 'has repeated punctuation',
+            'edges': 'has stray punctuation', 'truncated': 'looks incomplete',
+            'shouting': 'is all uppercase', 'numeric': 'contains only numbers',
+            'part_number': 'contains a part number',
+            'chapter_fraction': 'looks like a chapter count',
+            'separator': 'contains unusual separators',
+            'random_fragment': 'contains random-looking text',
+            'joined_words': 'may contain joined words',
+        }
+        return f'{field} {labels.get(kind, "looks unusual")}'
 
     def _exchange_html(self, exchange: Dict) -> str:
         """The full LLM call: who was asked, what was sent, what came back."""

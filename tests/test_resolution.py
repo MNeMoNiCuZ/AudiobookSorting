@@ -9,6 +9,7 @@ from scripts.cache import Cache
 from scripts.dedupe import find_duplicates
 from scripts.models import SOURCE_CONFIDENCE, BookEntry, Field, clean_value
 from scripts.paths import render_template, sanitize_component, shorten_path
+from scripts.quality import inspect_value
 from scripts.regex_parser import parse_name, parse_path
 
 
@@ -127,6 +128,25 @@ def test_confidence_ignores_series_when_standalone():
     entry.set_field('author', 'A', 'metadata')
     entry.set_field('title', 'T', 'metadata')
     assert entry.confidence() == pytest.approx(SOURCE_CONFIDENCE['metadata'])
+
+
+def test_one_lower_confidence_series_does_not_replace_the_whole_score():
+    entry = BookEntry(
+        author=Field('Myles Christensen', 'metadata', 0.80),
+        title=Field("She Stole My Buddy's Starship", 'metadata', 0.80),
+        series=Field("She Stole My Buddy's Starship", 'regex', 0.45),
+        series_index=Field('2', 'regex', 0.45))
+
+    assert entry.confidence() == pytest.approx(0.73)
+
+
+def test_tags_alone_never_exceed_seventy_five_percent_confidence():
+    entry = BookEntry()
+    for name, value in (('author', 'A'), ('title', 'T'), ('series', 'S'),
+                        ('series_index', '1')):
+        entry.set_field(name, value, 'metadata')
+
+    assert entry.confidence() == pytest.approx(0.75)
 
 
 def test_confidence_penalises_series_without_index():
@@ -396,3 +416,37 @@ def test_stale_duplicate_flag_is_cleared(tmp_path):
     assert mark_duplicates([entry]) == 0
     assert entry.status == STATUS_PENDING
     assert entry.duplicate_of == ''
+
+
+def test_normal_title_numbers_are_not_suspicious():
+    assert not inspect_value('title', 'A Story - Part 1')
+    assert not inspect_value('title', 'A Story, Volume Two')
+    assert not inspect_value('title', 'The Sheriff 2')
+    assert not inspect_value('title', 'Books 1-3')
+    assert not inspect_value('author', 'adastra339')
+    assert any(finding.kind == 'file_segment'
+               for finding in inspect_value('title', 'A Story - Track 03'))
+    assert not inspect_value('title', 'A Story-01')
+    assert not inspect_value('title', '003')
+    assert not inspect_value('title', 'The Parting Glass')
+
+
+@pytest.mark.parametrize('value,kinds', [
+    ('01/80', {'chapter_fraction', 'separator'}),
+    ('A chapter - 1/9', {'chapter_fraction', 'separator'}),
+    ('ObsessioninDeathUnabridgedPart1 Mp332 Aequz5bhhjgtu',
+     {'file_words'}),
+    ('Title | Alternate', {'separator'}),
+    ('Title \\ Alternate', {'separator'}),
+    ('Title "Alternate"', {'separator'}),
+])
+def test_suspicious_identity_patterns(value, kinds):
+    found = {finding.kind for finding in inspect_value('title', value)}
+    assert kinds <= found
+
+
+def test_suggested_fix_removes_empty_brackets_after_file_details():
+    from scripts.quality import suggest_fix
+
+    assert suggest_fix(
+        'title', 'Constitution (Unabridged)', 'file_words') == 'Constitution'

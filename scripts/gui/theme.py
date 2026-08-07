@@ -91,7 +91,7 @@ SELECTION_BORDER = '#ffffff'
 # --------------------------------------------------------------------- status
 # The stripe/pill hue per status, and the muted fill used behind the pill.
 STATUS_HUES = {
-    'pending': TEXT_FAINT,
+    'pending': TEXT,
     'likely': '#3ddc84',
     'uncertain': '#ffc233',
     'unlikely': '#ff5c5c',
@@ -294,7 +294,7 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
 QComboBox[filter="true"] {{
     background-color: {FIELD};
     border: 1px solid {FIELD_BORDER};
-    padding: 8px 32px 8px 13px;
+    padding: 8px 22px 8px 13px;
     color: {TEXT};
     font-size: 14px;
     min-height: 20px;
@@ -328,7 +328,7 @@ QLineEdit:disabled, QComboBox:disabled {{ color: {TEXT_FAINT}; background-color:
    triangle is a web trick, and Qt renders it as a filled square. */
 QComboBox::drop-down {{
     subcontrol-origin: padding; subcontrol-position: center right;
-    border: none; background: transparent; width: 20px;
+    border: none; background: transparent; width: 14px;
 }}
 /* combobox-popup: 0 is not cosmetic. Without it Qt sizes a popup to *every* item and
    then clips whatever will not fit the screen - so a 51-model list opened from a combo

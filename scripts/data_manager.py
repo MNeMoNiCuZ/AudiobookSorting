@@ -47,10 +47,17 @@ class DataManager:
         if not isinstance(raw, dict):
             return
         stale_duplicates = 0
+        stripped_artwork = 0
         for entry_id, data in raw.items():
             try:
                 entry = BookEntry.from_dict(data)
                 entry.entry_id = entry.entry_id or entry_id
+                for key in list(entry.raw_tags):
+                    normal_key = str(key).casefold()
+                    if any(name in normal_key for name in
+                           ('covr', 'apic', 'metadata_block_picture')):
+                        entry.raw_tags.pop(key, None)
+                        stripped_artwork += 1
                 # "Duplicate" is derived, not decided: it is recomputed from the files
                 # on disk by every scan, and the files may have moved or been deleted
                 # since this was written. Trusting a saved flag is how a red row
@@ -70,6 +77,10 @@ class DataManager:
         if stale_duplicates:
             self.logger.info('Dropped %d saved duplicate flag(s) - they are recomputed '
                              'from the files on disk, never restored', stale_duplicates)
+        if stripped_artwork:
+            self.logger.info('Removed %d embedded cover-art value(s) from saved raw tags',
+                             stripped_artwork)
+            self.mark_dirty()
 
     def _backup_corrupt(self) -> None:
         try:

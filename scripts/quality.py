@@ -18,6 +18,7 @@ you turn a visible problem into an invisible one.
 from __future__ import annotations
 
 import re
+import html as html_lib
 from typing import Dict, List, NamedTuple
 
 # Bracket pairs that must balance within one field.
@@ -39,6 +40,13 @@ _ODD_EDGE = re.compile(r'^[\s\-–—_,;:.!?)\]}]+|[\s\-–—_,;:(\[{]+$')
 
 # A truncated scrape almost always ends in one of these.
 _TRUNCATED = re.compile(r'(\.{3}|…|\bet al\b|\betc\.?$)', re.I)
+_TITLE_FILE_SEGMENT = re.compile(
+    r'\b(?:disc|disk|cd|track|file)\s*\d+\b', re.I)
+_CHAPTER_FRACTION = re.compile(r'(?:^|[-_\s])\d{1,3}\s*/\s*\d{1,3}(?:$|\s)')
+_SPECIAL_SEPARATOR = re.compile(r'[|/\\"]')
+_EMBEDDED_FILE_WORD = re.compile(
+    r'(?:unabridged|abridged|audiobook|mp3\d*|m4[ab]|flac)', re.I)
+_JOINED_WORDS = re.compile(r'^[A-Za-z]{24,}$')
 
 # How much of the field's confidence each kind of finding costs. Multiplicative, so
 # two problems on one field compound rather than cancelling out.
@@ -50,8 +58,11 @@ _PENALTY = {
     'edges': 0.85,
     'truncated': 0.70,
     'shouting': 0.85,
-    'numeric': 0.50,
     'length': 0.70,
+    'file_segment': 0.75,
+    'chapter_fraction': 0.55,
+    'separator': 0.70,
+    'joined_words': 0.70,
 }
 
 # Fields where an unusual character is genuinely unusual. Titles legitimately carry
@@ -80,61 +91,68 @@ def inspect_value(field: str, value: str) -> List[Finding]:
 
     strict = field in _STRICT_FIELDS
     found: List[Finding] = []
+    letters = [c for c in text if c.isalpha()]
 
     for opener, closer in _PAIRS:
         if text.count(opener) != text.count(closer):
             found.append(Finding(
                 field, 'brackets',
-                f'{field}: "{text}" has an unclosed {opener}{closer} - the search '
-                f'result was probably cut off mid-phrase'))
+                f'{field.replace("_", " ").title()} has unclosed brackets'))
             break
 
     if _ENTITY.search(text) or _TAG.search(text):
         found.append(Finding(
             field, 'html',
-            f'{field}: "{text}" still contains raw HTML - it was scraped from a page '
-            f'and never decoded'))
+            f'{field.replace("_", " ").title()} contains HTML'))
 
-    match = _FILE_WORDS.search(text)
+    match = _FILE_WORDS.search(text) or _EMBEDDED_FILE_WORD.search(text)
     if match:
         found.append(Finding(
             field, 'file_words',
-            f'{field}: "{text}" contains "{match.group().strip()}", which describes '
-            f'the file rather than the book'))
+            f'{field.replace("_", " ").title()} contains file details'))
 
     if _PUNCT_RUN.search(text):
         found.append(Finding(
             field, 'punctuation',
-            f'{field}: "{text}" has a run of repeated punctuation'))
+            f'{field.replace("_", " ").title()} has repeated punctuation'))
 
     if _ODD_EDGE.search(text):
         found.append(Finding(
             field, 'edges',
-            f'{field}: "{text}" begins or ends with stray punctuation'))
+            f'{field.replace("_", " ").title()} has stray punctuation'))
 
     if _TRUNCATED.search(text):
         found.append(Finding(
             field, 'truncated',
-            f'{field}: "{text}" looks truncated'))
+            f'{field.replace("_", " ").title()} looks incomplete'))
 
-    letters = [c for c in text if c.isalpha()]
+    if field == 'title' and _TITLE_FILE_SEGMENT.search(text):
+        found.append(Finding(
+            field, 'file_segment', 'Title looks like a file segment'))
+
+    if field == 'title' and _CHAPTER_FRACTION.search(text):
+        found.append(Finding(
+            field, 'chapter_fraction', 'Title looks like a chapter count'))
+
+    if _SPECIAL_SEPARATOR.search(text):
+        found.append(Finding(
+            field, 'separator',
+            f'{field.replace("_", " ").title()} contains unusual separators'))
+
+    if field == 'title' and _JOINED_WORDS.fullmatch(text) and any(c.isupper() for c in text[1:]):
+        found.append(Finding(
+            field, 'joined_words', 'Title may contain joined words'))
+
     if (strict and len(letters) > 4
             and all(c.isupper() for c in letters) and ' ' in text):
         found.append(Finding(
             field, 'shouting',
-            f'{field}: "{text}" is entirely upper case - that is how a tag dump looks, '
-            f'not how a name is written'))
-
-    if strict and letters == [] and any(c.isdigit() for c in text):
-        found.append(Finding(
-            field, 'numeric',
-            f'{field}: "{text}" is only digits, which is not a name'))
+            f'{field.replace("_", " ").title()} is all uppercase'))
 
     if len(text) > (60 if strict else 180):
         found.append(Finding(
             field, 'length',
-            f'{field}: "{text[:60]}..." is {len(text)} characters long - a whole '
-            f'sentence was captured instead of a value'))
+            f'{field.replace("_", " ").title()} is very long'))
 
     return found
 
@@ -153,3 +171,35 @@ def penalties(findings: List[Finding]) -> Dict[str, float]:
     for finding in findings:
         factors[finding.field] = factors.get(finding.field, 1.0) * finding.penalty
     return factors
+
+
+def suggest_fix(field: str, value: str, kind: str) -> str:
+    """Conservative, editable cleanup proposed for one quality finding."""
+    text = str(value or '')
+    if kind == 'brackets':
+        for opener, closer in _PAIRS:
+            if text.count(opener) != text.count(closer):
+                text = text.replace(opener, '').replace(closer, '')
+    elif kind == 'html':
+        text = html_lib.unescape(_TAG.sub('', text))
+    elif kind == 'file_words':
+        text = _EMBEDDED_FILE_WORD.sub(' ', _FILE_WORDS.sub(' ', text))
+    elif kind == 'punctuation':
+        text = _PUNCT_RUN.sub(lambda match: match.group(1), text)
+    elif kind == 'edges':
+        text = _ODD_EDGE.sub('', text)
+    elif kind == 'truncated':
+        text = _TRUNCATED.sub('', text)
+    elif kind == 'shouting':
+        text = text.title()
+    elif kind == 'file_segment':
+        text = _TITLE_FILE_SEGMENT.sub(' ', text)
+    elif kind == 'chapter_fraction':
+        text = _CHAPTER_FRACTION.sub(' ', text)
+    elif kind == 'separator':
+        text = _SPECIAL_SEPARATOR.sub(' ', text)
+    empty_brackets = re.compile(r'\(\s*\)|\[\s*\]|\{\s*\}')
+    while empty_brackets.search(text):
+        text = empty_brackets.sub(' ', text)
+    text = re.sub(r'\s+([,;:.!?])', r'\1', text)
+    return re.sub(r'\s+', ' ', text).strip(' -_,;:.')

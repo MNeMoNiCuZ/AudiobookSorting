@@ -76,8 +76,8 @@ def test_clearing_a_book_drops_the_reasoning_that_explained_it():
 
     assert entry.evidence == {}
     assert not entry.resolved
-    # The clearing itself is recorded - the trace is not simply empty.
-    assert [step for step in entry.trace if step['tier'] == 'user']
+    # Loading is not a manual edit and leaves no stale explanation behind.
+    assert entry.trace == []
 
 
 def test_decisions_are_kept_or_dropped_as_asked():
@@ -198,6 +198,8 @@ def test_a_cleared_book_is_read_from_disk_again_by_the_same_load(qt_app, setting
     # A load that keeps nothing - the new default, and the report that found this.
     apply_keep(data.all(), KeepOptions(manual=False, above=101, decisions=False))
     assert all(not e.value('title') for e in data.all()), 'cleared, as asked'
+    assert all(not any(step.get('tier') == 'user' for step in e.trace)
+               for e in data.all()), 'load clearing is not a manual edit'
 
     entries = worker()
 
@@ -205,7 +207,7 @@ def test_a_cleared_book_is_read_from_disk_again_by_the_same_load(qt_app, setting
     assert any(e.confidence() > 0 for e in entries), 'and with confidence, not zero'
 
 
-def test_unsaved_is_typed_or_approved_and_not_yet_written():
+def test_unsaved_requires_processed_data_awaiting_a_decision():
     typed = book('typed', author=('Le Guin', 'user', 1.0))
     approved = book('approved', author=('Sanderson', 'audnexus', 0.9))
     approved.status = STATUS_APPROVED
@@ -214,6 +216,15 @@ def test_unsaved_is_typed_or_approved_and_not_yet_written():
     written.status = STATUS_APPLIED
     written.applied_path = '/output/Le Guin'
 
+    guessed.explicit_work_pending = True
     waiting = {e.entry_id for e in unsaved_entries([typed, approved, guessed, written])}
 
-    assert waiting == {'typed', 'approved'}
+    assert waiting == {'guessed'}
+
+
+def test_identified_row_awaiting_review_is_unsaved():
+    identified = book('identified', author=('Le Guin', 'audnexus', 0.9))
+    identified.resolved = True
+    identified.explicit_work_pending = True
+
+    assert unsaved_entries([identified]) == [identified]

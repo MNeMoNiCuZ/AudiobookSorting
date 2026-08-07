@@ -318,14 +318,20 @@ def run_gui(app: Application) -> int:
     def sync_queue_rows(_count=0):
         """Keep row markers aligned with identification jobs still waiting."""
         nonlocal queued_rows
-        current = {entry.entry_id
-                   for worker in workers.queue
-                   if getattr(worker, 'kind', '') == 'identify'
-                   for entry in getattr(worker, 'entries', [])}
+        queued_identifications = [
+            (entry, list(getattr(worker, 'tiers', []) or []))
+            for worker in workers.queue
+            if getattr(worker, 'kind', '') == 'identify'
+            for entry in getattr(worker, 'entries', [])]
+        current = {entry.entry_id for entry, _tiers in queued_identifications}
         for entry_id in queued_rows - current:
             window.set_row_progress(entry_id, None)
-        for entry_id in current:
-            window.set_row_progress(entry_id, 0.0, 'Queued')
+            window.clear_identification_queued(entry_id)
+        for entry, tiers in queued_identifications:
+            window.set_row_progress(entry.entry_id, 0.0, 'Queued')
+            window.clear_identification_queued(entry.entry_id)
+            if len(tiers) == 1:
+                window.set_identification_queued(entry, tiers[0])
         queued_rows = current
         window.show_queue(workers.labels())
 
@@ -427,7 +433,7 @@ def run_gui(app: Application) -> int:
             window.show_message(f'Loading {len(targets)} book'
                                 f'{"" if len(targets) == 1 else "s"}'
                                 + cleared_note(plan) + unsaved_note(waiting))
-            do_resolve(targets, ['metadata', 'regex'])
+            do_resolve(targets, ['metadata', 'regex'], explicit=False)
             return
 
         # The whole folder. Clearing happens before the scan, because the scan's own
@@ -466,24 +472,28 @@ def run_gui(app: Application) -> int:
         wire(worker)
 
     # --- identify
-    def do_resolve(entries, tiers):
+    def do_resolve(entries, tiers, explicit=True):
         worker = ResolveWorker(app.resolver, entries, tiers=list(tiers))
 
-        worker.signals.entry_started.connect(
-            lambda entry: window.set_row_progress(
-                entry.entry_id, 0.03, 'Identifying'))
+        def started(entry):
+            if explicit:
+                entry.explicit_work_pending = True
+                app.data.update(entry)
+            window.set_row_progress(entry.entry_id, 0.03, 'Identifying')
+
+        worker.signals.entry_started.connect(started)
         worker.signals.entry_done.connect(
-            lambda entry: window.set_row_progress(entry.entry_id, None))
+            window.finish_identification_entry)
         tier_labels = {'metadata': 'Reading metadata', 'regex': 'Parsing filename',
                        'api': 'Checking book databases',
-                       'search': 'Searching the web', 'llm': 'Asking the model'}
+                       'search': 'Searching the web', 'llm': 'Asking the AI'}
         worker.signals.entry_progress.connect(
-            lambda entry, fraction, tier: window.set_row_progress(
-                entry.entry_id, fraction, tier_labels.get(tier, tier.title())))
+            lambda entry, fraction, tier: window.update_identification_progress(
+                entry, fraction, tier, tier_labels.get(tier, tier.title())))
 
         def done(result):
             for entry in entries:
-                window.set_row_progress(entry.entry_id, None)
+                window.finish_identification_entry(entry)
             app.data.mark_dirty()
             window.set_busy(workers.busy)
             window.refresh_stats()
@@ -493,10 +503,10 @@ def run_gui(app: Application) -> int:
             window.review_overwrites(entries)
 
         worker.signals.error.connect(
-            lambda _text: [window.set_row_progress(entry.entry_id, None)
+            lambda _text: [window.finish_identification_entry(entry)
                            for entry in entries])
         worker.signals.cancelled.connect(
-            lambda: [window.set_row_progress(entry.entry_id, None)
+            lambda: [window.finish_identification_entry(entry)
                      for entry in entries])
         worker.signals.finished.connect(done)
         wire(worker)

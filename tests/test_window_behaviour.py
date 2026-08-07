@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import QApplication                              # noqa: E4
 from scripts.gui.main_window import SHAPE_FILTERS, MainWindow         # noqa: E402
 from scripts.load_options import plan_load                            # noqa: E402
 from scripts.models import BookEntry, Field                           # noqa: E402
+from scripts.gui.why_panel import GOOD, STATE_COLOURS                 # noqa: E402
 
 
 @pytest.fixture
@@ -36,6 +37,30 @@ def window(qt_app, settings):
 
 def shape_filter(name):
     return next(test for label, test in SHAPE_FILTERS if label == name)
+
+
+def test_manual_source_run_is_marked_queued_on_its_card(window):
+    entry = BookEntry(entry_id='queued')
+    window.why_panel.show_entry(entry)
+    window.set_identification_queued(entry, 'llm')
+
+    card = next(card for card in window.why_panel._tier_cards(entry)
+                if card.key == 'llm')
+    assert card._badge == 'queued'
+
+
+def test_manual_edit_card_only_shows_current_user_fields(window):
+    entry = BookEntry(entry_id='manual')
+    entry.log('user', 'Cleared on load: author, series, series_index, title')
+    empty = window.why_panel._manual_card(entry)
+    assert empty._badge == ''
+    assert 'Cleared on load' not in empty.body.text()
+
+    entry.set_field('title', 'Typed title', 'user')
+    edited = window.why_panel._manual_card(entry)
+    assert edited._badge == '1 field'
+    assert 'Typed title' in edited.body.text()
+    assert STATE_COLOURS[GOOD] in edited.header.styleSheet()
 
 
 # ------------------------------------------------------------------ the panel width
@@ -90,6 +115,22 @@ def test_closing_writes_the_panel_width_back(window, settings):
     parts = settings.get('AO_UI_WINDOW').split(',')
     assert len(parts) == 5
     assert int(parts[3]) == expected
+
+
+def test_window_resize_keeps_the_restored_panel_width(qt_app, settings):
+    settings.set('AO_UI_REMEMBER_LAYOUT', 'true')
+    settings.set('AO_UI_WINDOW', '1400,900,1000,400,normal')
+
+    win = MainWindow(settings)
+    win.show()
+    qt_app.processEvents()
+    win.splitter.resize(1600, 800)
+    win._restore_split()
+    win.resize(1900, win.height())
+    QTest.qWait(10)
+
+    assert win.splitter.sizes()[1] == pytest.approx(400, abs=4)
+    win.close()
 
 
 def test_reset_layout_forgets_the_saved_widths(window):
@@ -570,7 +611,8 @@ def test_unsaved_rows_light_up_and_then_stop(window, qt_app):
     from scripts.gui.delegates import ROLE_FLASH
     from scripts.gui.main_window import COL_TITLE
 
-    typed = BookEntry(entry_id='typed', folder='/library/typed',
+    typed = BookEntry(entry_id='typed', folder='/library/typed', resolved=True,
+                      explicit_work_pending=True,
                       title=Field(value='Typed', source='user', confidence=1.0))
     found = BookEntry(entry_id='found', folder='/library/found',
                       title=Field(value='Found', source='audnexus', confidence=0.9))
@@ -606,7 +648,7 @@ def test_confidence_setting_is_not_on_the_main_filter_row(window):
     assert not hasattr(window, 'confidence_score')
 
 
-def test_confidence_bands_are_the_status_until_reviewed(window):
+def test_confidence_bands_do_not_replace_review_status(window):
     from scripts.gui.delegates import ROLE_STATUS
 
     settings = window.settings
@@ -622,17 +664,330 @@ def test_confidence_bands_are_the_status_until_reviewed(window):
         displayed[entry_id] = (window.table.item(row, 7).text(),
                                window.table.item(row, 0).data(ROLE_STATUS))
     assert displayed == {
-        'green': ('Likely', 'likely'),
-        'amber': ('Uncertain', 'uncertain'),
-        'red': ('Unlikely', 'unlikely'),
+        'green': ('Pending', 'pending'),
+        'amber': ('Pending', 'pending'),
+        'red': ('Pending', 'pending'),
     }
 
 
-def test_status_filter_lists_confidence_until_reviewed(window):
+def test_status_filter_lists_coloured_review_statuses(window):
     items = [window.status_filter.itemText(index)
              for index in range(window.status_filter.count())]
-    assert items == ['All statuses', 'Likely', 'Uncertain', 'Unlikely', 'Approved',
-                     'Rejected', 'Applied', 'Duplicate']
+    assert items == ['All statuses', 'Pending', 'Unsure', 'Approved', 'Rejected',
+                     'Applied', 'Duplicate', 'Has Warning']
+    for index in range(1, window.status_filter.count()):
+        assert window.status_filter.itemData(
+            index, Qt.ItemDataRole.ForegroundRole) is not None
+
+
+def test_has_warning_status_filter(window):
+    warned = _identified('warned', 0.8)
+    warned.author = Field(value='UPPER CASE', source='test', confidence=0.8)
+    clean = _identified('clean', 0.8)
+    _loaded(window, warned, clean)
+
+    window.status_filter.setCurrentText('Has Warning')
+    window._apply_filters()
+
+    shown = {window._entry_at(row).entry_id
+             for row in range(window.table.rowCount())
+             if not window.table.isRowHidden(row)}
+    assert shown == {'warned'}
+
+
+def test_warnings_dialog_shows_book_columns_and_inline_fix(window, monkeypatch):
+    from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QHeaderView,
+                                 QLineEdit, QPushButton, QToolButton, QTreeWidget)
+    from scripts.gui.theme import STATUS_TEXT
+
+    book = BookEntry(
+        entry_id='warned', folder='/library/warned', audio_files=['book.m4b'],
+        status='approved',
+        author=Field(value='AUTHOR NAME', source='test', confidence=0.8),
+        series=Field(value='Series', source='test', confidence=0.8),
+        series_index=Field(value='3', source='test', confidence=0.8),
+        title=Field(value='Book Title', source='test', confidence=0.8))
+    _loaded(window, book)
+    shown = []
+    def capture(dialog):
+        dialog.show()
+        QApplication.processEvents()
+        QApplication.processEvents()
+        shown.append(dialog)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(
+        QDialog, 'exec', capture)
+
+    window._show_warnings_dialog()
+
+    dialog = shown[0]
+    tree = dialog.findChild(QTreeWidget)
+    assert dialog.width() == 1860
+    assert [tree.headerItem().text(column) for column in range(8)] == [
+        'File', 'Author', 'Series', '#', 'Title', 'Fixed', 'Fix', 'Ignore']
+    finding = tree.topLevelItem(0)
+    assert finding.text(0) == 'book.m4b'
+    assert [tree.itemWidget(finding, column).text() for column in range(1, 6)] == [
+        'AUTHOR NAME', 'Series', '3', 'Book Title', 'Author Name']
+    assert [finding.text(column) for column in range(1, 6)] == ['', '', '', '', '']
+    assert finding.foreground(1).color().name() == STATUS_TEXT['rejected']
+    assert finding.foreground(5).color().name() == STATUS_TEXT['approved']
+    assert finding.data(0, Qt.ItemDataRole.UserRole) == 'warned'
+    assert finding.sizeHint(0).height() == 58
+    assert tree.isSortingEnabled()
+    widths = [tree.columnWidth(column) for column in range(8)]
+    assert widths[3] == 52
+    assert widths[6] == tree.ACTION_WIDTH
+    assert widths[7] == tree.ACTION_WIDTH
+    assert widths[0] > widths[4] > widths[1] >= widths[2] > widths[3]
+    assert tree.viewport().width() - sum(widths) < 12
+
+    button_texts = [button.text() for button in dialog.findChildren(QPushButton)]
+    assert not any('Approve' in text or 'Reject' in text for text in button_texts)
+    for column in range(1, 6):
+        assert isinstance(tree.itemWidget(finding, column), QLineEdit)
+    editor = tree.itemWidget(finding, 5)
+    assert isinstance(editor, QLineEdit)
+    assert editor.text() == 'Author Name'
+    assert not editor.isClearButtonEnabled()
+    assert not editor.hasFrame()
+    editor.setText('Edited Author')
+    fix_button = tree.itemWidget(finding, 6)
+    ignore_button = tree.itemWidget(finding, 7)
+    assert isinstance(fix_button, QToolButton)
+    assert isinstance(ignore_button, QToolButton)
+    assert not dialog.findChildren(QCheckBox)
+    assert not fix_button.icon().isNull()
+    assert not ignore_button.icon().isNull()
+    assert fix_button.width() >= widths[6] - 2
+    assert ignore_button.width() >= widths[7] - 2
+    assert fix_button.height() == tree.visualItemRect(finding).height()
+    assert ignore_button.height() == tree.visualItemRect(finding).height()
+    assert fix_button.iconSize().width() == 44
+    assert ignore_button.iconSize().width() == 44
+    assert tree.header().sectionResizeMode(6) == QHeaderView.ResizeMode.Fixed
+    assert tree.header().sectionResizeMode(7) == QHeaderView.ResizeMode.Fixed
+    assert tree.selectionBehavior() == QAbstractItemView.SelectionBehavior.SelectItems
+    for column in range(1, 6):
+        assert tree.itemWidget(finding, column).alignment() & Qt.AlignmentFlag.AlignLeft
+    assert fix_button.isEnabled()
+    fix_button.click()
+    assert book.value('author') == 'Edited Author'
+    assert book.status == 'pending'
+    assert book.explicit_work_pending
+
+
+def test_warnings_table_redistributes_space_after_column_resize(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QTreeWidget
+
+    book = BookEntry(
+        entry_id='warned', folder='/library/warned', audio_files=['book.m4b'],
+        author=Field(value='UPPER CASE', source='test', confidence=0.8))
+    _loaded(window, book)
+    shown = []
+    monkeypatch.setattr(
+        QDialog, 'exec',
+        lambda self: shown.append(self) or QDialog.DialogCode.Accepted)
+
+    window._show_warnings_dialog()
+
+    tree = shown[0].findChild(QTreeWidget)
+    tree.setColumnWidth(0, tree.columnWidth(0) - 120)
+    QApplication.processEvents()
+
+    widths = [tree.columnWidth(column) for column in range(tree.columnCount())]
+    assert tree.viewport().width() - sum(widths) < 12
+
+
+def test_warnings_dialog_hides_fix_icon_without_a_proposal(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QLineEdit, QToolButton, QTreeWidget
+
+    book = BookEntry(
+        entry_id='warned', folder='/library/warned', audio_files=['book.m4b'],
+        title=Field(value='ThisIsAVeryLongJoinedTitleName',
+                    source='test', confidence=0.8))
+    _loaded(window, book)
+    shown = []
+    monkeypatch.setattr(
+        QDialog, 'exec',
+        lambda self: shown.append(self) or QDialog.DialogCode.Accepted)
+
+    window._show_warnings_dialog()
+
+    tree = shown[0].findChild(QTreeWidget)
+    finding = tree.topLevelItem(0)
+    fixed = tree.itemWidget(finding, 5)
+    fix_button = tree.itemWidget(finding, 6)
+    assert isinstance(fixed, QLineEdit)
+    assert fixed.placeholderText() == ''
+    assert fix_button.icon().isNull()
+    assert not fix_button.isEnabled()
+
+
+def test_warnings_dialog_sorts_fixable_findings_by_fix_column(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QTreeWidget
+
+    fixable = BookEntry(
+        entry_id='fixable', folder='/library/fixable', audio_files=['fixable.m4b'],
+        author=Field(value='AUTHOR NAME', source='test', confidence=0.8))
+    manual = BookEntry(
+        entry_id='manual', folder='/library/manual', audio_files=['manual.m4b'],
+        title=Field(value='ThisIsAVeryLongJoinedTitleName',
+                    source='test', confidence=0.8))
+    _loaded(window, fixable, manual)
+    shown = []
+    monkeypatch.setattr(
+        QDialog, 'exec',
+        lambda self: shown.append(self) or QDialog.DialogCode.Accepted)
+
+    window._show_warnings_dialog()
+
+    tree = shown[0].findChild(QTreeWidget)
+    tree.sortItems(6, Qt.SortOrder.AscendingOrder)
+    assert tree.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole) == 'fixable'
+
+
+def test_warnings_dialog_field_buttons_filter_one_field_at_a_time(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QLabel, QPushButton, QTreeWidget
+
+    book = BookEntry(
+        entry_id='warned', folder='/library/warned', audio_files=['book.m4b'],
+        author=Field(value='AUTHOR NAME', source='test', confidence=0.8),
+        series=Field(value='SERIES NAME', source='test', confidence=0.8),
+        title=Field(value='Track 01', source='test', confidence=0.8))
+    _loaded(window, book)
+    shown = []
+    monkeypatch.setattr(
+        QDialog, 'exec',
+        lambda self: shown.append(self) or QDialog.DialogCode.Accepted)
+
+    window._show_warnings_dialog()
+
+    dialog = shown[0]
+    tree = dialog.findChild(QTreeWidget)
+    filters = {button.text(): button for button in dialog.findChildren(QPushButton)
+               if button.text() in ('Author', 'Series', 'Title')}
+    assert any(label.text() == 'Filter:' for label in dialog.findChildren(QLabel))
+    filter_label = next(label for label in dialog.findChildren(QLabel)
+                        if label.text() == 'Filter:')
+    assert 'background: transparent' in filter_label.styleSheet()
+    assert tree.topLevelItemCount() == 3
+
+    filters['Author'].click()
+    assert tree.topLevelItemCount() == 1
+    assert tree.topLevelItem(0).data(
+        0, int(Qt.ItemDataRole.UserRole) + 1) == 'author'
+    assert filters['Author'].isChecked()
+
+    filters['Series'].click()
+    assert tree.topLevelItemCount() == 1
+    assert tree.topLevelItem(0).data(
+        0, int(Qt.ItemDataRole.UserRole) + 1) == 'series'
+    assert not filters['Author'].isChecked()
+    assert filters['Series'].isChecked()
+
+    filters['Series'].click()
+    assert tree.topLevelItemCount() == 3
+    assert not any(button.isChecked() for button in filters.values())
+
+
+def test_warnings_dialog_manual_fields_save_and_require_review(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QLineEdit, QTreeWidget
+
+    book = BookEntry(
+        entry_id='warned', folder='/library/warned', audio_files=['book.m4b'],
+        status='approved',
+        author=Field(value='AUTHOR NAME', source='test', confidence=0.8),
+        title=Field(value='Old Title', source='test', confidence=0.8))
+    _loaded(window, book)
+    shown = []
+    monkeypatch.setattr(
+        QDialog, 'exec',
+        lambda self: shown.append(self) or QDialog.DialogCode.Accepted)
+
+    window._show_warnings_dialog()
+
+    tree = shown[0].findChild(QTreeWidget)
+    title = tree.itemWidget(tree.topLevelItem(0), 4)
+    assert isinstance(title, QLineEdit)
+    title.setText('New Title')
+    title.editingFinished.emit()
+
+    assert book.value('title') == 'New Title'
+    assert book.title.source == 'user'
+    assert book.status == 'risky'
+    assert book.explicit_work_pending
+
+
+def test_warnings_dialog_has_apply_and_ignore_context_menu(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QMenu, QTreeWidget
+
+    book = BookEntry(
+        entry_id='warned', folder='/library/warned', audio_files=['book.m4b'],
+        author=Field(value='AUTHOR NAME', source='test', confidence=0.8))
+    _loaded(window, book)
+    shown = []
+    menus = []
+    monkeypatch.setattr(
+        QDialog, 'exec',
+        lambda self: shown.append(self) or QDialog.DialogCode.Accepted)
+    monkeypatch.setattr(QMenu, 'exec', lambda self, *_args: menus.append(self))
+
+    window._show_warnings_dialog()
+
+    tree = shown[0].findChild(QTreeWidget)
+    finding = tree.topLevelItem(0)
+    tree.customContextMenuRequested.emit(tree.visualItemRect(finding).center())
+    actions = {action.text(): action for action in menus[0].actions()}
+    assert actions['Apply fix'].isEnabled()
+    assert 'Ignore fix' in actions
+    actions['Ignore fix'].trigger()
+    assert book.warnings_silenced
+
+
+def test_warnings_dialog_sorts_files_by_folder_then_filename(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QTreeWidget
+
+    books = [
+        BookEntry(entry_id='z', folder='/library/A', audio_files=['z.m4b'],
+                  author=Field(value='UPPER CASE', source='test', confidence=0.8)),
+        BookEntry(entry_id='a', folder='/library/B', audio_files=['a.m4b'],
+                  author=Field(value='UPPER CASE', source='test', confidence=0.8)),
+        BookEntry(entry_id='b', folder='/library/A', audio_files=['b.m4b'],
+                  author=Field(value='UPPER CASE', source='test', confidence=0.8)),
+    ]
+    _loaded(window, *books)
+    shown = []
+    monkeypatch.setattr(
+        QDialog, 'exec',
+        lambda self: shown.append(self) or QDialog.DialogCode.Accepted)
+
+    window._show_warnings_dialog()
+
+    tree = shown[0].findChild(QTreeWidget)
+    tree.sortItems(0, Qt.SortOrder.AscendingOrder)
+    assert [tree.topLevelItem(row).text(0) for row in range(3)] == [
+        'b.m4b', 'z.m4b', 'a.m4b']
+
+
+def test_first_subfolder_filter_is_added_to_shape_filter(window, tmp_path):
+    root = tmp_path / '!Sorting'
+    window.settings.set('AO_INPUT_DIR', str(root))
+    target = _identified('target', 0.8)
+    target.folder = str(root / '41-60 and SS' / 'J.D. Robb - 49 Vendetta in Death')
+    other = _identified('other', 0.8)
+    other.folder = str(root / 'Other' / 'Book')
+    _loaded(window, target, other)
+
+    name, folder = window._first_input_folder(target)
+    window._set_folder_filter(name, folder)
+
+    assert window.shape_filter.currentText() == 'Folder: 41-60 and SS'
+    shown = {window._entry_at(row).entry_id
+             for row in range(window.table.rowCount())
+             if not window.table.isRowHidden(row)}
+    assert shown == {'target'}
 
 
 def test_unsure_rows_have_no_status_background_tint():
@@ -644,8 +999,8 @@ def test_unsure_rows_have_no_status_background_tint():
 def test_confidence_filter_lists_coloured_bands_and_custom(window):
     items = [window.confidence_filter.itemText(index)
              for index in range(window.confidence_filter.count())]
-    assert items == ['Any confidence', 'Likely', 'Uncertain', 'Unlikely',
-                     'Custom threshold...']
+    assert items == ['Any confidence', '80% and above', '50% to 79%',
+                     'Below 50%', '...']
     for index in (1, 2, 3):
         assert window.confidence_filter.itemData(
             index, Qt.ItemDataRole.ForegroundRole) is not None
@@ -658,7 +1013,8 @@ def test_confidence_filter_uses_the_configured_band_boundaries(window):
              _identified('low', 0.30)]
     _loaded(window, *books)
 
-    expected = {'Likely': {'high'}, 'Uncertain': {'middle'}, 'Unlikely': {'low'}}
+    expected = {'80% and above': {'high'}, '50% to 79%': {'middle'},
+                'Below 50%': {'low'}}
     for label, visible in expected.items():
         window.confidence_filter.setCurrentText(label)
         window._apply_filters()

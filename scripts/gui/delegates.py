@@ -40,6 +40,8 @@ ROLE_PROGRESS_TEXT = Qt.ItemDataRole.UserRole + 6
 # 0..1 while this row is being pointed out - work you have not saved yet, lit up by
 # MainWindow.flash_unsaved and faded back to nothing. None the rest of the time.
 ROLE_FLASH = Qt.ItemDataRole.UserRole + 7
+ROLE_WARNING = Qt.ItemDataRole.UserRole + 8
+ROLE_WARNING_IGNORED = Qt.ItemDataRole.UserRole + 9
 
 # What a cell should look like. Set as ROLE_KIND on the item.
 KIND_TEXT = 'text'
@@ -162,7 +164,27 @@ class ReviewDelegate(QStyledItemDelegate):
         else:
             self._paint_text(painter, body, index, selected)
 
+        if index.data(ROLE_WARNING) and kind == KIND_CONFIDENCE:
+            self._paint_warning_badge(painter, rect, index)
+
         painter.restore()
+
+    @staticmethod
+    def warning_badge_rect(rect: QRect) -> QRect:
+        return QRect(rect.right() - 29, rect.top() + 7, 24, 24)
+
+    def _paint_warning_badge(self, painter: QPainter, rect: QRect, index) -> None:
+        badge = self.warning_badge_rect(rect)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(TEXT_DIM if index.data(ROLE_WARNING_IGNORED)
+                                else STATUS_HUES['risky']))
+        painter.drawEllipse(badge)
+        font = QFont(painter.font())
+        font.setPixelSize(16)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(BG_BASE))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, '!')
 
     def _paint_background(self, painter: QPainter, rect: QRect, status: str,
                           selected: bool, hovered: bool, odd: bool = False) -> None:
@@ -260,7 +282,11 @@ class ReviewDelegate(QStyledItemDelegate):
         except (TypeError, ValueError):
             return
 
-        wash = QColor(ACCENT)
+        label = str(index.data(ROLE_PROGRESS_TEXT) or '')
+        queued = label.casefold() == 'queued'
+        progress_colour = QColor(STATUS_HUES['risky'] if queued else ACCENT)
+
+        wash = QColor(progress_colour)
         wash.setAlpha(52)
         filled = int(rect.width() * fraction)
         painter.fillRect(QRect(rect.left(), rect.top(), filled, rect.height()), wash)
@@ -270,7 +296,7 @@ class ReviewDelegate(QStyledItemDelegate):
         # between "working" and "hung", and it is the only thing on screen that can
         # say so - the number genuinely has not changed.
         remaining = rect.width() - filled
-        if remaining > 8:
+        if remaining > 8 and not queued:
             sweep = QRect(rect.left() + filled, rect.top(), remaining, rect.height())
             gradient = QLinearGradient(sweep.left(), 0, sweep.right(), 0)
             glow = QColor(ACCENT)
@@ -286,18 +312,17 @@ class ReviewDelegate(QStyledItemDelegate):
             painter.fillRect(sweep, QBrush(gradient))
 
         # A hairline at the leading edge, so slow progress is still visibly progress.
-        edge = QColor(ACCENT)
+        edge = QColor(progress_colour)
         edge.setAlpha(190)
         x = rect.left() + filled
         painter.fillRect(QRect(max(rect.left(), x - 2), rect.top(), 2, rect.height()),
                          edge)
 
-        label = str(index.data(ROLE_PROGRESS_TEXT) or '')
         if label:
             font = QFont(painter.font())
             font.setPixelSize(max(9, (font.pixelSize() or 12) - 2))
             painter.setFont(font)
-            painter.setPen(QColor(ACCENT))
+            painter.setPen(progress_colour)
             painter.drawText(rect.adjusted(0, 0, -6, -2),
                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
                              label)
@@ -370,6 +395,11 @@ class ReviewDelegate(QStyledItemDelegate):
                if self.colour_confidence
                else (TEXT if value >= 0.8 else
                      TEXT_DIM if value >= 0.55 else TEXT_FAINT))
+        bar_hue = (STATUS_HUES['risky']
+                   if (index.data(ROLE_WARNING)
+                       and not index.data(ROLE_WARNING_IGNORED)
+                       and value >= self.confident_threshold)
+                   else hue)
         painter.setPen(QColor(hue if self.colour_confidence else hue))
         # Left, under a left-aligned heading. Only "#" is centred in this table.
         painter.drawText(QRect(rect.left() + 2, top, rect.width() - 4,
@@ -387,7 +417,7 @@ class ReviewDelegate(QStyledItemDelegate):
             filled = QRectF(track)
             filled.setWidth(max(bar_height, track.width() * min(1.0, value)))
             painter.setBrush(QBrush(QColor(
-                hue if self.colour_confidence else TEXT_DIM)))
+                bar_hue if self.colour_confidence else TEXT_DIM)))
             painter.drawRoundedRect(filled, radius, radius)
 
     def _paint_status(self, painter: QPainter, rect: QRect, status: str,

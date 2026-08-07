@@ -38,6 +38,8 @@ TOOL_ITEMS: List[ToolItem] = [
              'Choose which sources identification is allowed to use'),
     ToolItem('identify', '▶', 'Identify',
              'Run the ticked sources over the selected rows  (F4)'),
+    ToolItem('warnings', '⚠', 'Warnings',
+             'Review suspicious values, fix them, or make a decision in batches'),
     ToolItem('approve', '✔', 'Approve',
              'LMB: Approve selected\n'
              'MMB: Approve over the saved threshold\n'
@@ -52,8 +54,9 @@ TOOL_ITEMS: List[ToolItem] = [
     # full colour on Windows and would ignore the theme entirely.
     ToolItem('preview', '▤', 'Preview',
              'Show the folder tree applying would produce, without touching files  (F7)'),
-    ToolItem('apply', '➔', 'Save',
-             'The only step that touches your files. Every approved row - including\n'
+    ToolItem('apply', '➔', 'Finalize',
+             'The program auto-saves identification results, edits, and review choices.\n'
+             'Finalize is the only step that touches your files. Every approved row - including\n'
              'any edits you typed - is renamed and moved/copied into the output\n'
              'folder. Preview it first; you are asked to confirm before anything moves.'),
     ToolItem('goodreads', '⌕', 'Goodreads',
@@ -69,7 +72,7 @@ TOOL_ITEMS: List[ToolItem] = [
 
 ITEMS_BY_KEY = {item.key: item for item in TOOL_ITEMS}
 
-DEFAULT_LAYOUT = ('scan,sources,identify,|,approve,reject,reset,|,'
+DEFAULT_LAYOUT = ('scan,sources,identify,warnings,|,approve,reject,reset,|,'
                   'goodreads,preview,apply,undo,|,settings')
 
 
@@ -78,6 +81,7 @@ DEFAULT_LAYOUT = ('scan,sources,identify,|,approve,reject,reset,|,'
 # verbatim an old default, which means it was never arranged at all.
 _SUPERSEDED_LAYOUTS = {
     'scan,sources,identify,|,approve,reject,reset,|,preview,apply,undo,|,save,settings',
+    'scan,sources,identify,|,approve,reject,reset,|,goodreads,preview,apply,undo,|,settings',
 }
 
 

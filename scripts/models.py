@@ -24,7 +24,7 @@ SOURCE_CONFIDENCE = {
     'llm': 0.60,
     'openlibrary': 0.70,
     'googlebooks': 0.75,
-    'metadata': 0.80,
+    'metadata': 0.75,
     'audnexus': 0.90,
     'user': 1.0,
 }
@@ -116,12 +116,17 @@ class BookEntry:
     # wrong (an unclosed bracket, "(Unabridged)", an author in capitals). Refreshed
     # on every resolve; the confidence of the fields involved is docked to match.
     warnings: List[str] = field(default_factory=list)
+    warnings_silenced: bool = False
+    warnings_checked_values: Dict[str, str] = field(default_factory=dict)
     # field name -> the factor its confidence has already been multiplied by for the
     # warnings above. Kept so re-running identification re-judges the value instead of
     # docking it a second time; without this, resolving the same book four times would
     # take a perfectly good 90% down to 30% on no new evidence.
     quality_penalties: Dict[str, Any] = field(default_factory=dict)
     resolved: bool = False
+    # Set only when a user-requested Identify or individual source run actually starts.
+    # The automatic metadata and filename pass performed by Load Input does not count.
+    explicit_work_pending: bool = False
 
     # ------------------------------------------------------------------ helpers
 
@@ -172,20 +177,19 @@ class BookEntry:
     def confidence(self) -> float:
         """How much we trust the identity we are about to file this book under.
 
-        The weakest of author and title, because getting either wrong misfiles the
-        book. A known series with an unknown index is *incomplete*, not *wrong*: it
-        used to drag the whole entry to 0%, which is why the table could read 0% while
-        every field card on the right said 45%. It now costs a fixed penalty, and the
-        missing index is reported where it belongs - in the status.
+        Author and title carry most of the score. Series context contributes without
+        allowing one lower-confidence field to replace the confidence of the entire
+        book. Missing core identity still matters; a missing optional series does not.
         """
-        core = [getattr(self, name) for name in ('author', 'title')]
-        scores = [f.confidence if not f.is_empty() else 0.0 for f in core]
-        result = min(scores) if scores else 0.0
-
-        if not self.series.is_empty():
-            result = min(result, self.series.confidence)
-            if self.series_index.is_empty():
-                result *= 0.9
+        author = self.author.confidence if not self.author.is_empty() else 0.0
+        title = self.title.confidence if not self.title.is_empty() else 0.0
+        if self.series.is_empty():
+            result = author * 0.5 + title * 0.5
+        else:
+            series = self.series.confidence
+            index = (self.series_index.confidence
+                     if not self.series_index.is_empty() else 0.0)
+            result = author * 0.4 + title * 0.4 + series * 0.15 + index * 0.05
         return round(result, 3)
 
     def force_field(self, name: str, value: Any, source: str,

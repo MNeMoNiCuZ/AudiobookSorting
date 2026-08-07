@@ -584,6 +584,8 @@ class SettingsDialog(QDialog):
         self.provider_combo = SettingsComboBox()
         self.provider_combo.addItems(self.settings.provider_names())
         self.provider_combo.currentTextChanged.connect(self._provider_changed)
+        self.provider_combo.currentTextChanged.connect(
+            lambda _='': self._changed(''))
         select_form.addRow('Provider', self.provider_combo)
         layout.addWidget(select_box)
 
@@ -592,13 +594,12 @@ class SettingsDialog(QDialog):
         for field, label, placeholder in (
             ('BASE_URL', 'Base URL', 'https://host:port/v1'),
             ('API_KEY', 'API key', 'sk-...'),
-            ('AUTH_STYLE', 'Auth style', 'bearer | x-api-key | none'),
-            ('EXTRA_BODY', 'Extra JSON', '{"enable_tools": false}'),
         ):
             edit = QLineEdit()
             edit.setPlaceholderText(placeholder)
             if field == 'API_KEY':
                 edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.textChanged.connect(lambda _='': self._changed(''))
             self.provider_widgets[field] = edit
             detail_form.addRow(label, edit)
 
@@ -609,6 +610,8 @@ class SettingsDialog(QDialog):
         # A provider can advertise fifty models; ten visible rows is a peephole.
         self.model_combo.setMaxVisibleItems(18)
         self.model_combo.currentIndexChanged.connect(self._model_selected)
+        self.model_combo.currentIndexChanged.connect(
+            lambda _=0: self._changed(''))
         self.model_refresh = QPushButton('Refresh')
         self.model_refresh.setFixedWidth(90)
         self.model_refresh.clicked.connect(lambda: self._fetch_models(announce=True))
@@ -626,16 +629,6 @@ class SettingsDialog(QDialog):
         self.model_hint.setStyleSheet(f'color: {TEXT_DIM}; font-size: 11px;')
         detail_form.addRow('', self.model_hint)
         layout.addWidget(detail_box)
-
-        tuning_box = QGroupBox('Generation')
-        tuning_form = QFormLayout(tuning_box)
-        for key in ('AO_TEMPERATURE', 'AO_MAX_TOKENS', 'AO_TIMEOUT', 'AO_MAX_RETRIES'):
-            default, kind, help_text = SCHEMA[key]
-            widget = self._make_widget(key, kind, default)
-            widget.setToolTip(help_text)
-            self.widgets[key] = widget
-            tuning_form.addRow(_pretty(key), widget)
-        layout.addWidget(tuning_box)
 
         actions = QHBoxLayout()
         test_button = QPushButton('Test connection')
@@ -1140,18 +1133,6 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         """Write to .env and stay open."""
-        extra = self.provider_widgets['EXTRA_BODY'].text().strip()
-        if extra:
-            import json
-            try:
-                parsed = json.loads(extra)
-                if not isinstance(parsed, dict):
-                    raise ValueError('must be a JSON object')
-            except ValueError as exc:
-                QMessageBox.warning(self, 'Invalid JSON',
-                                    f'The "Extra JSON" field is not a JSON object:\n{exc}')
-                return
-
         self._apply_to_settings()
         try:
             self.settings.save()
@@ -1327,6 +1308,9 @@ def _pretty(key: str, drop: str = '') -> str:
     `drop` removes a leading word that the tab already implies - every setting on the
     Interface page is a UI setting, so repeating "UI" in eleven labels is noise.
     """
+    if key == 'AO_CONFIDENCE_SCORE':
+        return 'Identification Threshold'
+
     words = key.replace('AO_', '').replace('_', ' ').lower().split()
     if drop and words and words[0] == drop.lower():
         words = words[1:]
