@@ -308,6 +308,17 @@ to two digits, `{file_index:03d}` to three.
 
 Also available:
 
+- **`AO_INDEX_PAD`** — how many digits a plain `{series_index}` is padded to. Two by
+  default, so `Book 5` comes out as `Book 05`. An omnibus is numbered as a range —
+  type `1-3` in the **#** column and it is stored as `1-3` and written as `01-03`, both
+  ends padded alike. `0` turns padding off; a template that states its own width, like
+  `{series_index:03d}`, keeps that width regardless.
+- **`AO_BLOCKED_WORDS`** — a comma-separated list of words and phrases struck out of
+  author, series and title as they are identified. Blocking `series` turns
+  `The Expanse Series` into `The Expanse`. Whole words only, case-insensitive, so
+  `Seriously Funny` survives.
+- **`AO_STRIP_PARENTHESES`** — drop bracketed asides: `Mistborn (Unabridged) [Audiobook]`
+  becomes `Mistborn`. On by default; `()`, `[]` and `{}` are all treated the same.
 - **`AO_RENAME_SUPPORT_FILES`** — rename the files that travel with the book (cover art,
   `.epub`, `.pdf`, `.nfo`, `.cue`, `.txt`) to match the audio. Only when a file is the
   only one of its extension in the folder, because two `.jpg`s renamed to one stem would

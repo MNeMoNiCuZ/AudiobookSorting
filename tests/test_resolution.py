@@ -9,7 +9,7 @@ from scripts.cache import Cache
 from scripts.dedupe import find_duplicates
 from scripts.models import SOURCE_CONFIDENCE, BookEntry, Field, clean_value
 from scripts.paths import render_template, sanitize_component, shorten_path
-from scripts.quality import inspect_value
+from scripts.quality import inspect_entry, inspect_value
 from scripts.regex_parser import parse_name, parse_path
 
 
@@ -25,6 +25,10 @@ from scripts.regex_parser import parse_name, parse_path
      {'series': 'Mistborn', 'series_index': '1', 'title': 'The Final Empire'}),
     ('Book 3-An Echo of Titans',
      {'series_index': '3', 'title': 'An Echo of Titans'}),
+    ('Book 15.5 - A Short Detour',
+     {'series_index': '15.5', 'title': 'A Short Detour'}),
+    ('Book 12,5 - Another Detour',
+     {'series_index': '12.5', 'title': 'Another Detour'}),
     ('01. The Beginning', {'series_index': '1', 'title': 'The Beginning'}),
 ])
 def test_regex_patterns(name, expected):
@@ -168,6 +172,7 @@ def test_confidence_penalises_series_without_index():
     ('series_index', 'Book 3', '3'),
     ('series_index', '03', '3'),
     ('series_index', '2.5', '2.5'),
+    ('series_index', '12,5', '12.5'),
     ('series_index', 'none', ''),
     ('title', 'unknown', ''),
     ('author', '  Spaced   Out  ', 'Spaced Out'),
@@ -245,6 +250,58 @@ def test_template_collapses_empty_fields(values, expected):
                            values) == expected
 
 
+@pytest.mark.parametrize('typed,stored', [
+    ('1-03', '1-3'), ('01 - 03', '1-3'), ('1 to 3', '1-3'),
+    ('5', '5'), ('003', '3'), ('2.5', '2.5'), ('7-7', '7'), ('none', ''),
+])
+def test_bundled_book_numbers_accept_a_range(typed, stored):
+    from scripts.models import clean_value
+
+    assert clean_value('series_index', typed) == stored
+
+
+def test_index_padding_applies_to_both_ends_of_a_range():
+    from scripts.paths import set_index_pad
+
+    values = {'series': 'S', 'series_index': '1-3', 'title': 'T'}
+    try:
+        set_index_pad(2)
+        assert render_template('{series} {series_index} - {title}', values) == 'S 01-03 - T'
+        set_index_pad(3)
+        assert render_template('{series} {series_index} - {title}', values) == 'S 001-003 - T'
+        set_index_pad(0)
+        assert render_template('{series} {series_index} - {title}', values) == 'S 1-3 - T'
+        # A template stating its own width still wins over the setting.
+        set_index_pad(2)
+        assert render_template('{series_index:04d}', values) == '0001-0003'
+        # A half-book keeps its fraction rather than being rounded into the padding.
+        assert render_template('{series_index}',
+                               {'series_index': '2.5'}) == '02.5'
+        assert render_template('{series_index}',
+                               {'series_index': '12,5'}) == '12.5'
+    finally:
+        set_index_pad(2)
+
+
+def test_blocked_words_and_brackets_are_stripped():
+    from scripts.models import clean_value, set_text_filters
+
+    try:
+        set_text_filters('series, unabridged', strip_parentheses=True)
+        assert clean_value('series', 'The Expanse Series') == 'The Expanse'
+        assert clean_value('title', 'Mistborn (Unabridged) [Audiobook]') == 'Mistborn'
+        # Whole words only, and numbers are never filtered.
+        assert clean_value('title', 'Seriously Funny') == 'Seriously Funny'
+        assert clean_value('series_index', '2') == '2'
+        # Nothing left but punctuation is an empty field, not a stub.
+        assert clean_value('series', 'Series') == ''
+
+        set_text_filters('', strip_parentheses=False)
+        assert clean_value('title', 'Mistborn (Unabridged)') == 'Mistborn (Unabridged)'
+    finally:
+        set_text_filters('', strip_parentheses=True)
+
+
 def test_reserved_names_are_escaped():
     assert sanitize_component('CON') == '_CON'
     assert sanitize_component('NUL') == '_NUL'
@@ -279,6 +336,15 @@ def test_unrelated_titles_do_not_match():
 
 def test_initials_match_full_names():
     assert author_similarity('J.R.R. Tolkien', 'John Ronald Reuel Tolkien') > 0.9
+
+
+def test_warning_finds_inconsistent_author_initial_spacing():
+    spaced = BookEntry(author=Field('N. S. Wikarski', 'metadata', 0.8))
+    compact = BookEntry(author=Field('N.S. Wikarski', 'metadata', 0.8))
+
+    findings = inspect_entry(spaced, [spaced, compact])
+
+    assert any(finding.kind == 'initial_spacing' for finding in findings)
 
 
 # --------------------------------------------------------------------- caching

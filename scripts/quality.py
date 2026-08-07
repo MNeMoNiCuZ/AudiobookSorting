@@ -47,6 +47,7 @@ _SPECIAL_SEPARATOR = re.compile(r'[|/\\"]')
 _EMBEDDED_FILE_WORD = re.compile(
     r'(?:unabridged|abridged|audiobook|mp3\d*|m4[ab]|flac)', re.I)
 _JOINED_WORDS = re.compile(r'^[A-Za-z]{24,}$')
+_INITIAL_SPACE = re.compile(r'(?<=\.)\s+')
 
 # How much of the field's confidence each kind of finding costs. Multiplicative, so
 # two problems on one field compound rather than cancelling out.
@@ -63,6 +64,7 @@ _PENALTY = {
     'chapter_fraction': 0.55,
     'separator': 0.70,
     'joined_words': 0.70,
+    'initial_spacing': 0.85,
 }
 
 # Fields where an unusual character is genuinely unusual. Titles legitimately carry
@@ -157,11 +159,24 @@ def inspect_value(field: str, value: str) -> List[Finding]:
     return found
 
 
-def inspect_entry(entry) -> List[Finding]:
+def inspect_entry(entry, entries=None) -> List[Finding]:
     """Every finding across a book's four identity fields."""
     findings: List[Finding] = []
     for name in ('author', 'series', 'title'):
         findings.extend(inspect_value(name, entry.value(name)))
+    if entries is not None:
+        author = entry.value('author').strip()
+        signature = _INITIAL_SPACE.sub('', author).casefold()
+        variants = sorted({candidate.value('author').strip()
+                           for candidate in entries
+                           if candidate.value('author').strip()
+                           and _INITIAL_SPACE.sub(
+                               '', candidate.value('author').strip()).casefold() == signature},
+                          key=str.casefold)
+        if len(variants) > 1:
+            findings.append(Finding(
+                'author', 'initial_spacing',
+                f'Author initials use inconsistent spacing: {", ".join(variants)}'))
     return findings
 
 

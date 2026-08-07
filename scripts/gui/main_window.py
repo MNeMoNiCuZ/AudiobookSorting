@@ -50,7 +50,7 @@ from .icons import icon as make_icon
 from .queue_dialog import plural
 from .theme import (ACCENT, ACCENT_DARK, BG_RAISED, CONFIDENCE_HUES, ROW_HEIGHTS,
                     STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT, source_color)
-from .toolbar import ITEMS_BY_KEY, SEPARATOR, parse_layout
+from .toolbar import ITEMS_BY_KEY, SEPARATOR, parse_layout, shortcut_for
 from .why_panel import WhyPanel
 
 logger = logging.getLogger(__name__)
@@ -388,6 +388,38 @@ class _DeselectFilter(QObject):
         return super().eventFilter(watched, event)
 
 
+class _CellKeysFilter(QObject):
+    """Delete, Ctrl+C and Ctrl+V on the table, spreadsheet-style.
+
+    An event filter on the table rather than window-wide QShortcuts, and that is the
+    point: while a cell is being edited the keystrokes go to the editor widget, which
+    is a different object, so Delete still deletes a character and Ctrl+C still copies
+    the selected text inside the field. A QShortcut would have taken all three away
+    from the editor.
+    """
+
+    def __init__(self, window: 'MainWindow'):
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(watched, event)
+
+        key = event.key()
+        control = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if key == Qt.Key.Key_Delete and not control:
+            self._window._clear_selected_cells()
+            return True
+        if control and key == Qt.Key.Key_C:
+            self._window._copy_selected_cells()
+            return True
+        if control and key == Qt.Key.Key_V:
+            self._window._paste_into_selection()
+            return True
+        return super().eventFilter(watched, event)
+
+
 class MainWindow(QMainWindow):
     """The review UI. All heavy work is delegated to the controller via signals."""
 
@@ -533,6 +565,9 @@ class MainWindow(QMainWindow):
             widget.installEventFilter(self._deselect_filter)
         self._warning_badge_filter = _WarningBadgeFilter(self)
         self.table.viewport().installEventFilter(self._warning_badge_filter)
+        # On the table itself, not the viewport: key presses go to the widget.
+        self._cell_keys_filter = _CellKeysFilter(self)
+        self.table.installEventFilter(self._cell_keys_filter)
 
         # Now the table exists, so the toolbar can finally say what is available.
         self.refresh_action_states()
@@ -739,6 +774,8 @@ class MainWindow(QMainWindow):
         # on it is free to mean "show me this properly".
         self.table.clicked.connect(self._cell_clicked)
         self.table.setToolTip('Double-click author, series, # or title to edit it. '
+                              'Delete clears the selected cells, Ctrl+C and Ctrl+V '
+                              'copy and paste them. '
                               'Right-click for everything you can do to the selection.')
 
         header = self.table.horizontalHeader()
@@ -1109,7 +1146,7 @@ class MainWindow(QMainWindow):
             if key in ('approve', 'reject'):
                 action.setToolTip(self._review_button_tooltip(key))
             else:
-                action.setToolTip(f'{item.label}\n{item.tooltip}')
+                action.setToolTip(self._tool_tooltip(key, item.tooltip))
             action.triggered.connect(handlers[key])
             self.toolbar.addAction(action)
             self.tool_actions[key] = action
@@ -1246,8 +1283,8 @@ class MainWindow(QMainWindow):
             if enabled and key in ('approve', 'reject'):
                 action.setToolTip(self._review_button_tooltip(key))
             else:
-                action.setToolTip(f'{item.label}\n{item.tooltip}' if enabled
-                                  else f'{item.label}\n{reasons[key]}')
+                action.setToolTip(self._tool_tooltip(
+                    key, item.tooltip if enabled else reasons[key]))
 
     def _watch_right_click(self, target, handler: Callable[[], None]) -> None:
         """Call `handler` when `target` is right-clicked.
@@ -1298,14 +1335,25 @@ class MainWindow(QMainWindow):
         except ValueError:
             return None
 
+    @staticmethod
+    def _tool_tooltip(key: str, body: str) -> str:
+        """A button's tooltip: its name, its key binding if it has one, then the body.
+
+        The key comes from toolbar.SHORTCUTS, which is also what installs it, so the
+        tooltip cannot drift out of step with what the key actually does.
+        """
+        label = ITEMS_BY_KEY[key].label
+        sequence = shortcut_for(key)
+        return f'{label}  ({sequence})\n{body}' if sequence else f'{label}\n{body}'
+
     def _review_button_tooltip(self, key: str) -> str:
         percent = self._review_threshold(key)
         if key == 'approve':
-            return ('Approve\nLMB: Approve selected\n'
+            return self._tool_tooltip('approve', 'LMB: Approve selected\n'
                     + (f'MMB: Approve over {percent}%\n' if percent is not None
                        else 'MMB: Disabled in Settings\n')
                     + 'RMB: Choose approve threshold')
-        return ('Reject\nLMB: Reject selected\n'
+        return self._tool_tooltip('reject', 'LMB: Reject selected\n'
                 + (f'MMB: Decline under {percent}%\n' if percent is not None
                    else 'MMB: Disabled in Settings\n')
                 + 'RMB: Choose decline threshold')
@@ -1543,7 +1591,7 @@ class MainWindow(QMainWindow):
         button = QToolButton()
         button.setIconSize(QSize(icon, icon))
         button.setIcon(make_icon('sources', TEXT, icon))
-        button.setToolTip(f'{item.label}\n{item.tooltip}')
+        button.setToolTip(self._tool_tooltip(item.key, item.tooltip))
         button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         # Sources is the one toolbar entry that is a widget rather than a QAction, so
         # it never picked up the toolbar's text-under-icon style and sat there as the
@@ -1588,18 +1636,26 @@ class MainWindow(QMainWindow):
         """F-keys, as requested - no single-letter bindings.
 
         F2 is rename, as it is in every file manager: it edits the cell you are on.
-        F4-F8 are the review loop. Settings sits out of the way on F12.
+        F4-F9 are the review loop, ending where it actually ends: F8 writes the files
+        out. Settings sits out of the way on F12.
+
+        Every binding a toolbar button has is declared once, in toolbar.SHORTCUTS, and
+        read from there both here and by the tooltips - so a button can never advertise
+        a key that does nothing.
         """
         bindings = [
             ('F2', self._edit_current_cell),
-            ('F4', lambda: self._request_resolve()),
-            ('F5', lambda: self._set_status_selected(STATUS_APPROVED)),
-            ('F6', lambda: self._set_status_selected(STATUS_REJECTED)),
-            ('F7', lambda: self._request_apply(preview=True)),
-            ('F8', lambda: self._set_status_selected(STATUS_PENDING)),
-            ('F12', self.settings_requested.emit),
-            ('Ctrl+R', lambda: self._request_load()),
-            ('Ctrl+Z', self._undo_last),
+            (shortcut_for('identify'), lambda: self._request_resolve()),
+            (shortcut_for('approve'),
+             lambda: self._set_status_selected(STATUS_APPROVED)),
+            (shortcut_for('reject'),
+             lambda: self._set_status_selected(STATUS_REJECTED)),
+            (shortcut_for('preview'), lambda: self._request_apply(preview=True)),
+            (shortcut_for('apply'), lambda: self._request_apply(preview=False)),
+            (shortcut_for('goodreads'), lambda: self._search_goodreads()),
+            (shortcut_for('settings'), self.settings_requested.emit),
+            (shortcut_for('scan'), lambda: self._request_load()),
+            (shortcut_for('undo'), self._undo_last),
             ('Ctrl+Y', self._redo_last),
             ('Ctrl+Shift+Z', self._redo_last),
             ('Ctrl+H', self._show_history_dialog),
@@ -2140,7 +2196,7 @@ class MainWindow(QMainWindow):
             for candidate in self.entries.values():
                 if candidate.warnings_silenced:
                     continue
-                findings = inspect_entry(candidate)
+                findings = inspect_entry(candidate, self.entries.values())
                 if warning_filter is not None:
                     findings = [finding for finding in findings
                                 if finding.field == warning_filter]
@@ -2472,7 +2528,8 @@ class MainWindow(QMainWindow):
             return
         if not force and current == entry.warnings_checked_values:
             return
-        warnings = [finding.message for finding in inspect_entry(entry)]
+        warnings = [finding.message
+                    for finding in inspect_entry(entry, self.entries.values())]
         if warnings != entry.warnings:
             entry.warnings = warnings
             entry.warnings_silenced = False
@@ -2766,7 +2823,9 @@ class MainWindow(QMainWindow):
             'Show where the selected rows would end up, without touching any files')
         goodreads_field = clicked if clicked in ('author', 'title', 'series') else None
         goodreads_target = FIELD_LABELS[goodreads_field] if goodreads_field else 'All fields'
-        add(f'Search Goodreads for {goodreads_target}{suffix}',
+        # F9 is the all-fields search, so it is only advertised on the all-fields entry.
+        add(f'Search Goodreads for {goodreads_target}{suffix}'
+            + ('' if goodreads_field else '  (F9)'),
             lambda: self._search_goodreads(entries, goodreads_field),
             f'Open a Goodreads search using {goodreads_target.lower()}')
 
@@ -2797,8 +2856,14 @@ class MainWindow(QMainWindow):
                 enabled=bool(first))
         # Named after what it would actually blank: "Clear" alone gave no way to tell
         # a three-cell selection from a three-column one until after you had done it.
+        add('Copy cells  (Ctrl+C)', self._copy_selected_cells,
+            'Copy the selected cells as tab-separated text - paste them back here, '
+            'or into a spreadsheet')
+        add('Paste cells  (Ctrl+V)', self._paste_into_selection,
+            'Write the clipboard into the selection. One value fills every selected '
+            'cell; a block of values is laid out from the top-left of the selection.')
         targets = self._clear_targets()
-        add(self._clear_label(targets), self._clear_selected_cells,
+        add(self._clear_label(targets) + '  (Del)', self._clear_selected_cells,
             'Blank the selected cells so they can be identified again. Select whole '
             'columns or individual cells to choose what gets cleared.',
             enabled=bool(targets))
@@ -2811,7 +2876,7 @@ class MainWindow(QMainWindow):
             add(f'Reject{suffix}  (F6)',
                 lambda: self._set_status_selected(STATUS_REJECTED),
                 'Mark every selected row rejected - rejected rows are never applied')
-            add(f'Reset to pending{suffix}  (F8)',
+            add(f'Reset to pending{suffix}',
                 lambda: self._set_status_selected(STATUS_PENDING),
                 'Clear the decision on every selected row and return it to pending')
 
@@ -3684,6 +3749,132 @@ class MainWindow(QMainWindow):
         self.show_message(f'Cleared {cells} cell{"" if cells == 1 else "s"} '
                           f'across {len(targets)} row{"" if len(targets) == 1 else "s"}')
 
+    # -------------------------------------------------------- cell clipboard
+
+    def _selection_block(self) -> List[List[int]]:
+        """The selected cells as a rectangle of (row, column), in the order shown.
+
+        A selection can be ragged - three cells in two rows - but a clipboard is not,
+        so the bounding box is what travels, with the cells you did not select left
+        blank inside it. That is what every spreadsheet does, and it is what makes a
+        copied block paste back into the same shape.
+        """
+        indexes = [index for index in self.table.selectedIndexes()
+                   if not self.table.isRowHidden(index.row())]
+        if not indexes:
+            return []
+        rows = sorted({index.row() for index in indexes},
+                      key=self.table.visualRow)
+        columns = sorted({index.column() for index in indexes},
+                         key=self.table.visualColumn)
+        return [rows, columns]
+
+    def _copy_selected_cells(self) -> None:
+        """The selected cells as tab-separated text, pasteable into a spreadsheet."""
+        block = self._selection_block()
+        if not block:
+            self.show_message('Select some cells first')
+            return
+        rows, columns = block
+        chosen = {(index.row(), index.column())
+                  for index in self.table.selectedIndexes()}
+
+        lines = []
+        for row in rows:
+            line = []
+            for column in columns:
+                item = self.table.item(row, column)
+                line.append(item.text() if item is not None
+                            and (row, column) in chosen else '')
+            lines.append('\t'.join(line))
+
+        cells = len(rows) * len(columns)
+        self._to_clipboard('\n'.join(lines),
+                           f'Copied {cells} cell{"" if cells == 1 else "s"}')
+
+    def _paste_into_selection(self) -> None:
+        """Write the clipboard into the selection, starting at the current cell.
+
+        One value fills the whole selection - "make these six all say this" is the
+        common case and needs no block to line up. A block of values is laid out from
+        the top-left of the selection, and anything landing on a column that is not
+        editable, or past the last row, is dropped rather than half-applied.
+        """
+        from PyQt6.QtWidgets import QApplication
+        from ..models import Field, clean_value
+
+        text = QApplication.clipboard().text()
+        if not text.strip():
+            self.show_message('Nothing on the clipboard to paste')
+            return
+
+        block = self._selection_block()
+        if not block:
+            self.show_message('Select where to paste first')
+            return
+        rows, columns = block
+
+        grid = [line.split('\t') for line in text.replace('\r\n', '\n').split('\n')]
+        single = len(grid) == 1 and len(grid[0]) == 1
+
+        # A block pastes from where the selection starts, spilling down and right over
+        # whatever follows it in the table - not only over what happens to be selected.
+        if not single:
+            start_row, start_column = rows[0], columns[0]
+            visible = [r for r in range(self.table.rowCount())
+                       if not self.table.isRowHidden(r)]
+            rows = visible[visible.index(start_row):][:len(grid)]
+            columns = [c for c in range(start_column, len(COLUMNS))][:max(
+                len(line) for line in grid)]
+
+        writes: List[tuple] = []
+        for row_offset, row in enumerate(rows):
+            entry = self._entry_at(row)
+            if entry is None:
+                continue
+            for column_offset, column in enumerate(columns):
+                name = EDITABLE.get(column)
+                if name is None:
+                    continue
+                if single:
+                    value = grid[0][0]
+                else:
+                    line = grid[row_offset]
+                    if column_offset >= len(line):
+                        continue
+                    value = line[column_offset]
+                cleaned = clean_value(name, value.strip())
+                if cleaned == entry.value(name):
+                    continue
+                writes.append((entry, name, cleaned))
+
+        if not writes:
+            self.show_message('Nothing to paste into the selected cells')
+            return
+
+        self._record_edit(
+            f'pasted {len(writes)} cell{"" if len(writes) == 1 else "s"}',
+            [(entry.entry_id, name, entry.get_field(name))
+             for entry, name, _value in writes])
+        touched = set()
+        for entry, name, value in writes:
+            setattr(entry, name, Field(value=value, source='user', confidence=1.0))
+            entry.log('user', f'{name} pasted as "{value}"')
+            touched.add(entry.entry_id)
+        for entry_id in touched:
+            entry = self.entries.get(entry_id)
+            row = self._row_for(entry_id)
+            if entry is not None and row is not None:
+                self._fill_row(row, entry)
+                self.entry_changed(entry)
+
+        self._apply_filters()
+        self.refresh_stats()
+        self.why_panel.show_entry(self.selected_entries()[0]
+                                  if self.selected_entries() else None)
+        self.show_message(f'Pasted {len(writes)} cell{"" if len(writes) == 1 else "s"} '
+                          f'across {len(touched)} row{"" if len(touched) == 1 else "s"}')
+
     def _write_field(self, entries: List[BookEntry], field: str, value: str) -> None:
         from ..models import Field, clean_value
         cleaned = clean_value(field, value)
@@ -3822,14 +4013,33 @@ class MainWindow(QMainWindow):
     def _request_apply(self, preview: bool) -> None:
         if preview:
             # Preview writes nothing, so it never refuses. Selected rows if you
-            # selected some; the whole library if you did not - "preview everything"
-            # is the only thing an empty selection could reasonably mean, and a
-            # button that answers a click with a status message and no window is a
-            # button that looks broken.
-            entries = self.selected_entries() or list(self.entries.values())
+            # selected some - previewing one row you are unsure about is the point of
+            # the selection.
+            #
+            # With nothing selected it previews what Finalize would actually write:
+            # the approved rows, and nothing else. It used to preview the whole
+            # library, rejected books included, which read as "these are going to be
+            # written" about books that had been explicitly turned down. Only when
+            # nothing is approved yet does it fall back to the whole list, because
+            # then the question being asked is "where would these end up?".
+            entries = self.selected_entries()
+            scope = 'selected'
+            if not entries:
+                entries = [e for e in self.entries.values()
+                           if e.status == STATUS_APPROVED]
+                scope = 'approved'
+            if not entries:
+                entries = list(self.entries.values())
+                scope = 'all'
             if not entries:
                 self.show_message('Nothing to preview - load the input folder first')
                 return
+            if scope == 'approved':
+                self.show_message(f'Previewing the {len(entries)} approved '
+                                  f'row{"" if len(entries) == 1 else "s"} - what '
+                                  f'Finalize would write')
+            elif scope == 'all':
+                self.show_message('Nothing is approved yet - previewing every row')
             self.apply_requested.emit(entries, True)
             return
 
@@ -4172,7 +4382,7 @@ class MainWindow(QMainWindow):
                                    '!' if (drift or moved) else ''))
 
         if not drift and not moved:
-            action.setToolTip(f'{base.label}\n{base.tooltip}')
+            action.setToolTip(self._tool_tooltip('scan', base.tooltip))
             return
 
         why = []
@@ -4189,7 +4399,7 @@ class MainWindow(QMainWindow):
             why.append(f'! The input folder has changed since this list was written '
                        f'({detail}).')
         action.setToolTip(
-            f'{base.label}\n{base.tooltip}\n\n' + '\n'.join(why)
+            self._tool_tooltip('scan', base.tooltip) + '\n\n' + '\n'.join(why)
             + '\nLoad it before you review, or you are working on stale data.')
 
     # --------------------------------------------------------- unsaved work
@@ -4266,7 +4476,7 @@ class MainWindow(QMainWindow):
         body = (base.tooltip if action.isEnabled()
                 else 'Nothing is loaded yet - press Ctrl+R')
         action.setToolTip(
-            f'{base.label}\n{body}'
+            self._tool_tooltip('identify', body)
             + (f'\n\n{plural(count, "identification")} outstanding. '
                f'Right-click to open the queue.' if count else ''))
 

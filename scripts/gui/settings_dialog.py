@@ -79,7 +79,8 @@ TABS: Dict[str, list] = {
     ],
     'Output': [
         'AO_COPY_MODE', 'AO_OUTPUT_TEMPLATE', 'AO_RENAME_FILES',
-        'AO_FILE_TEMPLATE', 'AO_RENAME_SUPPORT_FILES', 'AO_ILLEGAL_CHARS',
+        'AO_FILE_TEMPLATE', 'AO_INDEX_PAD', 'AO_RENAME_SUPPORT_FILES',
+        'AO_BLOCKED_WORDS', 'AO_STRIP_PARENTHESES', 'AO_ILLEGAL_CHARS',
         'AO_COLLISION_POLICY', 'AO_WRITE_TAGS', 'AO_WRITE_SIDECAR',
     ],
     # Everything the "Merge chapters into one .m4b" modal asks for also lives here.
@@ -370,6 +371,15 @@ class SettingsDialog(QDialog):
                     'touched, and you do not have to restart.')
                 reset.clicked.connect(self._reset_layout)
                 form.addRow('', reset)
+
+        # The padding governs the numbers in both template examples above it, so
+        # typing in it refreshes them.
+        pad = self.widgets.get('AO_INDEX_PAD')
+        if isinstance(pad, QLineEdit) and 'AO_INDEX_PAD' in keys:
+            pad.textChanged.connect(
+                lambda _='': [self._show_example(k) for k in
+                              ('AO_OUTPUT_TEMPLATE', 'AO_FILE_TEMPLATE')
+                              if k in self._examples])
 
         # Only tabs that actually have a starred row say anything. A tab with nothing
         # to warn about says nothing: "every setting here applies immediately" is the
@@ -735,7 +745,7 @@ class SettingsDialog(QDialog):
 
     def _show_example(self, key: str) -> None:
         """Render the template being typed against a stand-in book."""
-        from ..paths import render_template
+        from ..paths import index_pad, render_template, set_index_pad
 
         label = self._examples.get(key)
         if label is None:
@@ -745,11 +755,20 @@ class SettingsDialog(QDialog):
         values = {'author': 'Brandon Sanderson', 'series': 'Mistborn',
                   'series_index': 2, 'title': 'The Well of Ascension',
                   'file_index': '03', 'extension': 'mp3'}
+        # The example has to answer "what does the padding I just typed do?", so it
+        # renders against the pad field's current contents rather than the saved one.
+        pad_widget = self.widgets.get('AO_INDEX_PAD')
+        typed_pad = pad_widget.text().strip() if isinstance(pad_widget, QLineEdit) else ''
+        saved_pad = index_pad()
+        if typed_pad.isdigit():
+            set_index_pad(int(typed_pad))
         try:
             rendered = render_template(template, values)
         except Exception as exc:            # a half-typed template is not an error
             label.setText(f'...  ({exc})')
             return
+        finally:
+            set_index_pad(saved_pad)
         if key == 'AO_FILE_TEMPLATE' and not rendered.lower().endswith('.mp3'):
             rendered += '.mp3'
         label.setText('→  ' + (rendered + ('/' if key == 'AO_OUTPUT_TEMPLATE' else '')))

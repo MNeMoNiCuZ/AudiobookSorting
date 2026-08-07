@@ -88,16 +88,24 @@ SCHEMA: Dict[str, tuple] = {
     # --- apply behaviour
     'AO_COPY_MODE': ('true', 'bool',
                      'Copy books to the output folder instead of moving them.'),
-    'AO_OUTPUT_TEMPLATE': ('{author}/{series} {series_index:02d} - {title}', 'str',
+    'AO_OUTPUT_TEMPLATE': ('{author}/{series} {series_index} - {title}', 'str',
                            'Folder naming pattern for organised books.'),
     'AO_RENAME_FILES': ('true', 'bool',
                         'Rename audio files using the file naming pattern.'),
-    'AO_FILE_TEMPLATE': ('{series} {series_index:02d} - {title} {file_index:03d}', 'str',
+    'AO_FILE_TEMPLATE': ('{series} {series_index} - {title} {file_index:03d}', 'str',
                          'Naming pattern for audio files.'),
+    'AO_INDEX_PAD': ('2', 'int',
+                     'Digits to pad the book number to: 2 makes Book 5 into Book 05, '
+                     'and a 1-3 bundle into 01-03.'),
     'AO_RENAME_SUPPORT_FILES': ('true', 'bool',
                                 'Rename companion files to match the audio files.'),
     'AO_COLLISION_POLICY': ('suffix', 'choice:suffix|skip|merge|overwrite',
                             'What to do when the destination already exists.'),
+    'AO_BLOCKED_WORDS': ('', 'str',
+                         'Comma-separated words removed from author, series and '
+                         'title. Example: series, unabridged, audiobook.'),
+    'AO_STRIP_PARENTHESES': ('true', 'bool',
+                             'Remove bracketed asides such as (Unabridged) from names.'),
     'AO_ILLEGAL_CHARS': ('smart', 'choice:smart|dash|underscore|space|remove',
                          'How unsupported filename characters are replaced.'),
     'AO_WARN_DIRTY_OUTPUT': ('true', 'bool',
@@ -145,7 +153,7 @@ SCHEMA: Dict[str, tuple] = {
     'AO_UI_COPY_RECENT_LIST': ('', 'str', 'Recently used copy actions.'),
 
     # --- chapter merging (the modal remembers what you chose last time)
-    'AO_MERGE_TEMPLATE': ('{series} {series_index:02d} - {title}', 'str',
+    'AO_MERGE_TEMPLATE': ('{series} {series_index} - {title}', 'str',
                           'Naming pattern for merged books.'),
     'AO_MERGE_IN_PLACE': ('true', 'bool',
                           'Write merged books beside their chapter files.'),
@@ -217,6 +225,22 @@ class Settings:
 
     def reload(self) -> None:
         self._values = self._parse(self.env_path)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring values written by an older version in line with what they mean now.
+
+        The book number used to be padded by the template itself, so every .env
+        carries ``{series_index:02d}`` - a width spelled out in the pattern, which by
+        design overrides AO_INDEX_PAD. Someone changing the new padding setting would
+        watch it do nothing. Only the exact old default is rewritten, so a width you
+        chose deliberately is left alone.
+        """
+        for key in ('AO_OUTPUT_TEMPLATE', 'AO_FILE_TEMPLATE', 'AO_MERGE_TEMPLATE'):
+            value = self._values.get(key, '')
+            if value and value == SCHEMA[key][0].replace('{series_index}',
+                                                         '{series_index:02d}'):
+                self._values[key] = SCHEMA[key][0]
 
     @staticmethod
     def _parse(path: Path) -> Dict[str, str]:

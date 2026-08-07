@@ -212,7 +212,7 @@ class PreviewDialog(QDialog):
             trouble.setForeground(0, QColor(STATUS_TEXT['rejected']))
             self.tree.addTopLevelItem(trouble)
             for result in problems:
-                reason = result.error or 'destination already exists - skipped'
+                reason = result.error or f'skipped - {result.reason}'
                 item = QTreeWidgetItem([result.entry_id, 'skip' if result.skipped
                                         else 'error', reason])
                 colour = (STATUS_TEXT['risky'] if result.skipped

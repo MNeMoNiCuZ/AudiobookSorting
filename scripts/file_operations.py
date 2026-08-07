@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from .journal import ApplyJournal, FileMove, Transaction
-from .models import BookEntry
+from .models import STATUS_REJECTED, BookEntry
 from .paths import build_destination, long_path, sanitize_component, unique_path
 from .settings import display_path
 
@@ -32,13 +32,18 @@ class ApplyResult:
     """Outcome of applying one entry - also the dry-run preview payload."""
 
     def __init__(self, entry_id: str, destination: Path, operations: List[Dict],
-                 skipped: bool = False, error: str = '', dry_run: bool = False):
+                 skipped: bool = False, error: str = '', dry_run: bool = False,
+                 reason: str = ''):
         self.entry_id = entry_id
         self.destination = destination
         self.operations = operations
         self.skipped = skipped
         self.error = error
         self.dry_run = dry_run
+        # Why it was skipped. A skip is not a failure, so it carries a reason rather
+        # than an error - "the destination exists" and "you rejected this book" are
+        # both ordinary outcomes, and they are not the same outcome.
+        self.reason = reason or ('destination exists' if skipped else '')
 
     @property
     def ok(self) -> bool:
@@ -48,7 +53,7 @@ class ApplyResult:
         if self.error:
             return f'ERROR  {self.entry_id}: {self.error}'
         if self.skipped:
-            return f'SKIP   {self.entry_id}: destination exists'
+            return f'SKIP   {self.entry_id}: {self.reason}'
         verb = 'WOULD ' if self.dry_run else ''
         lines = [f'{verb}APPLY {self.entry_id} -> {display_path(self.destination)}']
         for op in self.operations:
@@ -151,6 +156,16 @@ class FileOperations:
 
     def _apply(self, entry: BookEntry, force_dry_run: bool) -> ApplyResult:
         dry_run = force_dry_run
+
+        # A rejected book is never written, whoever asked. The window already sends
+        # only approved rows, but "rejected" is a decision about the book itself, not
+        # about one caller's list, and the place to enforce it is the one function
+        # that actually touches the disk. A preview may still render one - looking at
+        # where a book would have gone is not the same as putting it there.
+        if not dry_run and entry.status == STATUS_REJECTED:
+            return ApplyResult(entry.entry_id, Path(), [], skipped=True,
+                               reason='you rejected this book')
+
         files = self.files_for(entry)
         if not files:
             return ApplyResult(entry.entry_id, Path(), [],

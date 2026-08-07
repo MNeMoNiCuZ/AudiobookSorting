@@ -26,31 +26,32 @@ _NOISE_PATTERNS = [
 ]
 
 _SERIES_WORD = r'(?:book|bk|volume|vol|part|pt|#|no\.?|episode|ep)'
+_INDEX = r'\d{1,3}(?:[.,]\d+)?'
 
 # Ordered most-specific first; the first match wins.
 _PATTERNS: List[tuple] = [
     # Author - Series 03 - Title
     (re.compile(rf'^(?P<author>.+?)\s+-\s+(?P<series>.+?)\s+{_SERIES_WORD}?\s*'
-                rf'(?P<index>\d{{1,3}})\s+-\s+(?P<title>.+)$', re.I), 'author-series-index-title'),
+                rf'(?P<index>{_INDEX})\s+-\s+(?P<title>.+)$', re.I), 'author-series-index-title'),
     # Author - Title (Series Book 3)  |  Author - Title (Series, #3)
     (re.compile(rf'^(?P<author>.+?)\s+-\s+(?P<title>.+?)\s*\((?P<series>[^)]+?)[,\s]+'
-                rf'{_SERIES_WORD}?\s*(?P<index>\d{{1,3}})\)\s*$', re.I), 'author-title-(series-index)'),
+                rf'{_SERIES_WORD}?\s*(?P<index>{_INDEX})\)\s*$', re.I), 'author-title-(series-index)'),
     # Series 03 - Title
-    (re.compile(rf'^(?P<series>.+?)\s+{_SERIES_WORD}?\s*(?P<index>\d{{1,3}})\s*[-–—:]\s*'
+    (re.compile(rf'^(?P<series>.+?)\s+{_SERIES_WORD}?\s*(?P<index>{_INDEX})\s*[-–—:]\s*'
                 rf'(?P<title>.+)$', re.I), 'series-index-title'),
     # [Series 03] Title
-    (re.compile(rf'^\[(?P<series>[^\]]+?)\s+{_SERIES_WORD}?\s*(?P<index>\d{{1,3}})\]\s*'
+    (re.compile(rf'^\[(?P<series>[^\]]+?)\s+{_SERIES_WORD}?\s*(?P<index>{_INDEX})\]\s*'
                 rf'(?P<title>.+)$', re.I), '[series-index]-title'),
     # Title (Series Book 3)
     (re.compile(rf'^(?P<title>.+?)\s*\((?P<series>[^)]+?)[,\s]+{_SERIES_WORD}\s*'
-                rf'(?P<index>\d{{1,3}})\)\s*$', re.I), 'title-(series-book-index)'),
+                rf'(?P<index>{_INDEX})\)\s*$', re.I), 'title-(series-book-index)'),
     # Book 3 - Title   /   Book 3 Title
-    (re.compile(rf'^{_SERIES_WORD}\s*(?P<index>\d{{1,3}})\s*[-–—:.]?\s*(?P<title>.+)$', re.I),
+    (re.compile(rf'^{_SERIES_WORD}\s*(?P<index>{_INDEX})\s*[-–—:.]?\s*(?P<title>.+)$', re.I),
      'book-index-title'),
     # Author - Title
     (re.compile(r'^(?P<author>[^-]+?)\s+-\s+(?P<title>.+)$'), 'author-title'),
     # 01. Title  /  01 - Title
-    (re.compile(r'^(?P<index>\d{1,3})\s*[-.)]\s*(?P<title>.+)$'), 'index-title'),
+    (re.compile(rf'^(?P<index>{_INDEX})\s*[-.)]\s*(?P<title>.+)$'), 'index-title'),
 ]
 
 # A folder named exactly like a person: "Brandon Sanderson", "J. R. R. Tolkien"
@@ -141,7 +142,10 @@ def _match_patterns(cleaned: str) -> Dict[str, str]:
             if series:
                 result['series'] = titlecase(series)
         if groups.get('index'):
-            result['series_index'] = groups['index'].lstrip('0') or '0'
+            index = groups['index'].replace(',', '.')
+            whole, dot, fraction = index.partition('.')
+            result['series_index'] = ((whole.lstrip('0') or '0')
+                                      + (dot + fraction if dot else ''))
         if groups.get('title'):
             title = strip_noise(groups['title'])
             if title and not _GENERIC_STEMS.match(title):

@@ -1108,3 +1108,18 @@ def test_review_button_tooltips_explain_all_three_mouse_buttons(window):
         assert 'LMB:' in tooltip
         assert 'MMB:' in tooltip
         assert 'RMB:' in tooltip
+
+
+def test_every_toolbar_hotkey_is_installed_and_advertised(window):
+    """A tooltip may only name a key the window actually binds."""
+    from PyQt6.QtGui import QKeySequence, QShortcut
+
+    from scripts.gui.toolbar import SHORTCUTS
+
+    installed = {shortcut.key().toString()
+                 for shortcut in window.findChildren(QShortcut)}
+    for key, sequence in SHORTCUTS.items():
+        assert QKeySequence(sequence).toString() in installed, key
+        action = window.tool_actions.get(key)
+        if action is not None:
+            assert action.toolTip().splitlines()[0].endswith(f'({sequence})'), key

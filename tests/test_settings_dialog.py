@@ -278,3 +278,19 @@ def test_opening_the_page_flashes_no_stray_windows(qt_app, settings):
 
     strays = [name for name in shown if name != 'SettingsDialog']
     assert not strays, f'stray top-level windows appeared while building: {strays}'
+
+
+def test_old_padded_templates_migrate_to_the_padding_setting(tmp_path):
+    """A .env still spelling out ":02d" would make AO_INDEX_PAD look broken."""
+    from scripts.settings import Settings
+
+    env = tmp_path / '.env'
+    env.write_text(
+        'AO_OUTPUT_TEMPLATE={author}/{series} {series_index:02d} - {title}\n'
+        'AO_FILE_TEMPLATE={series} {series_index:04d} - {title}\n',
+        encoding='utf-8')
+    settings = Settings(env)
+
+    assert settings.get('AO_OUTPUT_TEMPLATE') == SCHEMA['AO_OUTPUT_TEMPLATE'][0]
+    # A width the user chose is not the old default, and is left alone.
+    assert settings.get('AO_FILE_TEMPLATE') == '{series} {series_index:04d} - {title}'

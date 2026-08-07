@@ -30,14 +30,14 @@ TOOL_ITEMS: List[ToolItem] = [
     # user reads changed, because "Scan" said nothing about what it did to the list
     # you already had.
     ToolItem('scan', '⟳', 'Load Input',
-             'Read the input folder into the list  (Ctrl+R).\n'
+             'Read the input folder into the list.\n'
              'With books already loaded you are asked what to keep first.\n'
              'Right-click for the same thing on the selected rows only, and to\n'
              'choose a different input folder.'),
     ToolItem('sources', '☰', 'Sources',
              'Choose which sources identification is allowed to use'),
     ToolItem('identify', '▶', 'Identify',
-             'Run the ticked sources over the selected rows  (F4)'),
+             'Run the ticked sources over the selected rows'),
     ToolItem('warnings', '⚠', 'Warnings',
              'Review suspicious values, fix them, or make a decision in batches'),
     ToolItem('approve', '✔', 'Approve',
@@ -49,11 +49,11 @@ TOOL_ITEMS: List[ToolItem] = [
              'MMB: Decline under the saved threshold\n'
              'RMB: Choose a decline threshold'),
     ToolItem('reset', '⟲', 'Reset',
-             'Clear the decision on the selected rows  (F8)'),
+             'Clear the decision on the selected rows'),
     # Monochrome glyphs only - the emoji codepoints for eye/folder/disk render in
     # full colour on Windows and would ignore the theme entirely.
     ToolItem('preview', '▤', 'Preview',
-             'Show the folder tree applying would produce, without touching files  (F7)'),
+             'Show the folder tree applying would produce, without touching files'),
     ToolItem('apply', '➔', 'Finalize',
              'The program auto-saves identification results, edits, and review choices.\n'
              'Finalize is the only step that touches your files. Every approved row - including\n'
@@ -63,14 +63,35 @@ TOOL_ITEMS: List[ToolItem] = [
              'Open a Goodreads search for the selected book in your browser,\n'
              'using whatever author/title we currently have.'),
     ToolItem('undo', '↶', 'Undo',
-             'Undo the last thing you did  (Ctrl+Z).\n'
+             'Undo the last thing you did.\n'
              'Right-click for the full history - edits and applies - and pick how\n'
              'far back to go.'),
     ToolItem('settings', '⚙', 'Settings',
-             'Open the settings page  (F12)'),
+             'Open the settings page'),
 ]
 
 ITEMS_BY_KEY = {item.key: item for item in TOOL_ITEMS}
+
+# The one place a toolbar button's key binding is written down. The main window
+# installs these, and every tooltip prints its own from here - a tooltip that names a
+# key the window does not actually bind is worse than no tooltip, and that is what a
+# hand-written "(F8)" in the text above became the moment the bindings moved.
+SHORTCUTS = {
+    'scan': 'Ctrl+R',
+    'identify': 'F4',
+    'approve': 'F5',
+    'reject': 'F6',
+    'preview': 'F7',
+    'apply': 'F8',
+    'goodreads': 'F9',
+    'undo': 'Ctrl+Z',
+    'settings': 'F12',
+}
+
+
+def shortcut_for(key: str) -> str:
+    """The key binding for a toolbar item, or '' if it has none."""
+    return SHORTCUTS.get(key, '')
 
 DEFAULT_LAYOUT = ('scan,sources,identify,warnings,|,approve,reject,reset,|,'
                   'goodreads,preview,apply,undo,|,settings')

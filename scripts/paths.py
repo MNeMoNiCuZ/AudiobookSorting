@@ -107,6 +107,24 @@ def set_illegal_char_mode(mode: str) -> None:
 def illegal_char_mode() -> str:
     return _mode
 
+# How wide a book number is padded when the template asks for no particular width.
+# Set once at start-up from AO_INDEX_PAD, and module-level for the same reason the
+# illegal-character strategy is: rendering happens far from any Settings object.
+_index_pad = 2
+
+
+def set_index_pad(width: int) -> None:
+    """Pad plain ``{series_index}`` to this many digits, process-wide."""
+    global _index_pad
+    try:
+        _index_pad = max(0, min(9, int(width)))
+    except (TypeError, ValueError):
+        _index_pad = 2
+
+
+def index_pad() -> int:
+    return _index_pad
+
 _RESERVED = {
     'con', 'prn', 'aux', 'nul',
     *(f'com{i}' for i in range(1, 10)),
@@ -153,7 +171,10 @@ def render_template(template: str, values: Dict[str, str]) -> str:
     # and the per-file part number take a format spec, so "{file_index:03d}" pads the
     # same way "{series_index:02d}" always has.
     for key in ('series_index', 'file_index'):
-        text = _render_number(text, key, values.get(key, ''))
+        text = _render_number(text, key, values.get(key, ''),
+                              default_spec=(f':0{_index_pad}d'
+                                            if key == 'series_index' and _index_pad > 1
+                                            else ''))
 
     for key in ('author', 'series', 'title', 'extension'):
         value = sanitize_component(str(values.get(key, '') or ''), fallback='')
@@ -180,32 +201,47 @@ def render_template(template: str, values: Dict[str, str]) -> str:
     return '/'.join(parts) if parts else 'Unknown'
 
 
-def _render_number(text: str, key: str, raw: Any) -> str:
+def _render_number(text: str, key: str, raw: Any, default_spec: str = '') -> str:
     """Substitute a numeric placeholder, honouring an optional format spec.
 
     ``{file_index:03d}`` -> "007". An empty value removes the placeholder entirely so
-    single-file books do not end up called "Title 000".
+    single-file books do not end up called "Title 000". ``default_spec`` is used for
+    the placeholders written without one, which is how the "pad book number" setting
+    reaches a template that just says ``{series_index}``.
+
+    A bundled omnibus carries a range - "1-3" - and both ends are padded to the same
+    width, so "Book 01-03" rather than "Book 01-3".
     """
     value = str(raw or '').strip()
     pattern = r'\{%s(:[^}]+)?\}' % key
     if not value:
         return re.sub(pattern, '', text)
 
+    for match in set(re.findall(pattern, text)):
+        spec = match or default_spec
+        rendered = '-'.join(_format_number(part, spec)
+                            for part in value.split('-')) if spec else value
+        text = text.replace(f'{{{key}{match or ""}}}', rendered)
+    return text
+
+
+def _format_number(value: str, spec: str) -> str:
+    """One number through one format spec, falling back to the text unchanged."""
+    value = value.strip().replace(',', '.')
     try:
         as_int = int(float(value))
     except ValueError:
         as_int = None
-
-    for match in set(re.findall(pattern, text)):
-        spec = match or ''
-        try:
-            rendered = (format(as_int if 'd' in spec and as_int is not None else value,
-                               spec.lstrip(':'))
-                        if spec else value)
-        except (ValueError, TypeError):
-            rendered = value
-        text = text.replace(f'{{{key}{spec}}}', rendered)
-    return text
+    # A half-book - "2.5", the novella between two novels - is still a number, and an
+    # integer format would round it away to "02". Pad the whole part, keep the rest.
+    whole, dot, fraction = value.partition('.')
+    if dot and fraction.isdigit() and whole.isdigit() and 'd' in spec:
+        return _format_number(whole, spec) + '.' + fraction
+    try:
+        return format(as_int if 'd' in spec and as_int is not None else value,
+                      spec.lstrip(':'))
+    except (ValueError, TypeError):
+        return value
 
 
 def platform_path_limit() -> int:

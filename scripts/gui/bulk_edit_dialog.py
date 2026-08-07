@@ -27,11 +27,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QRect, QSize, Qt
 from PyQt6.QtGui import QKeyEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QAbstractItemDelegate, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
-    QLabel, QMenu, QPushButton, QTableWidget, QTableWidgetItem, QToolButton,
+    QAbstractItemDelegate, QDialog, QDialogButtonBox, QHeaderView, QLabel, QLayout,
+    QLayoutItem, QMenu, QPushButton, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -57,8 +57,120 @@ SETTING_WINDOW = 'AO_UI_GRID_WINDOW'
 SETTING_COLUMNS = 'AO_UI_GRID_COLUMNS'
 
 
+class _FlowLayout(QLayout):
+    """Lays widgets out in a centred row, wrapping to the next line when they run out.
+
+    The one property that matters here: it never makes a child narrower than the child
+    says it needs to be. A QHBoxLayout squeezes its children to fit the window, and a
+    squeezed QPushButton elides its own text - which is how a button whose entire job
+    is to show you a name ended up showing you half of one.
+    """
+
+    def __init__(self, spacing: int = 10):
+        super().__init__()
+        self._items: List[QLayoutItem] = []
+        self._spacing = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    # QLayout's required plumbing.
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._lay_out(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._lay_out(rect, apply=True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        # As wide as the widest single button - below that there is nowhere left to
+        # wrap to, and the text would have to be cut.
+        # sizeHint, not minimumSize: the hint is what the styled button actually needs
+        # to paint its label, and it is what _lay_out gives every item.
+        width = max((item.sizeHint().width() for item in self._items), default=0)
+        height = self.heightForWidth(width) if self._items else 0
+        return QSize(width, height)
+
+    def _lay_out(self, rect: QRect, apply: bool) -> int:
+        """Place the items (or just measure them); returns the height used."""
+        x, y = rect.x(), rect.y()
+        line_height = 0
+        line: List[QLayoutItem] = []
+
+        def flush() -> None:
+            """Centre the line just finished, then start the next one."""
+            nonlocal x, y, line_height, line
+            if apply and line:
+                used = sum(item.sizeHint().width() for item in line)
+                used += self._spacing * (len(line) - 1)
+                left = rect.x() + max(0, (rect.width() - used) // 2)
+                for item in line:
+                    size = item.sizeHint()
+                    item.setGeometry(QRect(left, y, size.width(), line_height))
+                    left += size.width() + self._spacing
+            y += line_height + (self._spacing if line else 0)
+            x, line_height, line = rect.x(), 0, []
+
+        for item in self._items:
+            size = item.sizeHint()
+            if line and x + size.width() > rect.x() + rect.width():
+                flush()
+            line.append(item)
+            x += size.width() + self._spacing
+            line_height = max(line_height, size.height())
+        flush()
+
+        return y - rect.y() - self._spacing
+
+
+class _NumberItem(QTableWidgetItem):
+    """A book number that sorts as a number: 2 before 10, and blanks last.
+
+    A bundled omnibus holds a range - "1-3" - which sorts on where it starts, which is
+    where it belongs in the series.
+    """
+
+    def _key(self) -> float:
+        text = self.text().strip().split('-')[0].strip().replace(',', '.')
+        try:
+            return float(text)
+        except ValueError:
+            return float('inf')
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, _NumberItem):
+            mine, theirs = self._key(), other._key()
+            if mine != theirs:
+                return mine < theirs
+            return self.text() < other.text()
+        return super().__lt__(other)
+
+
 class _Grid(QTableWidget):
     """A table whose Enter/Tab keys move the way the docstring above describes."""
+
+    # Set by the dialog that owns it, right after construction. Not `parent()`: the
+    # grid's parent is whatever widget Qt reparents it to when it joins a layout.
+    dialog: 'BulkEditDialog'
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
@@ -72,6 +184,23 @@ class _Grid(QTableWidget):
         if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
             self._commit()
             self._step(0, -1 if (shift or key == Qt.Key.Key_Backtab) else 1)
+            event.accept()
+            return
+
+        # Delete, Ctrl+C and Ctrl+V reach here only when no editor is open - an open
+        # editor is a QLineEdit child with the focus, and it keeps its own three.
+        control = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        dialog = self.dialog
+        if key == Qt.Key.Key_Delete and not control:
+            dialog._clear_selected_cells()
+            event.accept()
+            return
+        if control and key == Qt.Key.Key_C:
+            dialog._copy_selected_cells()
+            event.accept()
+            return
+        if control and key == Qt.Key.Key_V:
+            dialog._paste_into_selection()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -136,6 +265,9 @@ class BulkEditDialog(QDialog):
         # the right author precisely because it is the right one, and copying the top
         # row instead means the button writes a value you did not choose.
         self._last_row: Dict[str, int] = {}
+        # (column, order) of the last heading click, so clicking the same one again
+        # reverses it. Nothing is sorted until you ask.
+        self._sorted: Optional[Tuple[int, Qt.SortOrder]] = None
 
         self.setWindowTitle(f'Edit {len(self.entries)} books')
 
@@ -144,12 +276,18 @@ class BulkEditDialog(QDialog):
         layout.setSpacing(8)
 
         note = QLabel('Enter moves down · Shift+Enter up · Tab right · Shift+Tab left '
-                      '· Ctrl+Z undoes one edit. '
+                      '· Ctrl+Z undoes one edit · Delete clears the selected cells '
+                      '· Ctrl+C / Ctrl+V copy and paste them · click a heading to sort. '
                       'Nothing is written until you press Apply.')
         note.setStyleSheet(f'color: {TEXT_DIM};')
+        # A wrapped QLabel still reports its whole unwrapped line as its minimum
+        # width, which is how one long sentence of key hints came to decide how wide
+        # this window opens. It is a hint; it wraps, and it gets no say in the size.
+        note.setMinimumWidth(1)
         layout.addWidget(note)
 
         self.grid = _Grid(len(self.entries), len(FIELDS))
+        self.grid.dialog = self
         self.grid.setHorizontalHeaderLabels([title for _, title in FIELDS])
         # Row numbers only. The file name is a column now, so the vertical header has
         # nothing left to say except where you are.
@@ -170,14 +308,29 @@ class BulkEditDialog(QDialog):
             Qt.AlignmentFlag.AlignCenter)
         self._restore_columns()
 
+        # Click a heading to sort. Qt's own setSortingEnabled re-sorts on every write,
+        # which in a grid you type down means the row you just edited jumps out from
+        # under the cursor mid-run. Sorting is done on the click instead, so the order
+        # only ever changes when you ask it to.
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._sort_by)
+        header.setSortIndicatorShown(False)
+        header.setToolTip('Click a heading to sort by that column. '
+                          'Rows keep their order while you type.')
+
         for row, entry in enumerate(self.entries):
             for column, (name, _) in enumerate(FIELDS):
                 text = self._row_label(entry) if name == 'file' else entry.value(name)
-                item = QTableWidgetItem(text)
+                item = (_NumberItem(text) if name == 'series_index'
+                        else QTableWidgetItem(text))
                 if name == 'file':
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     item.setToolTip(display_path(entry.primary_audio)
                                     if entry.primary_audio else entry.entry_id)
+                    # Which book this row is, surviving every re-sort: the undo stack
+                    # and the final diff are anchored to this, not to a row number,
+                    # because a row number means a different book after a sort.
+                    item.setData(Qt.ItemDataRole.UserRole, row)
                 elif name == 'series_index':
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.grid.setItem(row, column, item)
@@ -194,9 +347,11 @@ class BulkEditDialog(QDialog):
         # lived under the "#" column and was squeezed to a sliver, and every one of
         # them jumped sideways whenever a column was dragged. They are one centred row
         # now. Each says which field it writes, so nothing is lost by moving them.
-        bar = QHBoxLayout()
-        bar.setSpacing(10)
-        bar.addStretch(1)
+        # A flow, not a fixed row: each button names the value it would write, in full,
+        # and a real author plus a real series is easily wider than three buttons'
+        # worth of window. Given the choice between cutting the name short and using a
+        # second line, it takes the second line - the name is the whole message.
+        bar = _FlowLayout(spacing=10)
         self.column_buttons: Dict[str, QWidget] = {}
         for name in ('author', 'series', 'series_index'):
             if name == 'series_index':
@@ -207,7 +362,6 @@ class BulkEditDialog(QDialog):
             button.setMinimumWidth(190)
             self.column_buttons[name] = button
             bar.addWidget(button)
-        bar.addStretch(1)
         layout.addLayout(bar)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply
@@ -251,7 +405,11 @@ class BulkEditDialog(QDialog):
         except ValueError:
             saved_width = saved_height = 0
 
-        width = max(saved_width, self._main_table_width(), 900)
+        # Never narrower than the layout says it can be - the fill-down buttons carry
+        # a whole author or series name, and that name is not allowed to be clipped by
+        # the window edge any more than by an ellipsis.
+        width = max(saved_width, self._main_table_width(), 900,
+                    self.minimumSizeHint().width())
 
         # Header, one line per book, then the note, the button row and the buttons.
         rows = self.grid.verticalHeader().defaultSectionSize() * len(self.entries)
@@ -373,12 +531,12 @@ class BulkEditDialog(QDialog):
         """Record every value change so it can be walked back one step at a time."""
         if self._suspend:
             return
-        key = (item.row(), item.column())
+        key = (self._book_at(item.row()), item.column())
         before = self._current.get(key, '')
         if item.text() == before:
             return
         self._current[key] = item.text()
-        change = (item.row(), item.column(), before)
+        change = (key[0], item.column(), before)
         if self._batch is not None:
             self._batch.append(change)
             return          # the group refreshes once, when it closes
@@ -405,14 +563,55 @@ class BulkEditDialog(QDialog):
         try:
             # Newest change in the batch first, so a cell written twice within one
             # step lands back on the value it had before the step.
-            for row, column, before in reversed(batch):
-                item = self.grid.item(row, column)
+            for book, column, before in reversed(batch):
+                item = self.grid.item(self._row_of(book), column)
                 if item is None:
                     continue
                 item.setText(before)
-                self._current[(row, column)] = before
+                self._current[(book, column)] = before
         finally:
             self._suspend = False
+        self._refresh_buttons()
+
+    # --------------------------------------------------------------- ordering
+
+    def _book_at(self, row: int) -> int:
+        """Which entry the given visible row is showing."""
+        item = self.grid.item(row, 0)
+        book = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        return row if book is None else int(book)
+
+    def _row_of(self, book: int) -> int:
+        """Where the given entry currently sits. The inverse of :meth:`_book_at`."""
+        for row in range(self.grid.rowCount()):
+            if self._book_at(row) == book:
+                return row
+        return book
+
+    def _sort_by(self, column: int) -> None:
+        """Sort on a heading click, ascending then descending on the next click."""
+        self.grid._commit()
+        order = (Qt.SortOrder.DescendingOrder
+                 if self._sorted == (column, Qt.SortOrder.AscendingOrder)
+                 else Qt.SortOrder.AscendingOrder)
+
+        # "The row I was last in" is a statement about a book, not about a position,
+        # so it is carried across the re-sort rather than left pointing at whichever
+        # book landed on that row.
+        remembered = {name: self._book_at(row) for name, row in self._last_row.items()
+                      if 0 <= row < self.grid.rowCount()}
+        current = self.grid.currentRow()
+        current_book = self._book_at(current) if current >= 0 else None
+
+        self.grid.sortItems(column, order)
+        self._sorted = (column, order)
+        self.grid.horizontalHeader().setSortIndicator(column, order)
+        self.grid.horizontalHeader().setSortIndicatorShown(True)
+
+        self._last_row = {name: self._row_of(book) for name, book in remembered.items()}
+        if current_book is not None:
+            self.grid.setCurrentCell(self._row_of(current_book),
+                                     max(self.grid.currentColumn(), EDITABLE[0]))
         self._refresh_buttons()
 
     # ---------------------------------------------------------------- buttons
@@ -497,8 +696,9 @@ class BulkEditDialog(QDialog):
             row = self._source_row(name)
             value = self._value_at(row, name)
             button.setEnabled(bool(value) and self.grid.rowCount() > 1)
-            button.setText(f'Set as {self._short(value)}' if value
-                           else f'Set as the selected {name}')
+            self._set_button_text(
+                button,
+                f'Set as {value}' if value else f'Set as the selected {name}')
             button.setToolTip(
                 f'Write "{value}" - the {name} on row {row + 1}, the last one you had '
                 f'the cursor in - into the {name} of every other row.\n'
@@ -509,7 +709,7 @@ class BulkEditDialog(QDialog):
         number = self.column_buttons.get('series_index')
         if number is not None:
             top = self._top_number()
-            number.setText('Set as 1, 2, 3')
+            self._set_button_text(number, 'Set as 1, 2, 3')
             self.number_from_top.setText(
                 f'Set as {top}, {top + 1}, {top + 2}...')
             number.setToolTip('Number the rows 1, 2, 3 in the order shown.\n'
@@ -520,8 +720,18 @@ class BulkEditDialog(QDialog):
         self.undo_button.setText(f'Undo ({len(self._undo)})' if self._undo else 'Undo')
 
     @staticmethod
-    def _short(value: str, limit: int = 26) -> str:
-        return value if len(value) <= limit else value[:limit - 1] + '…'
+    def _set_button_text(button: QWidget, text: str) -> None:
+        """Label a button with the value it would write - all of it, always.
+
+        The whole point of these buttons is that they name the value, so a name cut
+        short is the one thing they must not do: no ellipsis in the string, and no
+        eliding by Qt to make it fit. Nothing is measured here on purpose. The button
+        reports what it needs through sizeHint - which is the styled width of this
+        exact text - and _FlowLayout gives every button exactly that, wrapping to the
+        next line rather than shaving anything off.
+        """
+        button.setText(text)
+        button.updateGeometry()
 
     # ---------------------------------------------------------------- actions
 
@@ -553,6 +763,76 @@ class BulkEditDialog(QDialog):
                 self.grid.item(row, column).setText(origin.text())
         self._ungroup()
 
+    # -------------------------------------------------------- cell clipboard
+
+    def _selected_cells(self) -> List[Tuple[int, int]]:
+        """The selected cells, in the order shown, editable ones only."""
+        return sorted({(index.row(), index.column())
+                       for index in self.grid.selectedIndexes()
+                       if index.column() in EDITABLE})
+
+    def _clear_selected_cells(self) -> None:
+        """Delete blanks the selected cells - one undo step, it was one keypress."""
+        cells = self._selected_cells()
+        if not cells:
+            return
+        self._group()
+        for row, column in cells:
+            self.grid.item(row, column).setText('')
+        self._ungroup()
+
+    def _copy_selected_cells(self) -> None:
+        """The selection as tab-separated text, in the shape it is on screen."""
+        from PyQt6.QtWidgets import QApplication
+
+        indexes = self.grid.selectedIndexes()
+        if not indexes:
+            return
+        rows = sorted({index.row() for index in indexes})
+        columns = sorted({index.column() for index in indexes})
+        chosen = {(index.row(), index.column()) for index in indexes}
+
+        lines = []
+        for row in rows:
+            lines.append('\t'.join(
+                self.grid.item(row, column).text()
+                if (row, column) in chosen and self.grid.item(row, column) else ''
+                for column in columns))
+        QApplication.clipboard().setText('\n'.join(lines))
+
+    def _paste_into_selection(self) -> None:
+        """Clipboard into the selection: one value fills it, a block is laid out.
+
+        The read-only file column is skipped rather than written through, so a block
+        copied from a spreadsheet that starts a column early still lands in the right
+        fields instead of silently shifting everything left.
+        """
+        from PyQt6.QtWidgets import QApplication
+
+        text = QApplication.clipboard().text()
+        cells = self._selected_cells()
+        if not text.strip() or not cells:
+            return
+
+        grid = [line.split('\t') for line in text.replace('\r\n', '\n').split('\n')]
+        self._group()
+        if len(grid) == 1 and len(grid[0]) == 1:
+            for row, column in cells:
+                self.grid.item(row, column).setText(grid[0][0].strip())
+        else:
+            start_row, start_column = cells[0]
+            for row_offset, line in enumerate(grid):
+                row = start_row + row_offset
+                if row >= self.grid.rowCount():
+                    break
+                for column_offset, value in enumerate(line):
+                    column = start_column + column_offset
+                    if column >= len(FIELDS):
+                        break
+                    if column in EDITABLE:
+                        self.grid.item(row, column).setText(value.strip())
+        self._ungroup()
+
     def _number_rows(self, start: int) -> None:
         column = self._column_for('series_index')
         self._group()
@@ -563,7 +843,9 @@ class BulkEditDialog(QDialog):
     def values(self) -> Dict[str, Dict[str, str]]:
         """entry_id -> {field: new value}, containing only what actually changed."""
         changes: Dict[str, Dict[str, str]] = {}
-        for row, entry in enumerate(self.entries):
+        for row in range(self.grid.rowCount()):
+            # By book, not by position: after a sort, row 3 is not entries[3].
+            entry = self.entries[self._book_at(row)]
             for column, (name, _) in enumerate(FIELDS):
                 if name == 'file':
                     continue

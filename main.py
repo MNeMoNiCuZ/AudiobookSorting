@@ -54,8 +54,12 @@ class Application:
         hand, so the chosen strategy is pushed into the module instead of threaded
         through every call site.
         """
-        from scripts.paths import set_illegal_char_mode
+        from scripts.paths import set_illegal_char_mode, set_index_pad
         set_illegal_char_mode(self.settings.get('AO_ILLEGAL_CHARS', 'smart'))
+        set_index_pad(self.settings.get_int('AO_INDEX_PAD', 2))
+        from scripts.models import set_text_filters
+        set_text_filters(self.settings.get('AO_BLOCKED_WORDS', ''),
+                         self.settings.get_bool('AO_STRIP_PARENTHESES', True))
 
     def reload_settings(self) -> None:
         """Re-read .env after the Settings page saved, and rebuild what depends on it."""

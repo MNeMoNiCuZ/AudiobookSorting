@@ -263,6 +263,67 @@ def pretty_status(status: str) -> str:
                       str(status or '').replace('_', ' ').title())
 
 
+# Text tidying that is a matter of taste rather than correctness: the words you never
+# want to see in a name ("Series", "Unabridged"), and whether bracketed asides are
+# kept. Module-level, and set once at start-up from AO_BLOCKED_WORDS and
+# AO_STRIP_PARENTHESES, because clean_value is called from everywhere and has no
+# Settings to hand - the same reasoning as paths.set_illegal_char_mode.
+_blocked: tuple = ()
+_strip_parentheses = True
+
+# The fields a name filter has any business touching. Numbers are not names.
+FILTERED_FIELDS = ('author', 'series', 'title')
+
+
+def set_text_filters(blocked: Any = '', strip_parentheses: bool = True) -> None:
+    """Configure the blocked words and bracket stripping for the whole process."""
+    global _blocked, _strip_parentheses
+    if isinstance(blocked, str):
+        # A comma-separated list is what people type; newlines are what they get when
+        # they paste one. Both work, and a term may be several words long.
+        terms = re.split(r'[,\n;]+', blocked)
+    else:
+        terms = list(blocked or ())
+    _blocked = tuple(term.strip() for term in terms if term and term.strip())
+    _strip_parentheses = bool(strip_parentheses)
+
+
+def blocked_words() -> tuple:
+    return _blocked
+
+
+def strip_parentheses_enabled() -> bool:
+    return _strip_parentheses
+
+
+def apply_text_filters(text: str) -> str:
+    """Drop bracketed asides and blocked terms from one name, then tidy the seam.
+
+    "The Expanse Series" with "series" blocked is "The Expanse", not "The Expanse "
+    or "The  Expanse". Removing every word of a value leaves nothing rather than
+    punctuation, and the caller treats that as an empty field.
+    """
+    if _strip_parentheses:
+        # Innermost-out, so "Title (Book One (Unabridged))" clears in one pass.
+        while True:
+            stripped = re.sub(r'\s*[\(\[\{][^\(\)\[\]\{\}]*[\)\]\}]', '', text)
+            if stripped == text:
+                break
+            text = stripped
+
+    for term in _blocked:
+        # Whole words only: blocking "series" must not gut "Seriously".
+        pattern = r'(?<!\w)%s(?!\w)' % r'\W+'.join(
+            re.escape(word) for word in term.split())
+        text = re.sub(pattern, ' ', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'\s{2,}', ' ', text)
+    # Punctuation left hanging where the removed words used to be.
+    text = re.sub(r'\s+([,;:.!?])', r'\1', text)
+    text = re.sub(r'^[\s\-–—_,:;.]+|[\s\-–—_,:;]+$', '', text)
+    return text.strip()
+
+
 def clean_value(name: str, value: Any) -> str:
     """Normalise a candidate value, rejecting the junk models and tags like to emit."""
     if value is None:
@@ -273,16 +334,32 @@ def clean_value(name: str, value: Any) -> str:
         return ''
 
     if name == 'series_index':
-        match = re.search(r'\d+(?:\.\d+)?', text)
-        if not match:
+        # A bundled omnibus is one entry covering several books, so the number is a
+        # range: "1-3", "01 - 03", "1 to 3" all mean the same thing and are stored
+        # unpadded as "1-3". Padding is an output concern, applied when the template
+        # is rendered, so the stored value never carries someone's typed zeroes.
+        span = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:-|–|—|to|through)\s*(\d+(?:[.,]\d+)?)',
+                         text, re.IGNORECASE)
+        if span:
+            first, last = (_clean_index(span.group(1)), _clean_index(span.group(2)))
+            if first and last:
+                return first if first == last else f'{first}-{last}'
             return ''
-        number = float(match.group())
-        if number < 0 or number > 999:
-            return ''
-        return str(int(number)) if number.is_integer() else str(number)
+        match = re.search(r'\d+(?:[.,]\d+)?', text)
+        return _clean_index(match.group()) if match else ''
 
     text = re.sub(r'\s+', ' ', text)
+    if name in FILTERED_FIELDS:
+        text = apply_text_filters(text)
     return text
+
+
+def _clean_index(text: str) -> str:
+    """One book number, normalised: no padding, no trailing ".0", 0-999 or nothing."""
+    number = float(text.replace(',', '.'))
+    if number < 0 or number > 999:
+        return ''
+    return str(int(number)) if number.is_integer() else str(number)
 
 
 def _norm(text: str) -> str:

@@ -160,3 +160,32 @@ def test_files_for_never_includes_siblings(settings, entries):
         owned = ops.files_for(entry)
         assert len(owned) == 1
         assert owned[0].name == Path(entry.primary_audio).name
+
+
+def test_a_rejected_book_is_never_written(settings, entries):
+    """Whoever asks, and whatever list it arrives in: rejected means not written."""
+    from scripts.models import STATUS_REJECTED
+
+    entry = _bladeborn(entries)[0]
+    entry.author = Field('Test Author', 'user', 1.0)
+    entry.status = STATUS_REJECTED
+
+    ops = FileOperations(settings)
+    result = ops.apply_entry(entry)
+
+    assert result.skipped and not result.ok
+    assert 'rejected' in result.reason
+    assert not result.operations
+    assert not settings.get_path('AO_OUTPUT_DIR').exists()
+
+
+def test_a_rejected_book_can_still_be_previewed(settings, entries):
+    """Looking at where a book would have gone is not putting it there."""
+    from scripts.models import STATUS_REJECTED
+
+    entry = _bladeborn(entries)[0]
+    entry.author = Field('Test Author', 'user', 1.0)
+    entry.status = STATUS_REJECTED
+
+    result = FileOperations(settings).preview(entry)
+    assert result.ok and result.operations

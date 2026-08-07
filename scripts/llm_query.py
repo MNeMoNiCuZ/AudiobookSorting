@@ -25,6 +25,16 @@ You identify audiobooks from messy filenames and partial metadata. Rules:
 - If a field is genuinely unknown, return an empty string. Never invent a series that
   does not exist, and never guess a series index you are not confident about.
 - A standalone book has no series: return "" for series and series_index.
+- The title is the title of that one book alone. It never repeats the series name and
+  never carries the book number: for "Mistborn: The Well of Ascension (Book 2)" the
+  title is "The Well of Ascension", the series is "Mistborn", series_index is "2".
+- The series is the name of the series itself, without the word "Series", "Saga",
+  "Trilogy", "Cycle", "Books", "Collection" or "Novels" bolted on, and without a
+  leading "The" that is not part of the published name: "The Expanse Series" is
+  "The Expanse", "Mistborn Trilogy" is "Mistborn".
+- Leave edition and format notes out of every field: "Unabridged", "Audiobook",
+  "Audible Edition", "Complete", "Boxed Set", "Remastered" and the like are not part
+  of a title, a series or an author's name.
 - Return titles and names in their normal published capitalisation.
 - Respond with JSON only. No prose, no markdown fences."""
 
