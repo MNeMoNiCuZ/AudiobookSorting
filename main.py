@@ -318,16 +318,24 @@ def run_gui(app: Application) -> int:
     def sync_queue_rows(_count=0):
         """Keep row markers aligned with identification jobs still waiting."""
         nonlocal queued_rows
+        identification_workers = list(workers.queue)
+        if (workers.current is not None and not workers.current.done
+                and getattr(workers.current, 'kind', '') == 'identify'):
+            identification_workers.insert(0, workers.current)
         queued_identifications = [
-            (entry, list(getattr(worker, 'tiers', []) or []))
-            for worker in workers.queue
+            (entry, list(getattr(worker, 'tiers', []) or []),
+             entry.entry_id not in getattr(worker, 'started_entry_ids', set()))
+            for worker in identification_workers
             if getattr(worker, 'kind', '') == 'identify'
             for entry in getattr(worker, 'entries', [])]
-        current = {entry.entry_id for entry, _tiers in queued_identifications}
+        current = {entry.entry_id for entry, _tiers, _waiting
+                   in queued_identifications}
         for entry_id in queued_rows - current:
             window.set_row_progress(entry_id, None)
             window.clear_identification_queued(entry_id)
-        for entry, tiers in queued_identifications:
+        for entry, tiers, waiting in queued_identifications:
+            if not waiting:
+                continue
             window.set_row_progress(entry.entry_id, 0.0, 'Queued')
             window.clear_identification_queued(entry.entry_id)
             if len(tiers) == 1:
@@ -479,6 +487,7 @@ def run_gui(app: Application) -> int:
             if explicit:
                 entry.explicit_work_pending = True
                 app.data.update(entry)
+            window.clear_identification_queued(entry.entry_id)
             window.set_row_progress(entry.entry_id, 0.03, 'Identifying')
 
         worker.signals.entry_started.connect(started)

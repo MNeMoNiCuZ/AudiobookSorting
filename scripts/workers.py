@@ -160,6 +160,9 @@ class ResolveWorker(CancellableWorker):
         self.entries = list(entries)
         self.tiers = tiers
         self.only_incomplete = only_incomplete
+        # The controller uses this to distinguish members of a bundled identify job
+        # that are still waiting from the folder currently being processed.
+        self.started_entry_ids = set()
         using = ', '.join(tiers) if tiers else 'the configured sources'
         self.label = (f'Identify {len(self.entries)} '
                       f'book{"" if len(self.entries) == 1 else "s"} using {using}')
@@ -185,6 +188,7 @@ class ResolveWorker(CancellableWorker):
                 break
             name = folder.rsplit('\\', 1)[-1].rsplit('/', 1)[-1]
             for entry in group:
+                self.started_entry_ids.add(entry.entry_id)
                 self.signals.entry_started.emit(entry)
             # One sentence, same shape every time: what is happening, to what.
             self.signals.progress.emit(done, total, f'Identifying {name}')
