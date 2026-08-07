@@ -109,6 +109,9 @@ SCHEMA: Dict[str, tuple] = {
     'AO_TIDY_PUNCTUATION': ('true', 'bool',
                             'Last step: close the seams the removals leave - empty '
                             'brackets, stray commas and dashes.'),
+    'AO_AUTHOR_INITIAL_STYLE': ('compact', 'choice:compact|spaced',
+                                'Consecutive author initials: compact A.B. or spaced A. B.; '
+                                'single initials always get a period.'),
     'AO_ILLEGAL_CHARS': ('smart', 'choice:smart|dash|underscore|space|remove',
                          'How unsupported filename characters are replaced.'),
     'AO_WARN_DIRTY_OUTPUT': ('true', 'bool',

@@ -365,13 +365,39 @@ def test_initials_match_full_names():
     assert author_similarity('J.R.R. Tolkien', 'John Ronald Reuel Tolkien') > 0.9
 
 
-def test_warning_finds_inconsistent_author_initial_spacing():
-    spaced = BookEntry(author=Field('N. S. Wikarski', 'metadata', 0.8))
-    compact = BookEntry(author=Field('N.S. Wikarski', 'metadata', 0.8))
+@pytest.mark.parametrize('style,author,fixed', [
+    ('compact', 'A. B. Exampleton', 'A.B. Exampleton'),
+    ('spaced', 'A.B. Exampleton', 'A. B. Exampleton'),
+    ('compact', 'Alex Q Exampleton', 'Alex Q. Exampleton'),
+])
+def test_author_initial_warning_follows_the_configured_style(style, author, fixed):
+    from scripts.quality import set_author_initial_style, suggest_fix
 
-    findings = inspect_entry(spaced, [spaced, compact])
+    entry = BookEntry(author=Field(author, 'metadata', 0.8))
+    try:
+        set_author_initial_style(style)
+        findings = [finding for finding in inspect_entry(entry)
+                    if finding.kind == 'author_initials']
+        assert len(findings) == 1
+        assert suggest_fix('author', author, findings[0].kind) == fixed
+        corrected = BookEntry(author=Field(fixed, 'metadata', 0.8))
+        assert not any(finding.kind == 'author_initials'
+                       for finding in inspect_entry(corrected))
+    finally:
+        set_author_initial_style('compact')
 
-    assert any(finding.kind == 'initial_spacing' for finding in findings)
+
+@pytest.mark.parametrize('author', [
+    'Amy S. Exampleton', 'F. Scott Exampleton', 'A.B. Exampleton',
+    'Emily St. Exampleton', 'George R.R. Exampleton',
+])
+def test_valid_compact_author_initials_are_not_warned(author):
+    from scripts.quality import set_author_initial_style
+
+    set_author_initial_style('compact')
+    entry = BookEntry(author=Field(author, 'metadata', 0.8))
+    assert not any(finding.kind == 'author_initials'
+                   for finding in inspect_entry(entry))
 
 
 # --------------------------------------------------------------------- caching

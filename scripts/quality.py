@@ -47,7 +47,10 @@ _SPECIAL_SEPARATOR = re.compile(r'[|/\\"]')
 _EMBEDDED_FILE_WORD = re.compile(
     r'(?:unabridged|abridged|audiobook|mp3\d*|m4[ab]|flac)', re.I)
 _JOINED_WORDS = re.compile(r'^[A-Za-z]{24,}$')
-_INITIAL_SPACE = re.compile(r'(?<=\.)\s+')
+_SINGLE_LETTER_NAME = re.compile(r'(?<![\w.])([A-Za-z])(?![\w.])')
+_SPACED_INITIALS = re.compile(r'(?<=\b[A-Za-z]\.)\s+(?=[A-Za-z]\.)')
+_COMPACT_INITIALS = re.compile(r'(?<=\b[A-Za-z]\.)(?=[A-Za-z]\.)')
+_author_initial_style = 'compact'
 
 # How much of the field's confidence each kind of finding costs. Multiplicative, so
 # two problems on one field compound rather than cancelling out.
@@ -64,7 +67,7 @@ _PENALTY = {
     'chapter_fraction': 0.55,
     'separator': 0.70,
     'joined_words': 0.70,
-    'initial_spacing': 0.85,
+    'author_initials': 0.85,
 }
 
 # Fields where an unusual character is genuinely unusual. Titles legitimately carry
@@ -85,6 +88,25 @@ class Finding(NamedTuple):
         return _PENALTY.get(self.kind, 0.85)
 
 
+def set_author_initial_style(style: str) -> None:
+    """Choose compact consecutive initials or a space between each initial."""
+    global _author_initial_style
+    _author_initial_style = style if style in ('compact', 'spaced') else 'compact'
+
+
+def author_initial_style() -> str:
+    """Return the active style so cached warning checks include the preference."""
+    return _author_initial_style
+
+
+def format_author_initials(author: str) -> str:
+    """Add missing periods and apply the configured consecutive-initial style."""
+    text = _SINGLE_LETTER_NAME.sub(r'\1.', str(author or '').strip())
+    if _author_initial_style == 'spaced':
+        return _COMPACT_INITIALS.sub(' ', text)
+    return _SPACED_INITIALS.sub('', text)
+
+
 def inspect_value(field: str, value: str) -> List[Finding]:
     """Everything suspicious about one field's value. Empty list means it looks fine."""
     text = str(value or '').strip()
@@ -94,6 +116,13 @@ def inspect_value(field: str, value: str) -> List[Finding]:
     strict = field in _STRICT_FIELDS
     found: List[Finding] = []
     letters = [c for c in text if c.isalpha()]
+
+    if field == 'author' and format_author_initials(text) != text:
+        style = 'spaces between consecutive initials' if _author_initial_style == 'spaced' \
+            else 'no spaces between consecutive initials'
+        found.append(Finding(
+            field, 'author_initials',
+            f'Author initials should use periods and {style}'))
 
     for opener, closer in _PAIRS:
         if text.count(opener) != text.count(closer):
@@ -164,19 +193,6 @@ def inspect_entry(entry, entries=None) -> List[Finding]:
     findings: List[Finding] = []
     for name in ('author', 'series', 'title'):
         findings.extend(inspect_value(name, entry.value(name)))
-    if entries is not None:
-        author = entry.value('author').strip()
-        signature = _INITIAL_SPACE.sub('', author).casefold()
-        variants = sorted({candidate.value('author').strip()
-                           for candidate in entries
-                           if candidate.value('author').strip()
-                           and _INITIAL_SPACE.sub(
-                               '', candidate.value('author').strip()).casefold() == signature},
-                          key=str.casefold)
-        if len(variants) > 1:
-            findings.append(Finding(
-                'author', 'initial_spacing',
-                f'Author initials use inconsistent spacing: {", ".join(variants)}'))
     return findings
 
 
@@ -213,6 +229,8 @@ def suggest_fix(field: str, value: str, kind: str) -> str:
         text = _CHAPTER_FRACTION.sub(' ', text)
     elif kind == 'separator':
         text = _SPECIAL_SEPARATOR.sub(' ', text)
+    elif kind == 'author_initials':
+        text = format_author_initials(text)
     empty_brackets = re.compile(r'\(\s*\)|\[\s*\]|\{\s*\}')
     while empty_brackets.search(text):
         text = empty_brackets.sub(' ', text)

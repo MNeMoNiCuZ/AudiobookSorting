@@ -81,7 +81,8 @@ TABS: Dict[str, list] = {
         'AO_COPY_MODE', 'AO_OUTPUT_TEMPLATE', 'AO_RENAME_FILES',
         'AO_FILE_TEMPLATE', 'AO_INDEX_PAD', 'AO_RENAME_SUPPORT_FILES',
         'AO_BLOCKED_WORDS', 'AO_STRIP_PARENTHESES', 'AO_ILLEGAL_CHARS',
-        'AO_TIDY_PUNCTUATION', 'AO_COLLISION_POLICY', 'AO_WRITE_TAGS',
+        'AO_TIDY_PUNCTUATION', 'AO_AUTHOR_INITIAL_STYLE',
+        'AO_COLLISION_POLICY', 'AO_WRITE_TAGS',
         'AO_WRITE_SIDECAR',
     ],
     # Everything the "Merge chapters into one .m4b" modal asks for also lives here.

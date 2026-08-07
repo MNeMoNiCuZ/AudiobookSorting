@@ -61,6 +61,8 @@ class Application:
         set_text_filters(self.settings.get('AO_BLOCKED_WORDS'),
                          self.settings.get_bool('AO_STRIP_PARENTHESES', True),
                          self.settings.get_bool('AO_TIDY_PUNCTUATION', True))
+        from scripts.quality import set_author_initial_style
+        set_author_initial_style(self.settings.get('AO_AUTHOR_INITIAL_STYLE', 'compact'))
 
     def reload_settings(self) -> None:
         """Re-read .env after the Settings page saved, and rebuild what depends on it."""
@@ -758,6 +760,7 @@ def run_gui(app: Application) -> int:
             app.reload_settings()
             window.refresh_mode_label()
             restyle()
+            window._validate_entries()
             window.show_message('Settings saved to .env')
             if app.settings.get('AO_INPUT_DIR') != before_input:
                 input_folder_changed(before_input)

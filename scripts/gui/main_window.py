@@ -1777,7 +1777,14 @@ class MainWindow(QMainWindow):
         for column, name in EDITABLE.items():
             field = entry.get_field(name)
             item = QTableWidgetItem(str(field.value))
-            item.setForeground(QColor(self._field_colour(entry, field)))
+            from ..quality import inspect_entry
+            author_initial_warning = (
+                name == 'author'
+                and any(finding.kind == 'author_initials'
+                        for finding in inspect_entry(entry, self.entries.values())))
+            item.setForeground(QColor(
+                STATUS_TEXT['rejected'] if author_initial_warning
+                else self._field_colour(entry, field)))
             item.setToolTip(
                 f'{field.value or "(empty)"}\n'
                 f'source: {field.source or "none"}\n'
@@ -2190,6 +2197,7 @@ class MainWindow(QMainWindow):
         def refill():
             from ..quality import inspect_entry, suggest_fix
 
+            tree.setSortingEnabled(False)
             tree.clear()
             finding_count = 0
             book_count = 0
@@ -2341,6 +2349,7 @@ class MainWindow(QMainWindow):
                         lambda _checked=False, row=item: ignore_finding(row))
                     update_fixed_value(editor.text())
                     finding_count += 1
+            tree.setSortingEnabled(True)
             tree.sortItems(tree.sortColumn(), header.sortIndicatorOrder())
             summary.setText(
                 f'<b>{finding_count}</b> finding'
@@ -2518,14 +2527,10 @@ class MainWindow(QMainWindow):
                           f'{"" if len(restored) == 1 else "s"}')
 
     def _validate_entry(self, entry: BookEntry, force: bool = False) -> None:
-        from ..quality import inspect_entry
+        from ..quality import author_initial_style, inspect_entry
 
         current = {name: entry.value(name) for name in ('author', 'series', 'title')}
-        if not force and not entry.warnings_checked_values and entry.warnings:
-            # Older cache files already contain useful warnings but predate the value
-            # fingerprint. Adopt their current values without discarding that cache.
-            entry.warnings_checked_values = current
-            return
+        current['_author_initial_style'] = author_initial_style()
         if not force and current == entry.warnings_checked_values:
             return
         warnings = [finding.message

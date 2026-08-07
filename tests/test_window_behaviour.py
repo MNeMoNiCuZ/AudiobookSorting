@@ -778,6 +778,55 @@ def test_warnings_dialog_shows_book_columns_and_inline_fix(window, monkeypatch):
     assert book.explicit_work_pending
 
 
+def test_initial_warning_previews_configured_fix_and_marks_only_nonmatching_rows(
+        window, monkeypatch):
+    from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QTreeWidget
+    from scripts.gui.main_window import COL_AUTHOR
+    from scripts.gui.theme import STATUS_TEXT
+    from scripts.quality import set_author_initial_style
+
+    set_author_initial_style('compact')
+    warned = _identified('warned', 0.8)
+    warned.author = Field(value='A. B. Exampleton', source='test', confidence=0.8)
+    clean = _identified('clean', 0.8)
+    clean.author = Field(value='A.B. Exampleton', source='test', confidence=0.8)
+    _loaded(window, warned, clean)
+
+    warned_row = window._row_for(warned.entry_id)
+    clean_row = window._row_for(clean.entry_id)
+    assert window.table.item(warned_row, COL_AUTHOR).foreground().color().name() == \
+        STATUS_TEXT['rejected']
+    assert window.table.item(clean_row, COL_AUTHOR).foreground().color().name() != \
+        STATUS_TEXT['rejected']
+    assert window._suggested_warning_fixes(warned) == [
+        ('author', 'A.B. Exampleton')]
+
+    shown = []
+
+    def capture(dialog):
+        dialog.show()
+        QApplication.processEvents()
+        shown.append(dialog)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, 'exec', capture)
+    window._show_warnings_dialog()
+
+    tree = shown[0].findChild(QTreeWidget)
+    finding = tree.topLevelItem(0)
+    preview = tree.itemWidget(finding, 5)
+    assert isinstance(preview, QLineEdit)
+    assert preview.text() == 'A.B. Exampleton'
+    fix_button = tree.itemWidget(finding, 6)
+    assert fix_button.isEnabled()
+    fix_button.click()
+
+    assert warned.value('author') == 'A.B. Exampleton'
+    assert not any('initials' in warning for warning in warned.warnings)
+    assert window.table.item(warned_row, COL_AUTHOR).foreground().color().name() != \
+        STATUS_TEXT['rejected']
+
+
 def test_warnings_table_redistributes_space_after_column_resize(window, monkeypatch):
     from PyQt6.QtWidgets import QDialog, QTreeWidget
 

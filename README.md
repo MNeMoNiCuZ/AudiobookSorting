@@ -325,6 +325,9 @@ Also available:
   `Mistborn - Book 1`), brackets left half-open, runs of commas and dashes, a space in
   front of a comma, punctuation dangling at either end. Punctuation that is part of the
   name is left alone, so `Spider-Man: No Way Home` and `Jr.` survive. On by default.
+- **`AO_AUTHOR_INITIAL_STYLE`** - controls consecutive author initials. `compact`, the
+  default, writes `A.B. Exampleton`; `spaced` writes `A. B. Exampleton`. A standalone
+  initial elsewhere in a name always receives its period.
 - **`AO_RENAME_SUPPORT_FILES`** — rename the files that travel with the book (cover art,
   `.epub`, `.pdf`, `.nfo`, `.cue`, `.txt`) to match the audio. Only when a file is the
   only one of its extension in the folder, because two `.jpg`s renamed to one stem would
