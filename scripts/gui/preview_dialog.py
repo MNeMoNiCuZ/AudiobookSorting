@@ -22,6 +22,32 @@ from .theme import (ACCENT, STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT,
                     table_modal_width)
 
 COLUMNS = ['Destination', 'Operation', 'Source']
+PREVIEW_WIDTHS_KEY = 'AO_UI_PREVIEW_COLUMN_WIDTHS'
+
+
+def restore_preview_widths(tree: QTreeWidget, settings) -> None:
+    """Restore shared preview widths, with a readable Operation default."""
+    saved = (settings.get(PREVIEW_WIDTHS_KEY) if settings is not None else '') or ''
+    try:
+        widths = [int(value) for value in saved.split(',')]
+    except ValueError:
+        widths = []
+    if len(widths) == len(COLUMNS) and all(value >= 40 for value in widths):
+        for index, width in enumerate(widths):
+            tree.setColumnWidth(index, width)
+    else:
+        tree.setColumnWidth(1, 130)
+
+
+def save_preview_widths(tree: QTreeWidget, settings) -> None:
+    if settings is None:
+        return
+    widths = [tree.columnWidth(index) for index in range(len(COLUMNS))]
+    settings.set(PREVIEW_WIDTHS_KEY, ','.join(str(width) for width in widths))
+    try:
+        settings.save()
+    except OSError:
+        pass
 
 
 class PreviewDialog(QDialog):
@@ -73,10 +99,12 @@ class PreviewDialog(QDialog):
         self.tree.setUniformRowHeights(True)
         self.tree.header().setStretchLastSection(True)
         self.tree.setColumnWidth(0, 760)
-        self.tree.setColumnWidth(1, 100)
         layout.addWidget(self.tree, stretch=1)
 
         self._build_tree()
+        restore_preview_widths(self.tree, self.settings)
+        self.tree.header().sectionResized.connect(
+            lambda *_: save_preview_widths(self.tree, self.settings))
 
         buttons = QHBoxLayout()
         self.show_files = QCheckBox('Show individual files')

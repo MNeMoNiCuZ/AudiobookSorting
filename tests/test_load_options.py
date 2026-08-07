@@ -91,6 +91,41 @@ def test_decisions_are_kept_or_dropped_as_asked():
     assert dropped.status == STATUS_PENDING
 
 
+def test_dropping_decisions_does_not_depend_on_clearing_a_value():
+    entry = book(author=('Sanderson', 'audnexus', 0.90))
+    entry.status = STATUS_APPROVED
+
+    keep = KeepOptions(manual=True, above=75, decisions=False)
+    promised = plan_load([entry], keep)
+    done = apply_keep([entry], keep)
+
+    assert entry.value('author') == 'Sanderson'
+    assert entry.status == STATUS_PENDING
+    assert promised.unreviewed == done.unreviewed == 1
+
+
+def test_same_entry_id_in_another_input_root_does_not_resume_saved_state(tmp_path):
+    from scripts.data_manager import DataManager
+
+    old_root = tmp_path / 'old'
+    new_root = tmp_path / 'new'
+    saved = book('same', author=('Sanderson', 'audnexus', 0.90))
+    saved.folder = str(old_root / 'same')
+    saved.status = STATUS_APPLIED
+    saved.applied_path = str(tmp_path / 'output' / 'same')
+
+    data = DataManager(save_file=tmp_path / 'entries.json', autosave_seconds=0)
+    data.entries[saved.entry_id] = saved
+    scanned = book('same')
+    scanned.folder = str(new_root / 'same')
+
+    merged = data.merge_scanned([scanned], resume=True, input_root=new_root)
+
+    assert merged == [scanned]
+    assert merged[0].status == STATUS_PENDING
+    assert merged[0].applied_path == ''
+
+
 def test_books_already_written_to_disk_are_left_alone():
     """Clearing the author of a book filed under that author breaks undo."""
     entry = book(author=('Sanderson', 'guess', 0.25))

@@ -26,6 +26,8 @@ class WorkerSignals(QObject):
     # chapters, so the bar can move at the rate the audio is actually converting
     # instead of jumping once per finished chapter. Whole numbers still arrive intact.
     progress = pyqtSignal(float, float, str)
+    entry_started = pyqtSignal(object)       # BookEntry
+    entry_progress = pyqtSignal(object, float, str)  # entry, fraction, tier
     entry_done = pyqtSignal(object)          # BookEntry
     message = pyqtSignal(str)
     error = pyqtSignal(str)
@@ -182,20 +184,30 @@ class ResolveWorker(CancellableWorker):
             if self._cancelled:
                 break
             name = folder.rsplit('\\', 1)[-1].rsplit('/', 1)[-1]
+            for entry in group:
+                self.signals.entry_started.emit(entry)
             # One sentence, same shape every time: what is happening, to what.
             self.signals.progress.emit(done, total, f'Identifying {name}')
             try:
                 if len(group) == 1:
                     entry = group[0]
                     self.resolver.resolve(entry, tiers=self.tiers,
-                                          should_cancel=self.should_cancel)
+                                          should_cancel=self.should_cancel,
+                                          on_tier=lambda name, done_, total_, e=entry:
+                                          self.signals.entry_progress.emit(
+                                              e, done_ / total_ if total_ else 0.0,
+                                              name))
                     self.signals.entry_done.emit(entry)
                     done += 1
                     self.signals.progress.emit(
                         done, total, f'Identified {entry.value("title") or name}')
                 else:
                     self.resolver.resolve_folder(group, tiers=self.tiers,
-                                                 should_cancel=self.should_cancel)
+                                                 should_cancel=self.should_cancel,
+                                                 on_tier=lambda name, done_, total_:
+                                                 [self.signals.entry_progress.emit(
+                                                     e, done_ / total_ if total_ else 0.0,
+                                                     name) for e in group])
                     for entry in group:
                         self.signals.entry_done.emit(entry)
                         done += 1

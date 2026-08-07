@@ -80,6 +80,29 @@ def test_worse_source_does_not_overwrite_better():
     assert entry.value('title') == 'Real Title'
 
 
+def test_high_scoring_database_match_replaces_weaker_metadata(settings):
+    from scripts.resolver import Resolver
+
+    entry = BookEntry(entry_id='book')
+    entry.set_field('author', 'Wrong Metadata Author', 'metadata')
+    entry.set_field('title', 'The Right Book', 'metadata')
+    resolver = Resolver(settings)
+    resolver.api.search = lambda *args, **kwargs: {
+        'author': 'Correct Database Author', 'title': 'The Right Book',
+        'source': 'googlebooks', 'score': 0.96,
+    }
+    resolver.api.last_sources = ['googlebooks']
+    resolver.api.last_candidates = []
+    resolver.api.last_by_source = {}
+    resolver.api.last_errors = {}
+
+    resolver._tier_api(entry, sources=['googlebooks'], forced=True)
+
+    assert entry.value('author') == 'Correct Database Author'
+    assert entry.author.source == 'googlebooks'
+    assert entry.author.confidence == pytest.approx(0.96)
+
+
 def test_agreement_raises_confidence():
     """Two independent tiers agreeing is stronger evidence than either alone (#9)."""
     entry = BookEntry()

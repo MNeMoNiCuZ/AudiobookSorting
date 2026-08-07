@@ -92,6 +92,9 @@ SELECTION_BORDER = '#ffffff'
 # The stripe/pill hue per status, and the muted fill used behind the pill.
 STATUS_HUES = {
     'pending': TEXT_FAINT,
+    'likely': '#3ddc84',
+    'uncertain': '#ffc233',
+    'unlikely': '#ff5c5c',
     'approved': '#5fd39a',
     'rejected': '#ef7583',
     'applied': '#5aa9e6',
@@ -101,6 +104,9 @@ STATUS_HUES = {
 # Optional full-row wash. Same hues, dropped to near-background so text stays legible.
 STATUS_COLORS = {
     'pending': BG_BASE,
+    'likely': BG_BASE,
+    'uncertain': BG_BASE,
+    'unlikely': BG_BASE,
     'approved': '#1e3628',
     'rejected': '#3a2126',
     'applied': '#1b2f3c',

@@ -606,7 +606,7 @@ def test_confidence_setting_is_not_on_the_main_filter_row(window):
     assert not hasattr(window, 'confidence_score')
 
 
-def test_confidence_bands_do_not_replace_the_review_status(window):
+def test_confidence_bands_are_the_status_until_reviewed(window):
     from scripts.gui.delegates import ROLE_STATUS
 
     settings = window.settings
@@ -616,16 +616,23 @@ def test_confidence_bands_do_not_replace_the_review_status(window):
              _identified('red', 0.30)]
     _loaded(window, *books)
 
+    displayed = {}
     for row in range(window.table.rowCount()):
-        assert window.table.item(row, 7).text() == 'Pending'
-        assert window.table.item(row, 0).data(ROLE_STATUS) == 'pending'
+        entry_id = window._entry_at(row).entry_id
+        displayed[entry_id] = (window.table.item(row, 7).text(),
+                               window.table.item(row, 0).data(ROLE_STATUS))
+    assert displayed == {
+        'green': ('Likely', 'likely'),
+        'amber': ('Uncertain', 'uncertain'),
+        'red': ('Unlikely', 'unlikely'),
+    }
 
 
-def test_status_filter_lists_review_statuses_not_confidence_bands(window):
+def test_status_filter_lists_confidence_until_reviewed(window):
     items = [window.status_filter.itemText(index)
              for index in range(window.status_filter.count())]
-    assert items == ['All statuses', 'Pending', 'Approved', 'Rejected', 'Unsure',
-                     'Applied', 'Duplicate']
+    assert items == ['All statuses', 'Likely', 'Uncertain', 'Unlikely', 'Approved',
+                     'Rejected', 'Applied', 'Duplicate']
 
 
 def test_unsure_rows_have_no_status_background_tint():
@@ -637,7 +644,7 @@ def test_unsure_rows_have_no_status_background_tint():
 def test_confidence_filter_lists_coloured_bands_and_custom(window):
     items = [window.confidence_filter.itemText(index)
              for index in range(window.confidence_filter.count())]
-    assert items == ['Any confidence', 'Confident', 'Unsure', 'Doubtful',
+    assert items == ['Any confidence', 'Likely', 'Uncertain', 'Unlikely',
                      'Custom threshold...']
     for index in (1, 2, 3):
         assert window.confidence_filter.itemData(
@@ -651,7 +658,7 @@ def test_confidence_filter_uses_the_configured_band_boundaries(window):
              _identified('low', 0.30)]
     _loaded(window, *books)
 
-    expected = {'Confident': {'high'}, 'Unsure': {'middle'}, 'Doubtful': {'low'}}
+    expected = {'Likely': {'high'}, 'Uncertain': {'middle'}, 'Unlikely': {'low'}}
     for label, visible in expected.items():
         window.confidence_filter.setCurrentText(label)
         window._apply_filters()

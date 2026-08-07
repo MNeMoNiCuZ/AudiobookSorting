@@ -181,7 +181,8 @@ class DataManager:
         with self._lock:
             for entry in scanned:
                 existing = self.entries.get(entry.entry_id)
-                if existing is not None and resume:
+                if (existing is not None and resume
+                        and self._belongs_to_root(existing, input_root)):
                     # Refresh what's derived from disk, keep everything decided.
                     existing.folder = entry.folder
                     existing.relative_path = entry.relative_path
@@ -202,6 +203,18 @@ class DataManager:
 
         self.mark_dirty()
         return result
+
+    @staticmethod
+    def _belongs_to_root(entry: BookEntry, input_root: Optional[Path]) -> bool:
+        """Whether saved state belongs to the input tree currently being scanned."""
+        if input_root is None:
+            return True
+        try:
+            root = Path(input_root).resolve()
+            folder = Path(entry.folder).resolve()
+        except OSError:
+            return False
+        return folder == root or root in folder.parents
 
     def _stale_ids(self, seen: Dict[str, BookEntry],
                    input_root: Optional[Path]) -> List[str]:

@@ -111,8 +111,8 @@ def _assess(entry: BookEntry, keep: KeepOptions,
             plan.tally(name)  # an empty field still gets a row in the table
     if losing:
         plan.books += 1
-        if entry.status != STATUS_PENDING and not keep.decisions:
-            plan.unreviewed += 1
+    if entry.status != STATUS_PENDING and not keep.decisions:
+        plan.unreviewed += 1
     return losing
 
 
@@ -127,12 +127,18 @@ def plan_load(entries: Iterable[BookEntry], keep: KeepOptions) -> LoadPlan:
 def apply_keep(entries: Iterable[BookEntry], keep: KeepOptions) -> LoadPlan:
     """Throw away everything `keep` does not protect. Returns what was done.
 
-    An entry that loses nothing is not touched at all - not its trace, not its status -
-    so a load with everything ticked is exactly the old resumable scan.
+    Metadata that loses nothing is not touched. Review decisions are handled
+    independently, because a status can be stale even when every value is retained.
     """
     plan = LoadPlan()
     for entry in entries:
         losing = _assess(entry, keep, plan)
+        if losing is None:
+            continue
+
+        if not keep.decisions and entry.status != STATUS_PENDING:
+            entry.status = STATUS_PENDING  # already counted by _assess when applicable
+
         if not losing:
             continue
 
@@ -148,8 +154,6 @@ def apply_keep(entries: Iterable[BookEntry], keep: KeepOptions) -> LoadPlan:
         entry.quality_penalties = {}
         entry.warnings = []
         entry.resolved = False
-        if not keep.decisions and entry.status != STATUS_PENDING:
-            entry.status = STATUS_PENDING  # already counted by _assess
         entry.log('user', f'Cleared on load: {", ".join(losing)}')
     return plan
 

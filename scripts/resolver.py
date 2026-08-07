@@ -119,7 +119,8 @@ class Resolver:
         return names, api_sources
 
     def resolve(self, entry: BookEntry, tiers: Optional[List[str]] = None,
-                should_cancel: Optional[CancelCheck] = None) -> BookEntry:
+                should_cancel: Optional[CancelCheck] = None,
+                on_tier: Optional[Callable[[str, int, int], None]] = None) -> BookEntry:
         """Run the chain over one entry, in place. Returns the same entry."""
         tiers, api_sources = self._split_tiers(tiers)
         steps = [
@@ -131,15 +132,17 @@ class Resolver:
             ('search', self.enable_search, self._tier_search),
             ('llm', self.enable_llm, self._tier_llm),
         ]
+        selected = [(name, enabled, handler) for name, enabled, handler in steps
+                    if (name in tiers if tiers is not None else enabled)]
+        tier_total = len(selected)
+        tier_done = 0
 
-        for name, enabled, handler in steps:
+        for name, enabled, handler in selected:
             if should_cancel and should_cancel():
                 entry.log('cancelled', f'Stopped before the {name} tier')
                 return entry
-            if tiers is not None and name not in tiers:
-                continue
-            if tiers is None and not enabled:
-                continue
+            if on_tier is not None:
+                on_tier(name, tier_done, tier_total)
             # This tier is about to speak, so retire what it said on the last run -
             # otherwise re-running appends a duplicate of the same paragraph.
             entry.begin_tier(name)
@@ -155,19 +158,27 @@ class Resolver:
                                 f'confidence, and tier {tier_number} is past the '
                                 f'"always search to tier {self.always_to_tier}" '
                                 f'setting. Run this source from the panel to force it.')
+                tier_done += 1
+                if on_tier is not None:
+                    on_tier(name, tier_done, tier_total)
                 continue
             try:
                 handler(entry)
             except Exception as exc:
                 self.logger.exception('%s tier failed for %s', name, entry.entry_id)
                 entry.log(name, f'Failed: {exc}')
+            tier_done += 1
+            if on_tier is not None:
+                on_tier(name, tier_done, tier_total)
 
         entry.resolved = True
         self._finalise(entry)
         return entry
 
     def resolve_folder(self, entries: List[BookEntry], tiers: Optional[List[str]] = None,
-                       should_cancel: Optional[CancelCheck] = None) -> List[BookEntry]:
+                       should_cancel: Optional[CancelCheck] = None,
+                       on_tier: Optional[Callable[[str, int, int], None]] = None
+                       ) -> List[BookEntry]:
         """Resolve every entry in one folder, sharing what we learn between them (#11).
 
         `tiers` overrides the enabled-tier settings for this run, which is what the
@@ -181,16 +192,37 @@ class Resolver:
         def wanted(name: str, enabled: bool) -> bool:
             return name in tiers if tiers is not None else enabled
 
+        selected = [name for name, enabled in (
+            ('metadata', self.enable_metadata), ('regex', self.enable_regex),
+            ('api', self.enable_api), ('search', self.enable_search),
+            ('llm', self.enable_llm)) if wanted(name, enabled)]
+        completed_tiers = set()
+
+        def report(name: str, finished: bool = False) -> None:
+            if finished:
+                completed_tiers.add(name)
+            if on_tier is not None:
+                on_tier(name, len(completed_tiers), len(selected))
+
         # Local tiers first, per entry - they're free and inform the shared step.
         for entry in entries:
             if should_cancel and should_cancel():
                 return entries
             if wanted('metadata', self.enable_metadata):
+                if entry is entries[0]:
+                    report('metadata')
                 entry.begin_tier('metadata')
                 self._tier_metadata(entry)
             if wanted('regex', self.enable_regex):
+                if entry is entries[0]:
+                    report('regex')
                 entry.begin_tier('regex')
                 self._tier_regex(entry)
+
+        if 'metadata' in selected:
+            report('metadata', True)
+        if 'regex' in selected:
+            report('regex', True)
 
         self._share_within_folder(entries)
 
@@ -201,8 +233,10 @@ class Resolver:
         if (needs_help and wanted('llm', self.enable_llm) and self.folder_reasoning
                 and len(entries) > 1 and not self._llm_failed):
             if not (should_cancel and should_cancel()):
+                report('llm')
                 self._tier_llm_folder(entries)
                 self._share_within_folder(entries)
+                report('llm', True)
 
         # Then per-entry network tiers. An explicit request (`tiers` given) runs them
         # whatever we already know; only the automatic chain is allowed to skip.
@@ -212,19 +246,29 @@ class Resolver:
                 return entries
             if forced or not self._is_satisfied(entry):
                 if wanted('api', self.enable_api):
+                    if entry is entries[0]:
+                        report('api')
                     entry.begin_tier('api')
                     self._tier_api(entry, sources=api_sources, forced=forced)
                 if wanted('search', self.enable_search) and (
                         forced or not self._is_satisfied(entry)):
+                    if entry is entries[0]:
+                        report('search')
                     entry.begin_tier('search')
                     self._tier_search(entry)
                 if (wanted('llm', self.enable_llm)
                         and (forced or not self._is_satisfied(entry))
                         and not self.folder_reasoning):
+                    if entry is entries[0]:
+                        report('llm')
                     entry.begin_tier('llm')
                     self._tier_llm(entry)
             entry.resolved = True
             self._finalise(entry)
+
+        for name in selected:
+            if name not in completed_tiers:
+                report(name, True)
 
         self._share_within_folder(entries)
         return entries
@@ -358,7 +402,13 @@ class Resolver:
             return
 
         source = result.get('source', 'api')
-        changed, held = self._apply_fields(entry, result, source)
+        # The candidate score is the confidence in this particular match. Using only
+        # a source-wide default meant a 96% Google Books or iTunes match could lose to
+        # unrelated 80% embedded metadata, even though the panel showed the database
+        # result as stronger. Manual edits remain protected by BookEntry.set_field.
+        match_confidence = float(result.get('score', 0.0) or 0.0)
+        changed, held = self._apply_fields(
+            entry, result, source, match_confidence or None)
         if result.get('cover_url'):
             entry.raw_tags.setdefault('_cover_url', result['cover_url'])
         summary = (f'{source} matched "{result.get("title", "")}" by '

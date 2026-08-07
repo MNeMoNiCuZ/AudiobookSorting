@@ -272,6 +272,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self.preview_provider = None
         self.entries: Dict[str, BookEntry] = {}
         self.row_ids: List[str] = []
         self._updating = False
@@ -449,8 +450,8 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 0, 0, 0)
 
         self.status_filter = self._filter_combo(
-            ['All statuses', 'Pending', 'Approved', 'Rejected', 'Unsure', 'Applied',
-             'Duplicate'],
+            ['All statuses', 'Likely', 'Uncertain', 'Unlikely', 'Approved',
+             'Rejected', 'Applied', 'Duplicate'],
             'Show only rows with this review status')
         row.addWidget(self.status_filter)
 
@@ -463,7 +464,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.missing_filter)
 
         self.confidence_filter = self._filter_combo(
-            ['Any confidence', 'Confident', 'Unsure', 'Doubtful',
+            ['Any confidence', 'Likely', 'Uncertain', 'Unlikely',
              'Custom threshold...'],
             'Show rows in a configured confidence colour band. '
             '"Custom threshold" asks for your own number.')
@@ -1532,10 +1533,11 @@ class MainWindow(QMainWindow):
         conf_item.setToolTip('How sure the identification is, averaged over the fields')
         self.table.setItem(row, COL_CONF, conf_item)
 
-        status = QTableWidgetItem(pretty_status(entry.status))
+        status_key, status_label = self._display_status(entry)
+        status = QTableWidgetItem(status_label)
         status.setData(ROLE_KIND, KIND_STATUS)
         status.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        status.setToolTip(f'Status: {pretty_status(entry.status)}. The stripe '
+        status.setToolTip(f'Status: {status_label}. The stripe '
                           f'down the left of '
                           f'the row and this pill use the same colour.')
         self.table.setItem(row, COL_STATUS, status)
@@ -1546,7 +1548,7 @@ class MainWindow(QMainWindow):
         for column in range(len(COLUMNS)):
             item = self.table.item(row, column)
             if item is not None:
-                item.setData(ROLE_STATUS, entry.status)
+                item.setData(ROLE_STATUS, status_key)
 
         self._updating = previous
 
@@ -1591,6 +1593,17 @@ class MainWindow(QMainWindow):
         if self.settings.get_bool('AO_UI_COLOR_BY_SOURCE', False):
             return source_color(field.source)
         return TEXT
+
+    def _display_status(self, entry: BookEntry) -> tuple[str, str]:
+        """Visible status: confidence until the user or filesystem decides it."""
+        if entry.status not in (STATUS_PENDING, STATUS_RISKY):
+            return entry.status, pretty_status(entry.status)
+        confidence = entry.confidence()
+        confident = self.settings.get_float('AO_UI_CONFIDENT_THRESHOLD', 0.80)
+        doubtful = self.settings.get_float('AO_UI_DOUBTFUL_THRESHOLD', 0.50)
+        key = ('likely' if confidence >= confident else
+               'uncertain' if confidence >= doubtful else 'unlikely')
+        return key, pretty_status(key)
 
     def _files_summary(self, entry: BookEntry):
         """(filename, path-from-root) - the delegate draws them as two lines.
@@ -1766,7 +1779,7 @@ class MainWindow(QMainWindow):
                                      entry.value('title'), entry.entry_id]).lower()
                 show = text in haystack
             if show and status != 'All statuses':
-                show = pretty_status(entry.status) == status
+                show = self._display_status(entry)[1] == status
             if show and missing != 'Any completeness':
                 gaps = entry.missing_fields()
                 if missing == 'Missing any field':
@@ -1784,11 +1797,11 @@ class MainWindow(QMainWindow):
                     'AO_UI_CONFIDENT_THRESHOLD', 0.80)
                 doubtful = self.settings.get_float(
                     'AO_UI_DOUBTFUL_THRESHOLD', 0.50)
-                if confidence == 'Confident':
+                if confidence == 'Likely':
                     show = value >= confident
-                elif confidence == 'Unsure':
+                elif confidence == 'Uncertain':
                     show = doubtful <= value < confident
-                elif confidence == 'Doubtful':
+                elif confidence == 'Unlikely':
                     show = value < doubtful
                 elif confidence.startswith('At least'):
                     show = value >= self._custom_confidence
@@ -2125,7 +2138,8 @@ class MainWindow(QMainWindow):
             self.show_message('Select a row first')
             return
         name, _, source = tier.partition(':')
-        self.show_message(f'Asking {source or name} about this book...')
+        action = 'Queued' if self._busy else 'Asking'
+        self.show_message(f'{action} {source or name} for this book...')
         self.resolve_requested.emit(entries[:1], [tier])
 
     def _label_for(self, entry: BookEntry) -> str:
@@ -2236,7 +2250,7 @@ class MainWindow(QMainWindow):
             self._relative_folder(entry),
             entry.value('author'), entry.value('series'),
             str(entry.value('series_index')), entry.value('title'),
-            f'{entry.confidence():.0%}', pretty_status(entry.status),
+            f'{entry.confidence():.0%}', self._display_status(entry)[1],
         ] for entry in entries]
 
         # Pad the columns so the table is readable as plain text too - Markdown does
@@ -2934,8 +2948,13 @@ class MainWindow(QMainWindow):
             # only reciting them and sending you off to Settings to fix one.
             from .apply_dialog import ApplyDialog
 
-            dialog = ApplyDialog(len(entries), self.settings, parent=self)
+            preview_result = (self.preview_provider(entries[0])
+                              if self.preview_provider is not None else None)
+            dialog = ApplyDialog(entries, self.settings, preview_result=preview_result,
+                                 parent=self)
             dialog.settings_requested.connect(self.settings_requested_on_tab.emit)
+            dialog.preview_requested.connect(
+                lambda: self.apply_requested.emit(entries, True))
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             # The dialog writes straight to .env, so the controller has to rebuild

@@ -306,13 +306,30 @@ def run_gui(app: Application) -> int:
         app.data.update(entry)
 
     window.entry_changed = persist
+    window.preview_provider = lambda entry: app.file_ops.preview(entry)
     # A setting changed directly from the main window, so rebuild the components that
     # keep their own settings-derived state.
     window.settings_changed.connect(app.reload_settings)
     # The queue view reads the manager directly rather than being fed a copy, so the
     # badge, the toolbar count and the Queue window can never disagree about it.
     window.queue_provider = workers.status
-    workers.on_queue_change = lambda _count: window.show_queue(workers.labels())
+    queued_rows = set()
+
+    def sync_queue_rows(_count=0):
+        """Keep row markers aligned with identification jobs still waiting."""
+        nonlocal queued_rows
+        current = {entry.entry_id
+                   for worker in workers.queue
+                   if getattr(worker, 'kind', '') == 'identify'
+                   for entry in getattr(worker, 'entries', [])}
+        for entry_id in queued_rows - current:
+            window.set_row_progress(entry_id, None)
+        for entry_id in current:
+            window.set_row_progress(entry_id, 0.0, 'Queued')
+        queued_rows = current
+        window.show_queue(workers.labels())
+
+    workers.on_queue_change = sync_queue_rows
     window.queue_remove_requested.connect(lambda index: (
         workers.remove(index), window.show_queue(workers.labels()),
         window.show_message('Removed a queued job')))
@@ -452,7 +469,21 @@ def run_gui(app: Application) -> int:
     def do_resolve(entries, tiers):
         worker = ResolveWorker(app.resolver, entries, tiers=list(tiers))
 
+        worker.signals.entry_started.connect(
+            lambda entry: window.set_row_progress(
+                entry.entry_id, 0.03, 'Identifying'))
+        worker.signals.entry_done.connect(
+            lambda entry: window.set_row_progress(entry.entry_id, None))
+        tier_labels = {'metadata': 'Reading metadata', 'regex': 'Parsing filename',
+                       'api': 'Checking book databases',
+                       'search': 'Searching the web', 'llm': 'Asking the model'}
+        worker.signals.entry_progress.connect(
+            lambda entry, fraction, tier: window.set_row_progress(
+                entry.entry_id, fraction, tier_labels.get(tier, tier.title())))
+
         def done(result):
+            for entry in entries:
+                window.set_row_progress(entry.entry_id, None)
             app.data.mark_dirty()
             window.set_busy(workers.busy)
             window.refresh_stats()
@@ -461,6 +492,12 @@ def run_gui(app: Application) -> int:
             # now, in one dialog, rather than silently discarded or silently applied.
             window.review_overwrites(entries)
 
+        worker.signals.error.connect(
+            lambda _text: [window.set_row_progress(entry.entry_id, None)
+                           for entry in entries])
+        worker.signals.cancelled.connect(
+            lambda: [window.set_row_progress(entry.entry_id, None)
+                     for entry in entries])
         worker.signals.finished.connect(done)
         wire(worker)
 

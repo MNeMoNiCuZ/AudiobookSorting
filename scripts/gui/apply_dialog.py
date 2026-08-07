@@ -17,21 +17,25 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QRadioButton, QVBoxLayout,
+    QRadioButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
-from .theme import ACCENT, STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT
+from .preview_dialog import (COLUMNS, restore_preview_widths,
+                             save_preview_widths)
+from .theme import ACCENT, STATUS_TEXT, TEXT_DIM, TEXT_FAINT
 
 
 class ApplyDialog(QDialog):
     """Confirm an apply, and edit the settings that decide what it does."""
 
     settings_requested = pyqtSignal(str)
+    preview_requested = pyqtSignal()
 
-    def __init__(self, count: int, settings, parent=None):
+    def __init__(self, entries, settings, preview_result=None, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.count = count
+        self.entries = list(entries)
+        self.count = len(self.entries)
 
         self.setWindowTitle('Write approved books to disk')
         self.setMinimumWidth(700)
@@ -53,6 +57,9 @@ class ApplyDialog(QDialog):
         self.summary.setStyleSheet(
             f'color: {TEXT_DIM}; border-left: 2px solid {ACCENT}; padding: 6px 10px;')
         layout.addWidget(self.summary)
+
+        if preview_result is not None:
+            layout.addWidget(self._build_preview(preview_result), stretch=1)
 
         undo = QLabel('Undo (Ctrl+Z) reverses this, and the History window can walk it '
                       'back further.')
@@ -152,6 +159,30 @@ class ApplyDialog(QDialog):
         column.addWidget(self.example)
         return box
 
+    def _build_preview(self, result) -> QGroupBox:
+        box = QGroupBox('One-book preview')
+        column = QVBoxLayout(box)
+        self.preview_tree = QTreeWidget()
+        self.preview_tree.setHeaderLabels(COLUMNS)
+        self.preview_tree.setAlternatingRowColors(True)
+        self.preview_tree.setUniformRowHeights(True)
+        for operation in result.operations:
+            self.preview_tree.addTopLevelItem(QTreeWidgetItem([
+                str(operation['destination']), operation['operation'],
+                str(operation['source'])]))
+        restore_preview_widths(self.preview_tree, self.settings)
+        self.preview_tree.header().sectionResized.connect(
+            lambda *_: save_preview_widths(self.preview_tree, self.settings))
+        column.addWidget(self.preview_tree)
+
+        full = QPushButton('Open full preview...')
+        full.setFlat(True)
+        full.setToolTip('Preview every approved book without writing any files')
+        full.setStyleSheet(f'color: {ACCENT}; text-align: left;')
+        full.clicked.connect(self.preview_requested.emit)
+        column.addWidget(full)
+        return box
+
     # ------------------------------------------------------------- load / save
 
     def _load(self) -> None:
@@ -189,17 +220,13 @@ class ApplyDialog(QDialog):
         books = f'{self.count} approved book' + ('' if self.count == 1 else 's')
         self.headline.setText(f'<b>{verb} {books}</b> into your output folder?')
         self.go.setText(f'{verb} {self.count}')
-        self.go.setProperty('danger', not copying)
-        self.go.style().unpolish(self.go)
-        self.go.style().polish(self.go)
 
         destination = self.settings.get('AO_OUTPUT_DIR')
         self.summary.setText(
             f'Destination: {destination}<br>'
             + ('Originals stay exactly where they are.' if copying else
                f'<span style="color:{STATUS_TEXT["rejected"]}">The originals are '
-               f'removed from the input folder.</span>')
-            + '<br>Your manual edits are included.')
+               f'removed from the input folder.</span>'))
 
         values = {'author': 'Brandon Sanderson', 'series': 'Mistborn',
                   'series_index': 2, 'title': 'The Well of Ascension',
