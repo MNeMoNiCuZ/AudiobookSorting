@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 
 from ..models import BookEntry
 from ..paths import render_template, sanitize_component, unique_path
+from .table import ColumnTable
 from .theme import ACCENT, STATUS_TEXT, TEXT_DIM, table_modal_width
 
 COLUMNS = ['BOOK', 'CHAPTERS', 'WILL BE CALLED', 'WHERE']
@@ -114,7 +115,7 @@ class MergeDialog(QDialog):
 
         layout.addWidget(self._build_options())
 
-        self.table = QTableWidget(0, len(COLUMNS))
+        self.table = ColumnTable(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)

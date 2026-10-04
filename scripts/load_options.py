@@ -66,6 +66,11 @@ class LoadPlan:
     kept: int = 0             # values that would survive
     unreviewed: int = 0       # books that would return to Pending
     skipped_applied: int = 0  # books left alone because they are already saved
+    # Cleared values the load's own tag-and-filename pass cannot produce again: from a
+    # database, the web, the model, or typed by you. This is work, and it is lost.
+    worked: int = 0
+    typed: int = 0            # of those, values you typed yourself
+    decisions: int = 0        # Approved / Rejected that would go back to Pending
     # The same counts split by field, because "31 values" is a number you cannot act
     # on and "every series number goes" is one you can.
     per_field: Dict[str, Tally] = dataclass_field(default_factory=dict)
@@ -75,6 +80,13 @@ class LoadPlan:
 
     def is_destructive(self) -> bool:
         return bool(self.cleared or self.unreviewed)
+
+    def loses_work(self) -> bool:
+        return bool(self.worked or self.decisions)
+
+
+# Where a value came from when a load can simply read it again.
+REREAD_SOURCES = ('', 'metadata', 'regex', 'guess')
 
 
 def is_applied(entry: BookEntry) -> bool:
@@ -104,6 +116,10 @@ def _assess(entry: BookEntry, keep: KeepOptions,
             losing.append(name)
             plan.cleared += 1
             plan.tally(name).cleared += 1
+            if not value.is_empty() and value.source not in REREAD_SOURCES:
+                plan.worked += 1
+                if value.source == 'user':
+                    plan.typed += 1
         elif not value.is_empty():
             plan.kept += 1
             plan.tally(name).kept += 1
@@ -113,6 +129,8 @@ def _assess(entry: BookEntry, keep: KeepOptions,
         plan.books += 1
     if entry.status != STATUS_PENDING and not keep.decisions:
         plan.unreviewed += 1
+        if entry.status in (STATUS_APPROVED, 'rejected'):
+            plan.decisions += 1
     return losing
 
 
@@ -173,3 +191,20 @@ def unsaved_entries(entries: Iterable[BookEntry]) -> List[BookEntry]:
                 and entry.status in (STATUS_PENDING, STATUS_RISKY)):
             out.append(entry)
     return out
+
+
+def entries_without_files(entries: Iterable[BookEntry]) -> List[BookEntry]:
+    """Books in the list with not one of their audio files still on disk.
+
+    Most are books already applied: the move worked, but the record still names the
+    folder they came from. The rest were deleted or moved by hand. Either way there is
+    nothing left to review, and nothing a load would ever bring back.
+    """
+    empty = []
+    for entry in entries:
+        try:
+            if not any(path.is_file() for path in entry.absolute_files()):
+                empty.append(entry)
+        except OSError:
+            continue
+    return empty

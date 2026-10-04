@@ -12,11 +12,13 @@ import logging
 import re
 import threading
 import time
+from collections import Counter
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
 from .models import normalize
+from .quality import has_multiple_authors
 
 logger = logging.getLogger(__name__)
 
@@ -46,19 +48,45 @@ def similarity(a: str, b: str) -> float:
     """
     if not a or not b:
         return 0.0
-    tokens_a = set(normalize(a).split())
-    tokens_b = set(normalize(b).split())
-    if not tokens_a or not tokens_b:
+    norm_a, norm_b = normalize(a), normalize(b)
+    words_a, words_b = norm_a.split(), norm_b.split()
+    if not words_a or not words_b:
         return 0.0
-    if tokens_a == tokens_b:
+    if words_a == words_b:
         return 1.0
+    ratio = SequenceMatcher(None, norm_a, norm_b).ratio()
 
-    overlap = len(tokens_a & tokens_b)
-    # Containment matters more than symmetric difference: a subtitle shouldn't be
-    # punished, so we score against the *smaller* token set.
-    containment = overlap / min(len(tokens_a), len(tokens_b))
-    ratio = SequenceMatcher(None, normalize(a), normalize(b)).ratio()
-    return round(max(containment * 0.9 + ratio * 0.1, ratio), 3)
+    # Extra words are free only when they stand apart as a segment of their own - a
+    # subtitle after ":" or " - ", a series name before it, a bracketed note. Then
+    # the shorter title is a whole run of the longer one's segments.
+    shorter, longer = (a, b) if len(words_a) <= len(words_b) else (b, a)
+    if normalize(shorter) in _segment_runs(longer):
+        overlap = len(set(words_a) & set(words_b))
+        containment = overlap / min(len(set(words_a)), len(set(words_b)))
+        return round(max(containment * 0.9 + ratio * 0.1, ratio), 3)
+
+    # Otherwise every word one title has and the other lacks is a different title,
+    # not noise: "More Tales", "More & More Tales" and "Still More Tales" are three
+    # books, and a word-set comparison scored them identical.
+    unmatched = sum(((Counter(words_a) - Counter(words_b))
+                     + (Counter(words_b) - Counter(words_a))).values())
+    return round(max(0.0, 1.0 - 0.35 * unmatched, ratio * 0.6), 3)
+
+
+def _segment_runs(title: str) -> set:
+    """Every contiguous run of a title's segments, normalised.
+
+    "Mistborn: The Final Empire (Book 1)" gives "mistborn", "the final empire",
+    "book 1", "mistborn the final empire", ... - the ways the same book's title can
+    legitimately appear with its series, subtitle or note attached or left off.
+    """
+    segments = [part for part in re.split(r'\s*(?::|;|\s[-–—]\s|[()\[\]]|,)\s*', title)
+                if normalize(part)]
+    runs = set()
+    for start in range(len(segments)):
+        for end in range(start + 1, len(segments) + 1):
+            runs.add(normalize(' '.join(segments[start:end])))
+    return runs
 
 
 def _freetext_score(query: str, candidate: str) -> float:
@@ -166,6 +194,12 @@ class BookAPIClient:
         self._dead: set = set()
         # url -> the answer it gave during this search, so a repeat costs nothing.
         self._responses: Dict[str, Any] = {}
+        # Shared across the queue run (see run_issues): growing waits for a source
+        # that throttles, and switching it off once it keeps refusing.
+        self.run_issues = None
+        # Sources not asked on the last search because the run had switched them off.
+        self.last_skipped: List[str] = []
+        self.should_cancel = None
 
     # ------------------------------------------------------------------ public
 
@@ -192,6 +226,7 @@ class BookAPIClient:
         self._pass = 1
         self._dead = set()
         self._responses = {}
+        self.last_skipped = []
         chosen = [s for s in (sources or self.sources) if s]
         self.last_sources = chosen
         title = (hints.get('title') or '').strip()
@@ -224,11 +259,14 @@ class BookAPIClient:
             best = self._merge_gaps(best, hints)
 
         if best is None or best['score'] < self.threshold:
+            # A miss caused by a throttled or switched-off source is not an answer,
+            # so it is not cached - the next run should ask again.
+            unreliable = bool(self.last_errors or self.last_skipped)
             if best:
                 self.last_rejected = {k: v for k, v in best.items() if k != 'raw'}
                 self.logger.info('Best match for %r scored %.2f, below threshold %.2f',
                                  title or query, best['score'], self.threshold)
-            if self.cache is not None:
+            if self.cache is not None and not unreliable:
                 self.cache.set_miss('booklookup', cache_key)
             return None
 
@@ -254,6 +292,10 @@ class BookAPIClient:
                 continue
             if source in self._dead:
                 continue          # already refused this search; asking again is theatre
+            if self.run_issues is not None and self.run_issues.is_disabled(f'api:{source}'):
+                if source not in self.last_skipped:
+                    self.last_skipped.append(source)
+                continue          # switched off for the rest of this queue run
             try:
                 candidates = handler(asked) or []
             except Exception as exc:
@@ -343,6 +385,8 @@ class BookAPIClient:
     def _is_complete(self, candidate: Dict[str, Any]) -> bool:
         """Whether a candidate answers everything we ask a book database for."""
         if not candidate.get('title') or not candidate.get('author'):
+            return False
+        if has_multiple_authors(candidate.get('author')):
             return False
         # A series without its position in that series is half an answer.
         if candidate.get('series') and not candidate.get('series_index'):
@@ -625,7 +669,10 @@ class BookAPIClient:
                                                'search - reusing the answer'})
             return self._responses[url]
 
+        issues = self.run_issues
         for attempt in range(1, attempts + 1):
+            if issues is not None:
+                issues.wait(f'api:{source}', self.should_cancel)
             self._rate_limit(source)
             record: Dict[str, Any] = {'source': source, 'url': url,
                                       'pass': self._pass, 'attempt': attempt}
@@ -640,6 +687,8 @@ class BookAPIClient:
                 self.logger.warning('%s request failed: %s', source, exc)
                 if attempt == attempts:
                     self.last_errors[source] = f'could not be reached: {exc}'
+                    if issues is not None:
+                        issues.limited(f'api:{source}', self.last_errors[source])
                     return None
                 time.sleep(0.4 * attempt)
                 continue
@@ -655,6 +704,8 @@ class BookAPIClient:
                     return None
                 if self.keep_raw:
                     record['raw'] = body
+                if issues is not None:
+                    issues.ok(f'api:{source}')
                 self._responses[url] = body
                 return body
 
@@ -680,6 +731,8 @@ class BookAPIClient:
                 continue
 
             self.last_errors[source] = record['error']
+            if issues is not None and (permanent or retryable):
+                issues.limited(f'api:{source}', record['error'], permanent=permanent)
             self._responses[url] = None
             self.logger.debug('%s returned HTTP %d', source, response.status_code)
             return None

@@ -18,13 +18,16 @@ import html
 import json
 from typing import Dict, Iterable, List, Optional
 
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout,
+    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout,
     QWidget,
 )
 
+from ..api_engine import CIRCUIT_OPEN
 from ..models import IDENTITY_FIELDS, BookEntry
+from ..quality import has_multiple_authors
 from ..settings import display_path
 from .theme import (ACCENT, BG_BASE, BG_DARKEST, BG_HOVER, BG_RAISED, BORDER,
                     STATUS_HUES, STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT,
@@ -86,7 +89,8 @@ class CollapsibleCard(QWidget):
 
     def __init__(self, key: str, title: str, body, badge: str = '',
                  colour: str = ACCENT, expanded: bool = True, panel=None, parent=None,
-                 run: str = '', has_run: bool = False, run_key: str = ''):
+                 run: str = '', has_run: bool = False, run_key: str = '',
+                 blocked: bool = False):
         super().__init__(parent)
         self.key = key
         self.panel = panel
@@ -129,9 +133,12 @@ class CollapsibleCard(QWidget):
             # The button used to be accent-coloured whatever had happened, so it read
             # as a warning rather than as "this one is still untouched".
             tint = STATUS_HUES['approved'] if has_run else TEXT
-            self.run_button = QPushButton('Run again' if has_run else 'Run')
+            self.run_button = QPushButton('Force retry' if blocked else
+                                          'Run again' if has_run else 'Run')
             self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
             self.run_button.setToolTip(
+                f'The server blocked {run} after repeated failures - ask it again now'
+                if blocked else
                 f'{run} has already run for this book - run it again'
                 if has_run else f'Ask {run} about this book now')
             self.run_button.setStyleSheet(f"""
@@ -318,11 +325,11 @@ class WhyPanel(QWidget):
 
     def _add(self, key: str, title: str, body, badge: str = '',
              colour: str = TEXT, run: str = '',
-             has_run: bool = False) -> CollapsibleCard:
+             has_run: bool = False, blocked: bool = False) -> CollapsibleCard:
         return CollapsibleCard(key, title, body, badge=badge, colour=colour,
                                expanded=self._open.get(key, key in DEFAULT_OPEN),
                                panel=self, parent=self.container, run=run,
-                               has_run=has_run)
+                               has_run=has_run, blocked=blocked)
 
     def _build_cards(self) -> List[CollapsibleCard]:
         # No library card: the counts live in the toolbar, where they are visible
@@ -427,7 +434,9 @@ class WhyPanel(QWidget):
                 body = ''.join(self._step_html(step) for step in steps)
             cards.append(self._add(
                 tier, label, body, badge=badge, colour=STATE_COLOURS[state],
-                run=label if runnable else '', has_run=True))
+                run=label if runnable else '', has_run=True,
+                blocked=any(CIRCUIT_OPEN in str(step.get('message', ''))
+                            for step in steps)))
         return cards
 
     def _manual_card(self, entry: BookEntry) -> CollapsibleCard:
@@ -558,6 +567,8 @@ class WhyPanel(QWidget):
                 continue    # no series, so no position in one to be missing
             if not entry.value(name):
                 missing.append(name.replace('_', ' '))
+        if has_multiple_authors(entry.value('author')):
+            missing.append('single author')
         return missing
 
     # ------------------------------------------------------- book-database card
@@ -696,41 +707,78 @@ class WhyPanel(QWidget):
         column.setContentsMargins(8, 8, 8, 8)
         column.setSpacing(6)
 
+        selectable = (Qt.TextInteractionFlag.TextSelectableByMouse
+                      | Qt.TextInteractionFlag.TextSelectableByKeyboard
+                      | Qt.TextInteractionFlag.LinksAccessibleByMouse)
         if parsed:
             parsed_step = {'data': {'result': parsed}}
             label = QLabel(self._step_html(parsed_step))
             label.setTextFormat(Qt.TextFormat.RichText)
             label.setWordWrap(True)
+            label.setTextInteractionFlags(selectable)
             column.addWidget(label)
 
         if results:
-            first = QLabel(self._search_results_html(results[:3]))
-            first.setTextFormat(Qt.TextFormat.RichText)
-            first.setOpenExternalLinks(True)
-            first.setWordWrap(True)
-            column.addWidget(first)
-            if len(results) > 3:
-                column.addWidget(self._sub_card(
-                    'More results', self._search_results_html(results[3:]),
-                    badge=str(len(results) - 3), colour=TEXT,
-                    key='search::more', expanded=False))
+            # Every result lives in one label, so a drag can select across several of
+            # them. "Show more" expands that same label rather than opening a second
+            # one, which a selection could not cross into.
+            label = QLabel()
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(selectable)
+            label.setOpenExternalLinks(False)
+            key = 'search::more'
+
+            def render() -> None:
+                show_all = self._open.get(key, False)
+                label.setText(self._search_results_html(
+                    results if show_all else results[:3],
+                    more=0 if show_all else len(results) - 3,
+                    fewer=show_all and len(results) > 3))
+
+            def clicked(href: str) -> None:
+                if href.startswith('copy:'):
+                    result = results[int(href[5:])]
+                    text = str(result.get('title') or '')
+                    url = str(result.get('href') or result.get('url') or '')
+                    body = str(result.get('body') or '')
+                    QApplication.clipboard().setText(
+                        '\n'.join(part for part in (text, url, body) if part))
+                elif href in ('more:', 'fewer:'):
+                    self.remember(key, href == 'more:')
+                    render()
+                else:
+                    QDesktopServices.openUrl(QUrl(href))
+
+            label.linkActivated.connect(clicked)
+            render()
+            column.addWidget(label)
         elif not parsed:
             label = QLabel(f'<span style="color:{TEXT};">No results</span>')
             column.addWidget(label)
         return host
 
     @staticmethod
-    def _search_results_html(results: List[Dict]) -> str:
+    def _search_results_html(results: List[Dict], more: int = 0,
+                             fewer: bool = False) -> str:
         rows = ['<table cellspacing="0" cellpadding="3" width="100%">']
-        for index, result in enumerate(results, start=1):
+        for index, result in enumerate(results):
             title = html.escape(str(result.get('title') or 'Untitled result'))
             href = html.escape(str(result.get('href') or result.get('url') or ''),
                                quote=True)
             title_html = f'<a href="{href}">{title}</a>' if href else title
+            copy = (f'<a href="copy:{index}" style="color:{TEXT}; '
+                    f'text-decoration:none;">Copy</a>')
             rows.append(
                 f'<tr><td style="color:{TEXT}; padding-right:8px; '
-                f'vertical-align:top;">{index}</td><td>{title_html}</td></tr>')
+                f'vertical-align:top;">{index + 1}</td><td>{title_html}</td>'
+                f'<td style="vertical-align:top; padding-left:8px;">{copy}</td></tr>')
         rows.append('</table>')
+        if more > 0:
+            rows.append(f'<a href="more:">Show {more} more result'
+                        f'{"" if more == 1 else "s"}</a>')
+        elif fewer:
+            rows.append('<a href="fewer:">Show fewer</a>')
         return ''.join(rows)
 
     def _sub_card(self, title: str, body: str, badge: str, colour: str, key: str,
@@ -823,6 +871,7 @@ class WhyPanel(QWidget):
             'separator': 'contains unusual separators',
             'random_fragment': 'contains random-looking text',
             'joined_words': 'may contain joined words',
+            'multiple_authors': 'has more than one author',
         }
         return f'{field} {labels.get(kind, "looks unusual")}'
 

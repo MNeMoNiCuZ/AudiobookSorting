@@ -11,16 +11,18 @@ import json
 import logging
 import os
 import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from .models import STATUS_DUPLICATE, STATUS_PENDING, BookEntry
+from .models import STATUS_DUPLICATE, STATUS_PENDING, BookEntry, Field, IDENTITY_FIELDS
 
 logger = logging.getLogger(__name__)
 
 
 class DataManager:
-    def __init__(self, save_file: Optional[Path] = None, autosave_seconds: float = 5.0):
+    def __init__(self, save_file: Optional[Path] = None, autosave_seconds: float = 5.0,
+                 change_log_mb: int = 200):
         from .paths import PROJECT_ROOT
         self.save_file = (Path(save_file) if save_file
                           else PROJECT_ROOT / 'book_entries.json')
@@ -30,15 +32,22 @@ class DataManager:
         self._lock = threading.RLock()
         self._autosave_seconds = autosave_seconds
         self._timer: Optional[threading.Timer] = None
+        # Size at which the change log is rotated; AO_CHANGE_LOG_MB.
+        self.change_log_limit = max(1, int(change_log_mb)) * 1024 * 1024
+        # What every entry looked like at the last save, so each save can log exactly
+        # which values changed. See _log_changes.
+        self._last_saved: Dict[str, Dict] = {}
         self.load()
+        self._last_saved = self._snapshot()
 
     # ------------------------------------------------------------------- load
 
-    def load(self) -> None:
-        if not self.save_file.exists():
+    def load(self, source: Optional[Path] = None) -> None:
+        source = Path(source) if source else self.save_file
+        if not source.exists():
             return
         try:
-            raw = json.loads(self.save_file.read_text(encoding='utf-8'))
+            raw = json.loads(source.read_text(encoding='utf-8'))
         except (OSError, ValueError) as exc:
             self.logger.error('Could not read %s: %s', self.save_file, exc)
             self._backup_corrupt()
@@ -73,7 +82,7 @@ class DataManager:
                 self.entries[entry_id] = entry
             except Exception as exc:
                 self.logger.warning('Skipping unreadable entry %s: %s', entry_id, exc)
-        self.logger.info('Loaded %d entries from %s', len(self.entries), self.save_file)
+        self.logger.info('Loaded %d entries from %s', len(self.entries), source)
         if stale_duplicates:
             self.logger.info('Dropped %d saved duplicate flag(s) - they are recomputed '
                              'from the files on disk, never restored', stale_duplicates)
@@ -92,6 +101,121 @@ class DataManager:
 
     # ------------------------------------------------------------------- save
 
+    BACKUPS_KEPT = 20
+
+    def backup(self, reason: str) -> Optional[Path]:
+        """Copy the list as it stands to backups/, before something rewrites it.
+
+        Taken before every load, clear and removal: those are the actions that throw
+        away identified values and decisions, and the save file is the only record
+        of them. The newest BACKUPS_KEPT copies are kept.
+        """
+        import time
+
+        self.flush()
+        with self._lock:
+            payload = {eid: entry.to_dict() for eid, entry in self.entries.items()}
+        if not payload:
+            return None
+        folder = self.save_file.parent / 'backups'
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        target = folder / f'{self.save_file.stem}.{stamp}.{reason}.json'
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                              encoding='utf-8')
+            old = sorted(folder.glob(f'{self.save_file.stem}.*.json'))
+            for stale in old[:-self.BACKUPS_KEPT]:
+                stale.unlink()
+        except OSError as exc:
+            self.logger.error('Could not back up the list before %s: %s', reason, exc)
+            return None
+        self.logger.info('Backed up %d entries to %s', len(payload), target)
+        return target
+
+    def restore(self, backup: Path) -> int:
+        """Replace the list with a backup. The list as it stands is backed up first."""
+        self.backup('before-restore')
+        with self._lock:
+            self.entries = {}
+        self.load(backup)
+        self.mark_dirty()
+        self.flush()
+        return len(self.entries)
+
+    # ------------------------------------------------------------ change log
+
+    LOGGED_FIELDS = ('author', 'series', 'series_index', 'title')
+
+    def _snapshot(self) -> Dict[str, Dict]:
+        """The values the change log compares: each field with its source, and status."""
+        with self._lock:
+            entries = list(self.entries.values())
+        snap = {}
+        for entry in entries:
+            row = {'status': entry.status,
+                   'where': str(Path(entry.folder) / entry.primary_audio)
+                   if entry.primary_audio and not Path(entry.primary_audio).is_absolute()
+                   else entry.primary_audio or entry.folder}
+            for name in self.LOGGED_FIELDS:
+                field = entry.get_field(name)
+                row[name] = [str(field.value or ''), field.source or '']
+            snap[entry.entry_id] = row
+        return snap
+
+    def change_log_path(self) -> Path:
+        return self.save_file.parent / 'logs' / 'changes.jsonl'
+
+    def _log_changes(self) -> None:
+        """Append every value that changed since the last save to logs/changes.jsonl.
+
+        One line per change, old and new value with their sources, so anything a load,
+        an edit or an identification overwrote can be read back and put back.
+        """
+        import time
+
+        now = self._snapshot()
+        before = self._last_saved
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        lines = []
+        for entry_id in sorted(set(before) | set(now)):
+            old, new = before.get(entry_id), now.get(entry_id)
+            if old == new:
+                continue
+            where = (new or old).get('where', '')
+            if old is None or new is None:
+                row = old or new
+                lines.append({'time': stamp, 'entry': entry_id, 'file': where,
+                              'change': 'added' if old is None else 'removed',
+                              'status': row['status'],
+                              **{name: row[name][0] for name in self.LOGGED_FIELDS}})
+                continue
+            for key in ('status',) + self.LOGGED_FIELDS:
+                if old.get(key) == new.get(key):
+                    continue
+                if key == 'status':
+                    lines.append({'time': stamp, 'entry': entry_id, 'file': where,
+                                  'field': 'status', 'before': old[key],
+                                  'after': new[key]})
+                else:
+                    lines.append({'time': stamp, 'entry': entry_id, 'file': where,
+                                  'field': key, 'before': old[key][0],
+                                  'before_source': old[key][1], 'after': new[key][0],
+                                  'after_source': new[key][1]})
+        self._last_saved = now
+        if not lines:
+            return
+        path = self.change_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > self.change_log_limit:
+                path.replace(path.with_suffix('.1.jsonl'))
+            with open(path, 'a', encoding='utf-8') as handle:
+                for line in lines:
+                    handle.write(json.dumps(line, ensure_ascii=False) + '\n')
+        except OSError as exc:
+            self.logger.error('Could not write the change log: %s', exc)
+
     def save(self, force: bool = False) -> bool:
         """Write to disk if anything changed. Atomic: temp file then replace."""
         with self._lock:
@@ -109,6 +233,7 @@ class DataManager:
                 os.fsync(handle.fileno())
             tmp.replace(self.save_file)
             self.logger.debug('Saved %d entries', len(payload))
+            self._log_changes()
             return True
         except OSError as exc:
             self.logger.error('Could not save entries: %s', exc)
@@ -190,6 +315,8 @@ class DataManager:
         seen: Dict[str, BookEntry] = {}
 
         with self._lock:
+            if resume:
+                scanned = self._apply_user_combines(list(scanned), input_root)
             for entry in scanned:
                 existing = self.entries.get(entry.entry_id)
                 if (existing is not None and resume
@@ -198,6 +325,7 @@ class DataManager:
                     existing.folder = entry.folder
                     existing.relative_path = entry.relative_path
                     existing.audio_files = entry.audio_files
+                    existing.audio_sizes = entry.audio_sizes
                     existing.primary_audio = entry.primary_audio
                     existing.image_files = entry.image_files
                     existing.is_multi_book_folder = entry.is_multi_book_folder
@@ -214,6 +342,114 @@ class DataManager:
 
         self.mark_dirty()
         return result
+
+    def combine(self, entries: List[BookEntry],
+                fields: Optional[Dict[str, Field]] = None) -> Optional[BookEntry]:
+        """Fold ``entries`` into the first of them: one book, every file.
+
+        Only entries in the same folder can be combined - an entry's files are names
+        relative to its one folder. The others are removed. Returns the combined entry,
+        or None when there is nothing to combine.
+        """
+        if len(entries) < 2:
+            return None
+        folder = os.path.normcase(os.path.normpath(entries[0].folder))
+        if any(os.path.normcase(os.path.normpath(e.folder)) != folder for e in entries):
+            return None
+
+        keep = entries[0]
+        sizes: Dict[str, int] = {}
+        for entry in entries:
+            for position, name in enumerate(entry.audio_files):
+                size = (entry.audio_sizes[position]
+                        if position < len(entry.audio_sizes) else -1)
+                sizes.setdefault(name, size)
+        names = sorted(sizes)
+        images = sorted({name for entry in entries for name in entry.image_files})
+
+        with self._lock:
+            for name in IDENTITY_FIELDS:
+                if fields and name in fields:
+                    setattr(keep, name, deepcopy(fields[name]))
+            keep.audio_files = names
+            keep.audio_sizes = [sizes[name] for name in names]
+            keep.primary_audio = str(Path(keep.folder) / names[0])
+            keep.image_files = images
+            keep.combined_by_user = True
+            keep.is_multi_book_folder = False
+            for entry in entries[1:]:
+                self.entries.pop(entry.entry_id, None)
+            self.entries[keep.entry_id] = keep
+        keep.log('user', f'Combined {len(entries)} entries into one book '
+                         f'({len(names)} files)')
+        self.mark_dirty()
+        return keep
+
+    def _apply_user_combines(self, scanned: List[BookEntry],
+                             input_root: Optional[Path]) -> List[BookEntry]:
+        """Put files you combined back into their combined entry.
+
+        The scanner does not know you joined them, so it splits them again. Every
+        scanned file owned by a combined entry goes to that entry; a scanned entry left
+        with nothing is dropped.
+        """
+        owner: Dict[str, BookEntry] = {}
+        for entry in self.entries.values():
+            if not entry.combined_by_user or not self._belongs_to_root(entry,
+                                                                       input_root):
+                continue
+            for path in entry.absolute_files():
+                owner[os.path.normcase(os.path.normpath(str(path)))] = entry
+
+        if not owner:
+            return scanned
+
+        combined_ids = {entry.entry_id for entry in owner.values()}
+        claimed: Dict[str, Dict[str, int]] = {}
+        combined: Dict[str, BookEntry] = {}
+        result: List[BookEntry] = []
+        for entry in scanned:
+            kept_names, kept_sizes = [], []
+            for position, name in enumerate(entry.audio_files):
+                size = (entry.audio_sizes[position]
+                        if position < len(entry.audio_sizes) else -1)
+                key = os.path.normcase(os.path.normpath(str(Path(entry.folder) / name)))
+                target = owner.get(key)
+                if target is None:
+                    kept_names.append(name)
+                    kept_sizes.append(size)
+                    continue
+                claimed.setdefault(target.entry_id, {})[name] = size
+                if target.entry_id not in combined:
+                    combined[target.entry_id] = target
+                    result.append(target)
+            if not kept_names:
+                continue
+            if len(kept_names) != len(entry.audio_files):
+                entry.audio_files = kept_names
+                entry.audio_sizes = kept_sizes
+                entry.primary_audio = str(Path(entry.folder) / kept_names[0])
+                if entry.entry_id in combined_ids:
+                    entry.entry_id = str(Path(entry.relative_path) / kept_names[0])
+                    entry.is_multi_book_folder = True
+            result.append(entry)
+
+        # The combined entries stand in for the scanned ones, so they carry what the
+        # scan found on disk: the files still there, at their current sizes.
+        refreshed: List[BookEntry] = []
+        for entry in result:
+            files = claimed.get(entry.entry_id) if entry.entry_id in combined else None
+            if files is not None and entry is combined[entry.entry_id]:
+                names = sorted(files)
+                refreshed.append(BookEntry(
+                    entry_id=entry.entry_id, folder=entry.folder,
+                    relative_path=entry.relative_path, image_files=entry.image_files,
+                    audio_files=names, audio_sizes=[files[name] for name in names],
+                    primary_audio=str(Path(entry.folder) / names[0]),
+                    is_multi_book_folder=False))
+            else:
+                refreshed.append(entry)
+        return refreshed
 
     @staticmethod
     def _belongs_to_root(entry: BookEntry, input_root: Optional[Path]) -> bool:

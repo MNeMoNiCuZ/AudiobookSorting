@@ -19,15 +19,18 @@ rather than on the toolbar, so the toolbar stays short enough to read at a glanc
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from PyQt6.QtCore import QEvent, QObject, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import (QEvent, QItemSelection, QItemSelectionModel, QObject,
+                         QFile, QSignalBlocker, QSize, Qt, QTimer, pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QFont, QIcon, QKeySequence, QPainter,
                          QPixmap, QShortcut)
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QGridLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QGridLayout,
     QHBoxLayout, QHeaderView,
     QInputDialog,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
@@ -37,25 +40,39 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget, QWidgetAction,
 )
 
+from ..paths import display_index
 from ..models import (IDENTITY_FIELDS, STATUS_APPROVED, STATUS_PENDING,
                       STATUS_REJECTED, STATUS_RISKY, BookEntry, pretty_status)
+from .table import ColumnTable
 from .delegates import (KIND_CONFIDENCE, KIND_COVER, KIND_FILES, KIND_STATUS,
-                        ROLE_CONFIDENCE, ROLE_ENTRY_ID, ROLE_FLASH, ROLE_KIND,
+                        ROLE_CONFIDENCE, ROLE_DUPLICATE_IDENTITY, ROLE_ENTRY_ID, ROLE_FLASH, ROLE_KIND,
                         ROLE_PROGRESS, ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
                         ROLE_WARNING, ROLE_WARNING_IGNORED,
                         ReviewDelegate)
+from .cover_loader import CoverLoader, read_cover
 from .cover_viewer import CoverViewer
 from .icons import badged_icon
+from .item_list import short_list
+from .load_dialog import _under as _is_under
 from .icons import icon as make_icon
 from .queue_dialog import plural
+from .shell_selection import open_folder_selection
 from .theme import (ACCENT, ACCENT_DARK, BG_RAISED, CONFIDENCE_HUES, ROW_HEIGHTS,
                     STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT, source_color)
 from .toolbar import ITEMS_BY_KEY, SEPARATOR, parse_layout, shortcut_for
 from .why_panel import WhyPanel
 
+# The local tiers: what the Identify button runs, as "Initial Scan", until every
+# listed book has had them.
+INITIAL_SCAN_TIERS = ('metadata', 'regex')
+INITIAL_SCAN_LABEL = 'Initial Scan'
+
 logger = logging.getLogger(__name__)
 
 COLUMNS = ['', 'FILES', 'AUTHOR', 'SERIES', '#', 'TITLE', 'CONFIDENCE', 'STATUS']
+# How many books the confirm-apply dialog previews.
+PREVIEW_SAMPLE = 5
+
 COL_COVER, COL_FILES, COL_AUTHOR, COL_SERIES, COL_INDEX, COL_TITLE, COL_CONF, COL_STATUS = range(8)
 
 # Which table column maps to which model field, for inline editing.
@@ -155,6 +172,12 @@ GOODREADS_DELAY = (0.7, 1.9)
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 
+def _move_to_trash(path: Path) -> bool:
+    """Send one file or folder to the Recycle Bin. PyQt6 returns (ok, new path)."""
+    result = QFile.moveToTrash(str(path))
+    return bool(result[0] if isinstance(result, tuple) else result)
+
+
 class _NumericItem(QTableWidgetItem):
     """Displays a formatted string, sorts on the number behind it."""
 
@@ -184,6 +207,55 @@ class _KeyedItem(QTableWidgetItem):
         if isinstance(other, _KeyedItem):
             return self.key < other.key
         return super().__lt__(other)
+
+
+class _FieldItem(QTableWidgetItem):
+    """An author, series, # or title cell that sorts on its row, not just itself.
+
+    Author sorts by author, then series, then #, then title; series by series, #,
+    title; # numerically. Only the first column follows the direction you clicked:
+    Z-A authors still list each author's books from book 1 up.
+    """
+
+    def __init__(self, text: str, sort_key: tuple):
+        super().__init__(text)
+        self.sort_key = sort_key
+
+    def __lt__(self, other) -> bool:
+        if not isinstance(other, _FieldItem):
+            return super().__lt__(other)
+        mine, theirs = self.sort_key, other.sort_key
+        if mine[0] != theirs[0]:
+            return mine[0] < theirs[0]
+        if mine[1:] == theirs[1:]:
+            return False
+        less = mine[1:] < theirs[1:]
+        # A descending sort asks "other < self" and reverses the whole comparison,
+        # so the tie-breakers are flipped back here to stay ascending.
+        view = self.tableWidget()
+        if (getattr(view, 'sort_order', None) == Qt.SortOrder.DescendingOrder):
+            return not less
+        return less
+
+
+def _index_number(value: str) -> float:
+    """The book number to sort on: "3" -> 3, "1-3" -> 1, "2.5" -> 2.5, none last."""
+    text = str(value or '').strip().split('-')[0].replace(',', '.')
+    try:
+        return float(text)
+    except ValueError:
+        return float('inf')
+
+
+def _sort_key(entry: BookEntry, column: int) -> tuple:
+    author = entry.value('author').casefold()
+    series = entry.value('series').casefold()
+    number = _index_number(entry.value('series_index'))
+    title = entry.value('title').casefold()
+    return {COL_AUTHOR: (author, series, number, title),
+            COL_SERIES: (series, number, title),
+            COL_INDEX: (number, title),
+            COL_TITLE: (title,)}[column]
 
 
 ROLE_WARNING_SORT = int(Qt.ItemDataRole.UserRole) + 20
@@ -323,13 +395,19 @@ class _WarningBadgeFilter(QObject):
         if kind == QEvent.Type.MouseMove:
             position = event.position().toPoint()
             index = self.window.table.indexAt(position)
-            if self.window._warning_badge_hit(index, position):
+            badge = self.window._warning_badge_hit(index, position)
+            if badge:
                 QToolTip.showText(event.globalPosition().toPoint(),
                                   index.data(Qt.ItemDataRole.ToolTipRole), watched)
                 self._hovering = True
             elif self._hovering:
                 QToolTip.hideText()
                 self._hovering = False
+            # The cover and the warning badge open something on a click, so say so.
+            if badge or (index.isValid() and index.column() == COL_COVER):
+                watched.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                watched.unsetCursor()
         if kind == QEvent.Type.ToolTip:
             position = event.pos()
             index = self.window.table.indexAt(position)
@@ -409,7 +487,7 @@ class _CellKeysFilter(QObject):
         key = event.key()
         control = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
         if key == Qt.Key.Key_Delete and not control:
-            self._window._clear_selected_cells()
+            self._window._delete_key()
             return True
         if control and key == Qt.Key.Key_C:
             self._window._copy_selected_cells()
@@ -426,11 +504,18 @@ class MainWindow(QMainWindow):
     # Emitted for the controller (main.py) to act on.
     # entries to load (None = the whole input folder), and a KeepOptions saying what
     # survives. There is one load action, and this is it.
-    load_requested = pyqtSignal(object, object)
+    load_requested = pyqtSignal(object, object, bool)
+    clear_requested = pyqtSignal()
+    purge_requested = pyqtSignal(list)             # entry ids with no files left on disk
+    remove_entries_requested = pyqtSignal(list, str)  # entry ids, status message
+    restore_requested = pyqtSignal()               # replace the list with a backup
     resolve_requested = pyqtSignal(list, list)     # entries, tier names
+    refresh_requested = pyqtSignal(list, list)     # the same, skipping the lookup cache
     apply_requested = pyqtSignal(list, bool)       # entries, preview
     undo_requested = pyqtSignal(int)               # index into the pending journal
+    revert_requested = pyqtSignal(dict)            # pending index -> move indices/None
     merge_requested = pyqtSignal(object)           # entry
+    combine_requested = pyqtSignal(list, dict)    # entries and chosen identity fields
     settings_requested = pyqtSignal()
     settings_requested_on_tab = pyqtSignal(str)    # open Settings on a tab
     cancel_requested = pyqtSignal()                # cancel everything (Esc, toolbar)
@@ -438,13 +523,21 @@ class MainWindow(QMainWindow):
     settings_changed = pyqtSignal()                # a setting was edited in the window
     queue_remove_requested = pyqtSignal(int)       # index into the pending queue
     queue_clear_requested = pyqtSignal()
+    dequeue_entries_requested = pyqtSignal(list)   # entry ids to take out of the queue
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
         self.preview_provider = None
         self.entries: Dict[str, BookEntry] = {}
+        self._identity_keys = {}
+        self._identity_groups = {}
         self.row_ids: List[str] = []
+        # Covers are read on a background thread and dropped into these items as
+        # they arrive; see cover_loader.
+        self._cover_items: Dict[str, QTableWidgetItem] = {}
+        self._covers = CoverLoader(self)
+        self._covers.loaded.connect(self._cover_loaded)
         self._updating = False
         self._columns_fitted = False
         self._has_saved_widths = False
@@ -466,6 +559,14 @@ class MainWindow(QMainWindow):
         self._folder_filter: Optional[Path] = None
         # Set by the controller: returns the undoable transactions, newest last.
         self.history_provider: Callable[[], List[str]] = lambda: []
+        # Set by the controller: every Finalize transaction, for the Finalize log.
+        self.finalize_log_provider: Callable[[], List[dict]] = lambda: []
+        self._finalize_log_dialog = None
+        # Source key -> what went wrong with it in finished runs, and which books it
+        # failed or skipped. Drawn by the floating run-issues notice and the row menu;
+        # a book leaves it when it is identified again with that source.
+        self._run_failures: Dict[str, dict] = {}
+        self._run_issues_panel = None
         # Undo history for edits made in the table - typing, clearing, filling down,
         # the grid editor. Applies live in the controller's journal instead; the two
         # are interleaved by comparing journal lengths, see _undo_last.
@@ -488,8 +589,10 @@ class MainWindow(QMainWindow):
         self._wanted_split: Optional[int] = None
         # Set by the controller: a WorkerManager.status() snapshot on demand.
         self.queue_provider: Callable[[], dict] = dict
+        # Entry ids still waiting in an identification job, for "Remove from queue".
+        self.waiting_entries_provider: Callable[[], set] = set
         # What compare_to_entries last reported, or None when the table is in step with
-        # the input folder. Drives the "!" on Load Input - see set_scan_stale.
+        # the input folder. Drives the "!" on Inputs - see set_scan_stale.
         self._scan_drift: Optional[dict] = None
         # Set when the input folder setting itself changed: the list now describes a
         # folder nobody is pointing at any more, which no file comparison can detect.
@@ -617,7 +720,7 @@ class MainWindow(QMainWindow):
             f'<b>No {which} folder is set.</b>  '
             + ('Nothing can be loaded or saved until both are chosen.'
                if len(missing) == 2 else
-               'Load Input has nothing to read.' if missing == ['input'] else
+               'Inputs has nothing to read.' if missing == ['input'] else
                'Saving has nowhere to write.'))
 
     def _build_filter_row(self) -> QHBoxLayout:
@@ -628,7 +731,7 @@ class MainWindow(QMainWindow):
 
         self.status_filter = self._filter_combo(
             ['All statuses', 'Pending', 'Unsure', 'Approved', 'Rejected',
-             'Applied', 'Duplicate', 'Has Warning'],
+             'Finalized', 'Duplicate', 'Has Warning'],
             'Show only rows with this review status')
         for index, key in enumerate(
                 ('pending', 'risky', 'approved', 'rejected', 'applied', 'duplicate'),
@@ -741,7 +844,7 @@ class MainWindow(QMainWindow):
         self._apply_filters()
 
     def _build_table(self) -> QTableWidget:
-        self.table = QTableWidget(0, len(COLUMNS))
+        self.table = ColumnTable(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         # Everything is painted by the delegate, which needs hover state and draws
         # its own row separators - so no zebra striping and no grid.
@@ -756,7 +859,10 @@ class MainWindow(QMainWindow):
         # cells belong to.
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.table.setSortingEnabled(True)
+        # Sorted on a header click, not by Qt's setSortingEnabled. That one re-sorts
+        # on every write, so changing a book's status moved its row mid-update and the
+        # rest of the update landed on whichever book took its place.
+        self.table.setSortingEnabled(False)
         self.table.setWordWrap(False)
         self.table.verticalHeader().setDefaultSectionSize(58)
         self.table.verticalHeader().setVisible(False)
@@ -774,16 +880,23 @@ class MainWindow(QMainWindow):
         # on it is free to mean "show me this properly".
         self.table.clicked.connect(self._cell_clicked)
         self.table.setToolTip('Double-click author, series, # or title to edit it. '
-                              'Delete clears the selected cells, Ctrl+C and Ctrl+V '
+                              'Delete clears the selected name cells, or asks to '
+                              'remove the book when a whole row is selected. '
+                              'Ctrl+C and Ctrl+V '
                               'copy and paste them. '
                               'Right-click for everything you can do to the selection.')
 
         header = self.table.horizontalHeader()
+        # Header clicks sort without Qt first selecting the entire column.
+        header.sectionPressed.disconnect(self.table.selectColumn)
         # Nothing is sorted until the user asks for it, so no arrow parked on the
         # cover column pretending the table is sorted by artwork. Qt turns the
         # indicator back on every time sorting is re-enabled, hence the flag.
         self._user_sorted = False
         header.setSortIndicatorShown(False)
+        self._restore_sort()
+        self._sort_state = (header.sortIndicatorSection(), header.sortIndicatorOrder())
+        header.setSectionsClickable(True)
         header.sectionClicked.connect(self._sorted_by_user)
         header.setSectionResizeMode(COL_COVER, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(COL_FILES, QHeaderView.ResizeMode.Interactive)
@@ -963,6 +1076,7 @@ class MainWindow(QMainWindow):
         if self._columns_fitted:
             QTimer.singleShot(0, self._fit_columns)
         self._fit_toolbar()
+        self._place_run_issues()
 
     def _finish_window_resize(self) -> None:
         # The central layout and its splitter are updated in separate queued passes.
@@ -1077,9 +1191,77 @@ class MainWindow(QMainWindow):
         if not hidden and width > 0:
             self.table.setColumnWidth(column, width)
 
-    def _sorted_by_user(self, _column: int) -> None:
+    def _sort_table(self) -> None:
+        """Put the rows in the order the header says, keeping the selection."""
+        header = self.table.horizontalHeader()
+        column = header.sortIndicatorSection()
+        if not 0 <= column < len(COLUMNS):
+            return
+        selected = [(entry.entry_id, index.column())
+                    for index in self.table.selectedIndexes()
+                    if (entry := self._entry_at(index.row())) is not None]
+        current = self.table.currentIndex()
+        entry = self._entry_at(current.row()) if current.isValid() else None
+        current_id = entry.entry_id if entry else None
+        model = self.table.selectionModel()
+        with QSignalBlocker(self.table), QSignalBlocker(model):
+            self.table.sortItems(column, header.sortIndicatorOrder())
+            rows = {entry.entry_id: row for row in range(self.table.rowCount())
+                    if (entry := self._entry_at(row)) is not None}
+            selection = QItemSelection()
+            for entry_id, selected_column in selected:
+                if entry_id in rows:
+                    index = self.table.model().index(rows[entry_id], selected_column)
+                    selection.select(index, index)
+            model.select(selection, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            if current_id in rows:
+                model.setCurrentIndex(
+                    self.table.model().index(rows[current_id], current.column()),
+                    QItemSelectionModel.SelectionFlag.NoUpdate)
+        self._selection_changed()
+        self.table.viewport().update()
+
+    def _sorted_by_user(self, column: int) -> None:
+        header = self.table.horizontalHeader()
+        shown = (header.sortIndicatorSection(), header.sortIndicatorOrder())
+        if shown[0] == column and shown != self._sort_state:
+            # The header already flipped its own arrow for this click.
+            order = shown[1]
+        else:
+            # Same column again flips the order; a new column starts ascending.
+            order = (Qt.SortOrder.DescendingOrder
+                     if self._sort_state == (column, Qt.SortOrder.AscendingOrder)
+                     else Qt.SortOrder.AscendingOrder)
         self._user_sorted = True
-        self.table.horizontalHeader().setSortIndicatorShown(True)
+        self._sort_state = (column, order)
+        header.setSortIndicator(column, order)
+        header.setSortIndicatorShown(True)
+        self._sort_table()
+        # Remembered at once, not on close: the sort is a choice you made, and a
+        # crash or a killed process should not quietly forget it.
+        order = ('desc' if header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+                 else 'asc')
+        self.settings.set('AO_UI_SORT', f'{header.sortIndicatorSection()},{order}')
+        try:
+            self.settings.save()
+        except OSError as exc:
+            logger.warning('Could not save the table sort: %s', exc)
+
+    def _restore_sort(self) -> None:
+        """Sort the table the way it was sorted when the program last ran."""
+        column, _, order = (self.settings.get('AO_UI_SORT') or '').partition(',')
+        try:
+            column = int(column)
+        except ValueError:
+            return
+        if not 0 <= column < len(COLUMNS):
+            return
+        self._user_sorted = True
+        header = self.table.horizontalHeader()
+        header.setSortIndicator(column, Qt.SortOrder.DescendingOrder
+                                if order.strip() == 'desc'
+                                else Qt.SortOrder.AscendingOrder)
+        header.setSortIndicatorShown(True)
 
     # ---------------------------------------------------------------- toolbar
 
@@ -1127,7 +1309,8 @@ class MainWindow(QMainWindow):
         # the table, and having it also mean "this button is important" is why the
         # colour scheme stopped carrying information.
         accented = set()
-        tinted = {'approve': STATUS_TEXT['approved'], 'reject': STATUS_TEXT['rejected']}
+        tinted = {'approve': STATUS_TEXT['approved'], 'reject': STATUS_TEXT['rejected'],
+                  'goodreads': '#f08a24'}
 
         icon = self._icon_size()
         self.toolbar.setIconSize(QSize(icon, icon))
@@ -1159,6 +1342,9 @@ class MainWindow(QMainWindow):
                 # event filter watching the right-button press on the button itself
                 # is not answerable to any of that, so it always fires.
                 self._watch_right_click(action, self._show_history_dialog)
+            if key == 'apply':
+                # Right-clicking Finalize opens the log of what it moved, to revert.
+                self._watch_right_click(action, self.show_finalize_log)
             if key == 'identify':
                 # The badge is painted onto this button's icon, so it has to be
                 # findable again when the queue changes.
@@ -1230,7 +1416,7 @@ class MainWindow(QMainWindow):
         work. The buttons that need a selection say so the same way, by being
         unavailable until there is one.
 
-        Load Input, Sources and Settings are never disabled: they are how you get
+        Inputs, Sources and Settings are never disabled: they are how you get
         out of
         the state where everything else is.
         """
@@ -1245,7 +1431,7 @@ class MainWindow(QMainWindow):
 
         available = {
             # Identify needs entries, not a selection - with none it identifies the
-            # lot, like Load Input and Preview.
+            # lot, like Inputs and Preview.
             'identify': anything,
             'warnings': any(e.warnings and not e.warnings_silenced
                             for e in self.entries.values()),
@@ -1277,7 +1463,8 @@ class MainWindow(QMainWindow):
             action.setEnabled(enabled)
             if key == 'identify':
                 # Its tooltip carries the queue badge too, so it is written in one
-                # place - _refresh_identify_badge, called immediately after this.
+                # place - _refresh_identify_badge.
+                self._refresh_identify_badge()
                 continue
             item = ITEMS_BY_KEY[key]
             if enabled and key in ('approve', 'reject'):
@@ -1407,7 +1594,8 @@ class MainWindow(QMainWindow):
                       if entry.status in (STATUS_PENDING, STATUS_RISKY)]
         if key == 'approve':
             matches = [entry for entry in candidates
-                       if entry.is_complete() and entry.confidence() >= threshold]
+                       if entry.is_complete() and entry.confidence() >= threshold
+                       and not self._is_unresolved_duplicate(entry)]
             status = STATUS_APPROVED
             description = f'at or above {percent}%'
         else:
@@ -1429,8 +1617,9 @@ class MainWindow(QMainWindow):
 
     def _first_input_folder(self, entry: BookEntry) -> tuple[str, Path]:
         """First folder below the configured input root for this book."""
-        folder = Path(entry.folder).resolve()
-        root = self.settings.get_path('AO_INPUT_DIR').resolve()
+        # Menu construction must not query slow or unavailable library drives.
+        folder = Path(os.path.abspath(entry.folder))
+        root = Path(os.path.abspath(self.settings.get_path('AO_INPUT_DIR')))
         try:
             relative = folder.relative_to(root)
         except ValueError:
@@ -1585,6 +1774,9 @@ class MainWindow(QMainWindow):
         self._queue_action = self.toolbar.addWidget(self.queue_button)
         self._queue_action.setVisible(False)
 
+        for button in self.toolbar.findChildren(QToolButton):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+
 
     def _build_sources_button(self, item, icon: int) -> QToolButton:
         """A menu of tickable sources - five checkboxes collapsed into one button."""
@@ -1659,6 +1851,7 @@ class MainWindow(QMainWindow):
             ('Ctrl+Y', self._redo_last),
             ('Ctrl+Shift+Z', self._redo_last),
             ('Ctrl+H', self._show_history_dialog),
+            ('Ctrl+O', lambda: self._open_folders(self.selected_entries())),
             ('Ctrl+A', self.table.selectAll),
             ('Ctrl+F', self.search_box.setFocus),
             # F3 is "find" everywhere else, and this is the only find there is here.
@@ -1683,6 +1876,13 @@ class MainWindow(QMainWindow):
     def set_entries(self, entries: List[BookEntry]) -> None:
         """Replace the whole table."""
         self.entries = {entry.entry_id: entry for entry in entries}
+        from ..quality import identity_key
+        self._identity_keys = {entry.entry_id: identity_key(entry) for entry in entries}
+        self._identity_groups = {}
+        for entry_id, key in self._identity_keys.items():
+            if key is not None:
+                self._identity_groups.setdefault(key, set()).add(entry_id)
+        self._covers.clear()
         self._rebuild_table()
 
     def upsert_entry(self, entry: BookEntry) -> None:
@@ -1690,7 +1890,16 @@ class MainWindow(QMainWindow):
         is_new = entry.entry_id not in self.entries
         self.entries[entry.entry_id] = entry
         if is_new:
-            self._rebuild_table()
+            # One new row, not a rebuild of every row: a load that reports its books
+            # one at a time rebuilt the whole table once per book, and three thousand
+            # books never finished arriving.
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.row_ids.append(entry.entry_id)
+            self._fill_row(row, entry)
+            self._sort_table()
+            self._apply_filters()
+            self.refresh_stats()
         else:
             row = self._row_for(entry.entry_id)
             if row is not None:
@@ -1715,10 +1924,9 @@ class MainWindow(QMainWindow):
 
     def _rebuild_table(self) -> None:
         self._updating = True
-        sorting = self.table.isSortingEnabled()
-        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         self.row_ids = []
+        self._cover_items = {}
 
         for entry in self.entries.values():
             row = self.table.rowCount()
@@ -1726,32 +1934,33 @@ class MainWindow(QMainWindow):
             self.row_ids.append(entry.entry_id)
             self._fill_row(row, entry)
 
-        self.table.setSortingEnabled(sorting)
+        self._sort_table()
         self.table.horizontalHeader().setSortIndicatorShown(self._user_sorted)
         self._updating = False
         self._apply_filters()
         self.refresh_stats()
 
     def _fill_row(self, row: int, entry: BookEntry) -> None:
+        affected = self._sync_identity_group(entry)
         self._validate_entry(entry)
         previous = self._updating
         self._updating = True
-        # Writing into a sorted table makes Qt re-sort on the spot, so approving one
-        # row teleports it somewhere else in the list mid-review. Rows only move when
-        # you sort, load, or reopen - unless you ask for live re-sorting.
-        resort = self.settings.get_bool('AO_UI_RESORT_LIVE', False)
-        was_sorting = self.table.isSortingEnabled()
-        if not resort:
-            self.table.setSortingEnabled(False)
+        # Rows only move when you sort, load, or reopen - unless you ask for live
+        # re-sorting, and even then only once every cell of this row is written.
+        # A rebuild sorts once at the end rather than once per row.
+        resort = self.settings.get_bool('AO_UI_RESORT_LIVE', True) and not previous
 
         filename, folder = self._files_summary(entry)
 
         # Sorted on the folder path, so clicking this column groups the table by where
         # the books live rather than by what they are called.
         cover = _KeyedItem(f'{folder}/{filename}')
-        pixmap = self._cover_pixmap(entry)
-        if pixmap is not None:
-            cover.setData(Qt.ItemDataRole.DecorationRole, pixmap)
+        cached = getattr(entry, '_cover_pixmap', None)
+        if cached is None:
+            self._covers.request(entry)
+        elif not cached.isNull():
+            cover.setData(Qt.ItemDataRole.DecorationRole, cached)
+        self._cover_items[entry.entry_id] = cover
         cover.setData(ROLE_KIND, KIND_COVER)
         cover.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         cover.setToolTip('Cover art embedded in the file, or an image in its folder.\n'
@@ -1774,16 +1983,19 @@ class MainWindow(QMainWindow):
             files.setData(ROLE_PROGRESS_TEXT, progress[1])
         self.table.setItem(row, COL_FILES, files)
 
+        findings = self._entry_findings(entry)
+        duplicate_warning = (bool(self._duplicate_ids(entry))
+                             and not entry.warnings_silenced)
         for column, name in EDITABLE.items():
             field = entry.get_field(name)
-            item = QTableWidgetItem(str(field.value))
-            from ..quality import inspect_entry
+            item = _FieldItem(display_index(field.value) if name == 'series_index'
+                              else str(field.value), _sort_key(entry, column))
             author_initial_warning = (
                 name == 'author'
                 and any(finding.kind == 'author_initials'
-                        for finding in inspect_entry(entry, self.entries.values())))
+                        for finding in findings))
             item.setForeground(QColor(
-                STATUS_TEXT['rejected'] if author_initial_warning
+                STATUS_TEXT['rejected'] if author_initial_warning or duplicate_warning
                 else self._field_colour(entry, field)))
             item.setToolTip(
                 f'{field.value or "(empty)"}\n'
@@ -1826,14 +2038,23 @@ class MainWindow(QMainWindow):
                           f'down the left of '
                           f'the row and this pill use the same colour.')
         self.table.setItem(row, COL_STATUS, status)
-        if not resort and was_sorting:
-            self.table.setSortingEnabled(True)
 
         # The delegate paints the stripe and the pill from this, on every cell.
         for column in range(len(COLUMNS)):
             item = self.table.item(row, column)
             if item is not None:
                 item.setData(ROLE_STATUS, status_key)
+                item.setData(ROLE_DUPLICATE_IDENTITY, duplicate_warning)
+
+        # Refresh both sides of a collision, including a book whose own fields did
+        # not change. Sorting waits until all affected rows have been written.
+        for entry_id in affected - {entry.entry_id}:
+            other_row = self._row_for(entry_id)
+            if other_row is not None:
+                self._fill_row(other_row, self.entries[entry_id])
+
+        if resort:
+            self._sort_table()
 
         self._updating = previous
 
@@ -1942,23 +2163,26 @@ class MainWindow(QMainWindow):
         if cached is not None:
             return cached if not cached.isNull() else None
 
-        pixmap = QPixmap()
-        try:
-            from ..metadata_extractor import MetadataExtractor
-            data = MetadataExtractor().extract_cover(entry.primary_audio)
-            if data:
-                pixmap.loadFromData(data)
-            if pixmap.isNull() and entry.image_files:
-                pixmap.load(str(Path(entry.folder) / entry.image_files[0]))
-        except Exception as exc:
-            logger.debug('No cover for %s: %s', entry.entry_id, exc)
-
-        if not pixmap.isNull():
-            pixmap = pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
-                                   Qt.TransformationMode.SmoothTransformation)
+        pixmap = QPixmap.fromImage(read_cover(entry.primary_audio, entry.folder,
+                                              entry.image_files))
         # Cache on the entry so scrolling doesn't re-decode every repaint.
         object.__setattr__(entry, '_cover_pixmap', pixmap)
         return pixmap if not pixmap.isNull() else None
+
+    def _cover_loaded(self, entry_id: str, image) -> None:
+        """A thumbnail from the background reader: cache it and show it."""
+        entry = self.entries.get(entry_id)
+        if entry is None:
+            return
+        pixmap = QPixmap.fromImage(image)
+        object.__setattr__(entry, '_cover_pixmap', pixmap)
+        item = self._cover_items.get(entry_id)
+        if item is None or pixmap.isNull():
+            return
+        try:
+            item.setData(Qt.ItemDataRole.DecorationRole, pixmap)
+        except RuntimeError:
+            self._cover_items.pop(entry_id, None)    # that row has been rebuilt since
 
     # ----------------------------------------------------------- cover viewer
 
@@ -2195,7 +2419,7 @@ class MainWindow(QMainWindow):
             refill()
 
         def refill():
-            from ..quality import inspect_entry, suggest_fix
+            from ..quality import suggest_fix
 
             tree.setSortingEnabled(False)
             tree.clear()
@@ -2204,7 +2428,7 @@ class MainWindow(QMainWindow):
             for candidate in self.entries.values():
                 if candidate.warnings_silenced:
                     continue
-                findings = inspect_entry(candidate, self.entries.values())
+                findings = self._entry_findings(candidate)
                 if warning_filter is not None:
                     findings = [finding for finding in findings
                                 if finding.field == warning_filter]
@@ -2527,20 +2751,58 @@ class MainWindow(QMainWindow):
                           f'{"" if len(restored) == 1 else "s"}')
 
     def _validate_entry(self, entry: BookEntry, force: bool = False) -> None:
-        from ..quality import author_initial_style, inspect_entry
+        from ..quality import author_initial_style
 
-        current = {name: entry.value(name) for name in ('author', 'series', 'title')}
+        # Two rows naming the same book would be written to the same place, so
+        # neither stays approved while the duplicate warning stands.
+        if entry.status == STATUS_APPROVED and self._is_unresolved_duplicate(entry):
+            entry.status = STATUS_PENDING
+            entry.log('user', 'approval withdrawn: duplicate of another row')
+        current = {name: entry.value(name) for name in IDENTITY_FIELDS}
         current['_author_initial_style'] = author_initial_style()
+        current['_duplicate_ids'] = '\n'.join(sorted(self._duplicate_ids(entry)))
         if not force and current == entry.warnings_checked_values:
             return
         warnings = [finding.message
-                    for finding in inspect_entry(entry, self.entries.values())]
+                    for finding in self._entry_findings(entry)]
         if warnings != entry.warnings:
             entry.warnings = warnings
             entry.warnings_silenced = False
         entry.warnings_checked_values = current
-        if warnings and entry.status == STATUS_PENDING:
+        if (any(finding.kind != 'duplicate_identity'
+                for finding in self._entry_findings(entry))
+                and entry.status == STATUS_PENDING):
             entry.status = STATUS_RISKY
+
+    def _is_unresolved_duplicate(self, entry: BookEntry) -> bool:
+        """Shares its identity with another row, and the warning is not ignored."""
+        return bool(self._duplicate_ids(entry)) and not entry.warnings_silenced
+
+    def _duplicate_ids(self, entry: BookEntry) -> set:
+        key = self._identity_keys.get(entry.entry_id)
+        return self._identity_groups.get(key, set()) - {entry.entry_id}
+
+    def _entry_findings(self, entry: BookEntry):
+        from ..quality import inspect_entry
+        return inspect_entry(entry, duplicate_ids=self._duplicate_ids(entry))
+
+    def _sync_identity_group(self, entry: BookEntry) -> set:
+        from ..quality import identity_key
+        key = identity_key(entry)
+        old = self._identity_keys.get(entry.entry_id)
+        if old == key:
+            return set()
+        affected = set(self._identity_groups.get(old, ()))
+        if old is not None:
+            self._identity_groups[old].discard(entry.entry_id)
+            if not self._identity_groups[old]:
+                del self._identity_groups[old]
+        self._identity_keys[entry.entry_id] = key
+        if key is not None:
+            group = self._identity_groups.setdefault(key, set())
+            group.add(entry.entry_id)
+            affected.update(group)
+        return affected
 
     def _validate_entries(self) -> None:
         for entry in self.entries.values():
@@ -2582,6 +2844,7 @@ class MainWindow(QMainWindow):
         if self._cover_viewer is None:
             self._cover_viewer = CoverViewer(self)
             self._cover_viewer.step_book.connect(self._step_cover_book)
+            self._cover_viewer.image_deleted.connect(self._cover_image_deleted)
             self._cover_viewer.finished.connect(
                 lambda _: setattr(self, '_cover_viewer', None))
         self._cover_viewer.set_book(
@@ -2614,6 +2877,20 @@ class MainWindow(QMainWindow):
                 return target
             target += delta
         return None
+
+    def _cover_image_deleted(self, path: Path) -> None:
+        """The viewer deleted a folder image: drop it from its book and redraw the row."""
+        row = self.table.currentRow()
+        entry = self._entry_at(row)
+        if entry is None:
+            return
+        folder = Path(entry.folder)
+        entry.image_files = [name for name in entry.image_files
+                             if folder / name != path]
+        # The thumbnail may have been that image; read it again.
+        object.__setattr__(entry, '_cover_pixmap', None)
+        self._fill_row(row, entry)
+        self.entry_changed(entry)
 
     def _step_cover_book(self, delta: int) -> None:
         """Move the viewer - and the table's cursor - to the next visible row."""
@@ -2724,6 +3001,10 @@ class MainWindow(QMainWindow):
             return
 
         from ..models import Field, clean_value
+        # The Number column shows "02" for a stored "2"; committing it unchanged is
+        # not an edit.
+        if field == 'series_index' and clean_value(field, value) == str(current.value):
+            return
         cleaned = clean_value(field, value)
         self._record_edit(f'{field} typed on "{self._label_for(entry)}"',
                           [(entry.entry_id, field, current)])
@@ -2769,6 +3050,13 @@ class MainWindow(QMainWindow):
             """
             if not enabled:
                 return None
+            draw_section()
+            action = menu.addAction(text, slot)
+            if tooltip:
+                action.setToolTip(tooltip)
+            return action
+
+        def draw_section() -> None:
             if pending_section[0]:
                 if menu.actions():
                     menu.addSeparator()
@@ -2780,10 +3068,6 @@ class MainWindow(QMainWindow):
                 font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
                 heading.setFont(font)
                 pending_section[0] = ''
-            action = menu.addAction(text, slot)
-            if tooltip:
-                action.setToolTip(tooltip)
-            return action
 
         multiple = count > 1
         mergeable = [e for e in entries if len(e.audio_files) > 1]
@@ -2823,6 +3107,16 @@ class MainWindow(QMainWindow):
                 # one can be asked by name, and the tier entry above now means
                 # "every one of them".
                 self._add_database_menu(sources, entries)
+        waiting = self.waiting_entries_provider() or set()
+        queued_entries = [e for e in entries if e.entry_id in waiting]
+        add('Remove from queue' + (f' ({len(queued_entries)})'
+                                   if len(queued_entries) > 1 else ''),
+            lambda: self.dequeue_entries_requested.emit(
+                [e.entry_id for e in queued_entries]),
+            'Take the selected books out of the identification queue before '
+            'their turn comes',
+            enabled=bool(queued_entries))
+        self._add_run_issue_menu(menu, entries)
         add(f'Preview{suffix}  (F7)',
             lambda: self.apply_requested.emit(entries, True),
             'Show where the selected rows would end up, without touching any files')
@@ -2868,10 +3162,18 @@ class MainWindow(QMainWindow):
             'Write the clipboard into the selection. One value fills every selected '
             'cell; a block of values is laid out from the top-left of the selection.')
         targets = self._clear_targets()
-        add(self._clear_label(targets) + '  (Del)', self._clear_selected_cells,
+        # Del clears name cells, and asks to remove the book when the selection
+        # reaches any other column. The menu says the same thing the key does.
+        delete_removes = not all(i.column() in EDITABLE
+                                 for i in self.table.selectedIndexes())
+        add(self._clear_label(targets) + ('' if delete_removes else '  (Del)'),
+            self._clear_selected_cells,
             'Blank the selected cells so they can be identified again. Select whole '
             'columns or individual cells to choose what gets cleared.',
             enabled=bool(targets))
+        if delete_removes:
+            add(f'Remove{suffix}...  (Del)', lambda: self._ask_remove(entries),
+                'Take the selected books off the list, or delete their files')
 
         if SHOW_REVIEW_SECTION:
             section('REVIEW')
@@ -2886,7 +3188,12 @@ class MainWindow(QMainWindow):
                 'Clear the decision on every selected row and return it to pending')
 
         section('FILES')
-        add(f'Open folder{suffix}', lambda: self._open_folders(entries),
+        cover_row = index.row() if index.isValid() else self.table.currentRow()
+        add('View artwork', lambda _=False, r=cover_row: self._open_cover_viewer(r),
+            "Show this book's cover and images at full size",
+            enabled=cover_row >= 0)
+        add(f'Open {"folders" if multiple else "folder"}{suffix}  (Ctrl+O)',
+            lambda: self._open_folders(entries),
             'Open each selected book folder in the file manager')
         self._add_copy_entries(menu, add, entries, suffix)
         add('Merge chapters into one .m4b...'
@@ -2894,10 +3201,28 @@ class MainWindow(QMainWindow):
             lambda: self._merge_selected(mergeable),
             'Join the chapter files of every selected multi-file book into one .m4b',
             enabled=bool(mergeable))
+        same_folder = len({os.path.normcase(os.path.normpath(e.folder))
+                           for e in entries}) == 1
+        add(f'Combine into one book{suffix}...',
+            lambda: self._confirm_combine(entries),
+            'Join the selected entries into a single book with all their files. '
+            'Kept when the folder is loaded again.',
+            enabled=multiple and same_folder)
         add(f'Open where it was written{suffix}',
             lambda: self._open_folders(applied),
             'Open the output folder these rows were written to',
             enabled=bool(applied))
+
+        remove_menu = menu.addMenu(f'Remove{suffix}')
+        remove_menu.setToolTipsVisible(True)
+        action = remove_menu.addAction('Remove from list',
+                                       lambda: self._remove_from_list(entries))
+        action.setToolTip('Take the selected books off the list. Nothing on disk '
+                          'is touched.')
+        action = remove_menu.addAction('Delete from drive (Recycle Bin)...',
+                                       lambda: self._delete_from_drive(entries))
+        action.setToolTip("Move the selected books' audio and image files to the "
+                          'Recycle Bin, and take them off the list')
 
         ignored_warnings = [entry for entry in entries
                             if entry.warnings and entry.warnings_silenced]
@@ -3053,7 +3378,9 @@ class MainWindow(QMainWindow):
         name, _, source = tier.partition(':')
         action = 'Queued' if self._busy else 'Asking'
         self.show_message(f'{action} {source or name} for this book...')
-        self.resolve_requested.emit(entries[:1], [tier])
+        # "Run again" on a card means "ask it now", so it skips the cache. Identify
+        # everywhere else reuses what was already looked up.
+        self.refresh_requested.emit(entries[:1], [tier])
 
     def _label_for(self, entry: BookEntry) -> str:
         """The shortest thing that names a book in a message: its title, else its file."""
@@ -3160,6 +3487,160 @@ class MainWindow(QMainWindow):
             self.merge_requested.emit(plan)
         self.show_message(f'Queued {plural(len(plans), "merge")}')
 
+    def _confirm_combine(self, entries: List[BookEntry]) -> None:
+        entries = self.in_view_order(entries)
+        if len(entries) < 2:
+            return
+        conflicts = {}
+        for name in IDENTITY_FIELDS:
+            choices = {}
+            for entry in entries:
+                choices.setdefault(entry.value(name), entry.get_field(name))
+            if len(choices) > 1:
+                conflicts[name] = choices
+        fields = {}
+        if conflicts:
+            dialog = QDialog(self)
+            dialog.setWindowTitle('Combine entries')
+            layout = QVBoxLayout(dialog)
+            grid = QGridLayout()
+            layout.addLayout(grid)
+            combos = {}
+            for row, (name, choices) in enumerate(conflicts.items()):
+                label = QLabel(FIELD_LABELS[name])
+                combo = QComboBox()
+                combo.setToolTip(f'Choose the {FIELD_LABELS[name].lower()} to keep')
+                combo.addItem('Choose...', None)
+                for value, field in choices.items():
+                    combo.addItem(value or '(empty)', field)
+                label.setBuddy(combo)
+                grid.addWidget(label, row, 0)
+                grid.addWidget(combo, row, 1)
+                combos[name] = combo
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+            combine = buttons.addButton('Combine', QDialogButtonBox.ButtonRole.AcceptRole)
+            combine.setToolTip('Combine the selected entries')
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip('Cancel')
+            combine.setEnabled(False)
+            for combo in combos.values():
+                combo.currentIndexChanged.connect(
+                    lambda _index: combine.setEnabled(
+                        all(box.currentIndex() > 0 for box in combos.values())))
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            fields = {name: combo.currentData() for name, combo in combos.items()}
+            self.combine_requested.emit(entries, fields)
+            return
+        files = sum(len(entry.audio_files) for entry in entries)
+        if QMessageBox.question(
+                self, 'Combine entries',
+                f'Combine {len(entries)} entries into one book with {files} files?\n\n'
+                f'{entries[0].value("author")} - {entries[0].value("title")}'
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.combine_requested.emit(entries, fields)
+
+    def show_combined_entry(self, combined: BookEntry,
+                            entries: List[BookEntry]) -> None:
+        """Refresh the retained row without rebuilding or sorting the table."""
+        removed = {entry.entry_id for entry in entries
+                   if entry.entry_id != combined.entry_id}
+        scroll = self.table.verticalScrollBar().value()
+        affected = set()
+        previous = self._updating
+        self._updating = True
+        try:
+            with QSignalBlocker(self.table), QSignalBlocker(self.table.selectionModel()):
+                for entry_id in removed:
+                    key = self._identity_keys.pop(entry_id, None)
+                    group = self._identity_groups.get(key, set())
+                    group.discard(entry_id)
+                    affected.update(group)
+                    if not group:
+                        self._identity_groups.pop(key, None)
+                    self.entries.pop(entry_id, None)
+                    self._cover_items.pop(entry_id, None)
+                for row in range(self.table.rowCount() - 1, -1, -1):
+                    item = self.table.item(row, COL_FILES)
+                    if item.data(Qt.ItemDataRole.UserRole) in removed:
+                        self.table.removeRow(row)
+                self.entries[combined.entry_id] = combined
+                self.row_ids = [self._entry_at(row).entry_id
+                                for row in range(self.table.rowCount())]
+                for entry_id in affected | {combined.entry_id}:
+                    row = self._row_for(entry_id)
+                    if row is not None:
+                        self._fill_row(row, self.entries[entry_id])
+                row = self._row_for(combined.entry_id)
+                if row is not None:
+                    self.table.selectRow(row)
+        finally:
+            self._updating = previous
+        self._apply_filters()
+        self.refresh_stats()
+        self._selection_changed()
+        self.table.verticalScrollBar().setValue(scroll)
+
+    def _remove_from_list(self, entries: List[BookEntry]) -> None:
+        count = len(entries)
+        self.remove_entries_requested.emit(
+            [entry.entry_id for entry in entries],
+            f'Removed {count} book{"" if count == 1 else "s"} from the list')
+
+    def _book_paths(self, entry: BookEntry) -> List[Path]:
+        """The files on disk that belong to this book: its audio and its images."""
+        folder = Path(entry.folder)
+        names = list(entry.audio_files) + list(entry.image_files)
+        return [folder / name for name in dict.fromkeys(names)
+                if (folder / name).exists()]
+
+    def _delete_from_drive(self, entries: List[BookEntry]) -> None:
+        paths = [path for entry in entries for path in self._book_paths(entry)]
+        count = len(entries)
+        books = f'{count} book{"" if count == 1 else "s"}'
+        if QMessageBox.question(
+                self, 'Delete from drive',
+                f'Move {len(paths)} file{"" if len(paths) == 1 else "s"} of {books} '
+                f'to the Recycle Bin and remove {"it" if count == 1 else "them"} '
+                f'from the list?\n\n'
+                f'{entries[0].value("author")} - {entries[0].value("title")}'
+                + (f'\n... and {count - 1} more' if count > 1 else ''),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        failed: List[str] = []
+        removed: List[str] = []
+        for entry in entries:
+            ok = True
+            for path in self._book_paths(entry):
+                if not _move_to_trash(path):
+                    failed.append(str(path))
+                    ok = False
+            if ok:
+                folder = Path(entry.folder)
+                # The book's own folder, emptied by the above, goes with it.
+                try:
+                    if (not entry.is_multi_book_folder and folder.is_dir()
+                            and not any(folder.iterdir())):
+                        _move_to_trash(folder)
+                except OSError:
+                    pass
+                removed.append(entry.entry_id)
+        message = (f'Moved {len(removed)} book{"" if len(removed) == 1 else "s"} '
+                   f'to the Recycle Bin')
+        if removed:
+            self.remove_entries_requested.emit(removed, message)
+        if failed:
+            QMessageBox.warning(
+                self, 'Delete from drive',
+                f'Could not move {len(failed)} file{"" if len(failed) == 1 else "s"} '
+                f'to the Recycle Bin. Those books stay on the list.\n\n'
+                + '\n'.join(failed[:20])
+                + (f'\n... and {len(failed) - 20} more' if len(failed) > 20 else ''))
+
     def _request_resolve_on(self, entries: List[BookEntry]) -> None:
         tiers = self.selected_tiers()
         if not tiers:
@@ -3168,26 +3649,38 @@ class MainWindow(QMainWindow):
         self.resolve_requested.emit(entries, tiers)
 
     def _open_folders(self, entries: List[BookEntry]) -> None:
-        """Opening 40 explorer windows helps nobody, so ask past a handful."""
-        if len(entries) > 5 and QMessageBox.question(
+        """Select book folders, or audio files when other books share the folder."""
+        folders = {}
+        for entry in entries:
+            folder = Path(entry.applied_path or entry.folder).absolute()
+            paths = ([folder / name for name in entry.audio_files]
+                     if entry.is_multi_book_folder and not entry.applied_path else [folder])
+            for path in paths or [folder]:
+                parent = path.parent
+                key = os.path.normcase(os.path.normpath(str(parent)))
+                _, items = folders.setdefault(key, (parent, {}))
+                items[os.path.normcase(os.path.normpath(str(path)))] = path
+        count = len(folders)
+        if count > 10 and QMessageBox.question(
                 self, 'Open folders',
-                f'Open {len(entries)} separate folders?'
+                f'{count} folders will be opened. Are you sure?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
-        import os
         import subprocess
-        for entry in entries:
-            path = entry.applied_path or entry.folder
+        for path, items in folders.values():
             try:
                 if os.name == 'nt':
-                    os.startfile(path)
+                    open_folder_selection(path, list(items.values()))
                 else:
-                    subprocess.Popen(['xdg-open', path])
+                    subprocess.Popen(['xdg-open', str(path)])
             except OSError as exc:
                 self.show_message(
                     f'Could not open {self.settings.display_path(path)}: {exc}')
                 return
-        self.show_message(f'Opened {len(entries)} folder(s)')
+        if count:
+            self.show_message(f'Opened {count} folder(s)')
 
     def _copy_paths(self, entries: List[BookEntry]) -> None:
         text = '\n'.join(entry.applied_path or entry.folder for entry in entries)
@@ -3447,6 +3940,175 @@ class MainWindow(QMainWindow):
     def _refresh_history_dialog(self) -> None:
         if self._history_dialog is not None:
             self._history_dialog.refresh()
+        if self._finalize_log_dialog is not None:
+            self._finalize_log_dialog.refresh()
+
+    # ------------------------------------------------------------ run issues
+
+    def show_run_issues(self, summary: List[dict]) -> None:
+        """The queue drained with source problems: record them and raise the notice."""
+        from .run_issues_panel import RunIssuesPanel
+
+        for row in summary:
+            record = self._run_failures.setdefault(
+                row['key'], {'failed': set(), 'skipped': set()})
+            record.update(label=row['label'], message=row['message'],
+                          disabled=row['disabled'], tiers=row['tiers'])
+            record['failed'].update(row['failed'])
+            record['skipped'].update(row['skipped'])
+            record['failed'] -= record['skipped']
+        if self._run_issues_panel is None:
+            panel = RunIssuesPanel(self._run_issue_rows, parent=self.centralWidget())
+            panel.select_requested.connect(self._select_run_issue)
+            panel.requeue_requested.connect(self._requeue_run_issue)
+            panel.select_ids_requested.connect(self._select_entry_ids)
+            panel.requeue_ids_requested.connect(
+                lambda key, ids: self._requeue_run_issue([key], only=set(ids)))
+            self._run_issues_panel = panel
+        self._run_issues_panel.refresh()
+        if self._run_issue_rows():
+            self._run_issues_panel.show()
+            self._run_issues_panel.raise_()
+            self._place_run_issues()
+
+    def _run_issue_rows(self) -> List[dict]:
+        rows = []
+        for key, record in sorted(self._run_failures.items()):
+            failed = [i for i in record['failed'] if i in self.entries]
+            skipped = [i for i in record['skipped'] if i in self.entries]
+            if failed or skipped:
+                rows.append(dict(record, key=key, failed=failed, skipped=skipped,
+                                 books=len(failed) + len(skipped),
+                                 **self._run_issue_outcome(failed + skipped)))
+        return rows
+
+    def _run_issue_outcome(self, ids: List[str]) -> dict:
+        """Where the books a source let down ended up, using the other sources.
+
+        missing: no author or title. doubtful: both, but below the confident
+        threshold. fine: confidently identified anyway.
+        """
+        threshold = self.settings.get_float('AO_UI_CONFIDENT_THRESHOLD', 0.80)
+        missing, doubtful, fine = [], [], []
+        for entry_id in ids:
+            entry = self.entries[entry_id]
+            if entry.author.is_empty() or entry.title.is_empty():
+                missing.append(entry_id)
+            elif entry.confidence() < threshold:
+                doubtful.append(entry_id)
+            else:
+                fine.append(entry_id)
+        return {'missing': missing, 'doubtful': doubtful, 'fine': fine,
+                'threshold': threshold}
+
+    def _run_issue_entries(self, key: str) -> List[BookEntry]:
+        record = self._run_failures.get(key) or {}
+        ids = set(record.get('failed', ())) | set(record.get('skipped', ()))
+        return [self.entries[i] for i in ids if i in self.entries]
+
+    def clear_run_failures(self, entry_id: str, tiers: List[str]) -> None:
+        """A book is being identified again: forget the failures that run covers."""
+        tiers = list(tiers or [])
+        for key in list(self._run_failures):
+            covered = (key in tiers
+                       or key.split(':', 1)[0] in tiers)
+            if covered:
+                record = self._run_failures[key]
+                record['failed'].discard(entry_id)
+                record['skipped'].discard(entry_id)
+                if not record['failed'] and not record['skipped']:
+                    del self._run_failures[key]
+        if self._run_issues_panel is not None and self._run_issues_panel.isVisible():
+            self._run_issues_panel.refresh()
+            self._place_run_issues()
+
+    def _select_run_issue(self, keys: List[str]) -> None:
+        self._select_entry_ids(
+            [entry.entry_id for key in keys for entry in self._run_issue_entries(key)])
+
+    def _select_entry_ids(self, ids: List[str]) -> None:
+        from PyQt6.QtCore import QItemSelectionModel
+
+        ids = set(ids)
+        model = self.table.selectionModel()
+        self.table.clearSelection()
+        first = None
+        for row in range(self.table.rowCount()):
+            entry = self._entry_at(row)
+            if entry is None or entry.entry_id not in ids or self.table.isRowHidden(row):
+                continue
+            model.select(self.table.model().index(row, 0),
+                         QItemSelectionModel.SelectionFlag.Select
+                         | QItemSelectionModel.SelectionFlag.Rows)
+            first = row if first is None else first
+        if first is None:
+            self.show_message('Those books are hidden by the current filter')
+            return
+        self.table.scrollToItem(self.table.item(first, COL_TITLE))
+        self.show_message(f'Selected {plural(len(ids), "book")}')
+
+    def _requeue_run_issue(self, keys: List[str], only: Optional[set] = None) -> None:
+        """One identify job per source, for the books it failed or skipped."""
+        for key in keys:
+            record = self._run_failures.get(key)
+            entries = [e for e in self._run_issue_entries(key)
+                       if only is None or e.entry_id in only]
+            if record and entries:
+                self.resolve_requested.emit(entries, list(record['tiers']))
+
+    def _place_run_issues(self) -> None:
+        panel = self._run_issues_panel
+        if panel is None or not panel.isVisible():
+            return
+        parent = panel.parentWidget()
+        panel.adjustSize()
+        panel.move(max(0, parent.width() - panel.width() - 16),
+                   max(0, parent.height() - panel.height() - 16))
+        panel.raise_()
+
+    def _add_run_issue_menu(self, menu: QMenu, entries: List[BookEntry]) -> None:
+        """Right-click: re-queue the selected books with the sources they failed."""
+        ids = {entry.entry_id for entry in entries}
+        hits = []
+        for row in self._run_issue_rows():
+            affected = ids & (set(row['failed']) | set(row['skipped']))
+            if affected:
+                hits.append((row, affected))
+        if not hits:
+            return
+        submenu = menu.addMenu('Re-queue failed sources...')
+        submenu.setToolTipsVisible(True)
+        for row, affected in hits:
+            action = submenu.addAction(
+                f'{row["label"]}  ({len(affected)})',
+                lambda _=False, k=row['key'], a=affected:
+                self._requeue_run_issue([k], only=a))
+            action.setToolTip(f'{row["message"]}\nIdentify these again with '
+                              f'{row["label"]} only')
+        if len(hits) > 1:
+            submenu.addSeparator()
+            submenu.addAction(
+                'All of them', lambda: self._requeue_run_issue(
+                    [row['key'] for row, _ in hits], only=ids))
+        submenu.addSeparator()
+        submenu.addAction('Show the run summary', self._show_run_issues_panel)
+
+    def _show_run_issues_panel(self) -> None:
+        self.show_run_issues([])
+
+    def show_finalize_log(self) -> None:
+        from .finalize_log_dialog import FinalizeLogDialog
+
+        if self._finalize_log_dialog is None:
+            dialog = FinalizeLogDialog(self.finalize_log_provider, parent=self)
+            dialog.revert_requested.connect(self.revert_requested.emit)
+            dialog.finished.connect(
+                lambda _: setattr(self, '_finalize_log_dialog', None))
+            self._finalize_log_dialog = dialog
+        self._finalize_log_dialog.refresh()
+        self._finalize_log_dialog.show()
+        self._finalize_log_dialog.raise_()
+        self._finalize_log_dialog.activateWindow()
 
     def _undo_to_position(self, keep: int) -> None:
         """Undo back until only the first `keep` steps of the history remain."""
@@ -3495,12 +4157,35 @@ class MainWindow(QMainWindow):
                             advance: bool = False) -> None:
         if not entries:
             return
-        for entry in entries:
-            entry.status = status
-            row = self._row_for(entry.entry_id)
-            if row is not None:
-                self._fill_row(row, entry)
-            self.entry_changed(entry)
+        blocked = 0
+        if status == STATUS_APPROVED:
+            allowed = [e for e in entries if not self._is_unresolved_duplicate(e)]
+            blocked = len(entries) - len(allowed)
+            if not allowed:
+                self.show_message(
+                    f'Not approved: {"this row duplicates" if blocked == 1 else "these rows duplicate"} '
+                    f'another row. Change the names, or ignore the warning.')
+                return
+            entries = allowed
+        # The book to move on to is picked before anything moves: after a re-sort,
+        # "the row below" is whichever book landed there, not the next one you saw.
+        next_id = self._next_book_id(entries) if advance else None
+        # Every row is written first and the table re-sorted once at the end, so no
+        # row moves while it is still being written.
+        previous = self._updating
+        self._updating = True
+        try:
+            for entry in entries:
+                entry.status = status
+                row = self._row_for(entry.entry_id)
+                if row is not None:
+                    self._fill_row(row, entry)
+                self.entry_changed(entry)
+        finally:
+            self._updating = previous
+        resorted = self.settings.get_bool('AO_UI_RESORT_LIVE', True)
+        if resorted:
+            self._sort_table()
         self._apply_filters()
         self.refresh_stats()
         # A row vanishing on approve is the status filter doing its job, but it looks
@@ -3510,26 +4195,41 @@ class MainWindow(QMainWindow):
                      and self.table.isRowHidden(row))
         message = (f'{len(entries)} entr{"y" if len(entries) == 1 else "ies"} '
                    f'set to {pretty_status(status)}')
+        if blocked:
+            message += (f' - {blocked} duplicate{"" if blocked == 1 else "s"} '
+                        f'not approved')
         if hidden:
             message += (f' - {hidden} no longer match the "'
                         f'{self.status_filter.currentText()}" filter and are hidden, '
                         f'not lost')
         self.show_message(message)
-        if advance:
-            self._advance_selection()
+        if advance and self.settings.get_bool('AO_UI_ADVANCE_AFTER_DECISION', True):
+            self._advance_selection(next_id)
+        elif resorted:
+            # The rows just moved; keep the one you are on in view.
+            current = self.table.currentItem()
+            if current is not None:
+                self.table.scrollToItem(current)
 
-    def _advance_selection(self) -> None:
-        """After a decision, move to the next visible row - keeps review flowing."""
-        if not self.settings.get_bool('AO_UI_ADVANCE_AFTER_DECISION', True):
-            return
+    def _next_book_id(self, entries: List[BookEntry]) -> Optional[str]:
+        """The first visible book below the selection that is not being changed."""
         rows = sorted({index.row() for index in self.table.selectedIndexes()})
         if not rows:
-            return
+            return None
+        changing = {entry.entry_id for entry in entries}
         for row in range(rows[-1] + 1, self.table.rowCount()):
-            if not self.table.isRowHidden(row):
-                self.table.selectRow(row)
-                self.table.scrollToItem(self.table.item(row, COL_TITLE))
-                return
+            entry = self._entry_at(row)
+            if (entry is not None and not self.table.isRowHidden(row)
+                    and entry.entry_id not in changing):
+                return entry.entry_id
+        return None
+
+    def _advance_selection(self, next_id: Optional[str]) -> None:
+        """After a decision, move to the next book - keeps review flowing."""
+        row = self._row_for(next_id) if next_id else None
+        if row is not None and not self.table.isRowHidden(row):
+            self.table.selectRow(row)
+            self.table.scrollToItem(self.table.item(row, COL_TITLE))
 
     def _edit_current_cell(self) -> None:
         """F2 = rename, exactly as double-clicking the cell does.
@@ -3722,6 +4422,47 @@ class MainWindow(QMainWindow):
             return f'Clear {count} {label}'
         return f'Clear {count} entries'
 
+    def _delete_key(self) -> None:
+        """Delete clears name cells; anything else selected asks to remove the book.
+
+        A selection that reaches the files, confidence or status column (a whole row
+        does) is about the book, not its metadata, so it offers to take the book off
+        the list or delete its files instead of blanking the row.
+        """
+        indexes = self.table.selectedIndexes()
+        if not indexes:
+            return
+        if all(index.column() in EDITABLE for index in indexes):
+            self._clear_selected_cells()
+            return
+        entries = self.selected_entries()
+        if entries:
+            self._ask_remove(entries)
+
+    def _ask_remove(self, entries: List[BookEntry]) -> None:
+        count = len(entries)
+        books = f'{count} book{"" if count == 1 else "s"}'
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle('Remove')
+        box.setText(
+            f'Remove {"this book" if count == 1 else books}?\n\n'
+            f'{entries[0].value("author")} - {entries[0].value("title")}'
+            + (f'\n... and {count - 1} more' if count > 1 else ''))
+        from_list = box.addButton('Remove from list',
+                                  QMessageBox.ButtonRole.AcceptRole)
+        from_drive = box.addButton('Delete from drive...',
+                                   QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is from_list:
+            self._remove_from_list(entries)
+        elif clicked is from_drive:
+            self._delete_from_drive(entries)
+
     def _clear_selected_cells(self) -> None:
         """Blank exactly the cells that are selected."""
         from ..models import Field
@@ -3731,12 +4472,30 @@ class MainWindow(QMainWindow):
             self.show_message('Nothing to clear in the selection')
             return
 
+        visible_columns = {column for column in range(self.table.columnCount())
+                           if not self.table.isColumnHidden(column)}
+        selected_columns = {}
+        for index in self.table.selectedIndexes():
+            selected_columns.setdefault(index.row(), set()).add(index.column())
+        if any(visible_columns <= columns for columns in selected_columns.values()):
+            if QMessageBox.question(
+                    self, 'Clear metadata', 'Are you sure?',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+
         cells = sum(len(names) for names in targets.values())
+        # A cleared row is no longer the book that was approved or rejected, so its
+        # decision goes back to pending - and comes back with Undo like the cells do.
+        decided = [entry_id for entry_id in targets if entry_id in self.entries
+                   and self.entries[entry_id].status != STATUS_PENDING]
         self._record_edit(
             f'cleared {cells} cell{"" if cells == 1 else "s"}',
             [(entry_id, name, self.entries[entry_id].get_field(name))
              for entry_id, names in targets.items() if entry_id in self.entries
-             for name in names])
+             for name in names]
+            + [(entry_id, 'status', self.entries[entry_id].status)
+               for entry_id in decided])
         for entry_id, names in targets.items():
             entry = self.entries.get(entry_id)
             if entry is None:
@@ -3744,6 +4503,7 @@ class MainWindow(QMainWindow):
             for name in names:
                 setattr(entry, name, Field())
                 entry.log('user', f'{name} cleared')
+            entry.status = STATUS_PENDING
             row = self._row_for(entry_id)
             if row is not None:
                 self._fill_row(row, entry)
@@ -3900,42 +4660,101 @@ class MainWindow(QMainWindow):
                           f'on {len(entries)} entries')
 
     def _request_load(self, selected_only: Optional[bool] = None) -> None:
-        """Load the input folder. The only question is what to keep.
+        """Load the input folder, through the dialog that picks folder, scan and keep.
 
         There is one load action and it always means the same thing: read the books on
-        disk into the list. It is only destructive when there is already something to
-        destroy, so an empty list loads immediately and a worked-on one is asked first.
+        disk into the list. The dialog can instead clear the list.
 
         ``selected_only`` preselects the scope for the right-click menu; None lets the
         dialog decide (the whole folder, unless you pick otherwise).
         """
-        from ..load_options import KeepOptions
-
-        # Nothing to lose, or nowhere to load from: either way the question would have
-        # exactly one answer. The controller does the asking when no folder is set -
-        # "what should I keep" in front of "you have not chosen a folder" is a dialog
-        # about a decision that does not exist yet.
-        if not self.entries or not self.settings.is_set('AO_INPUT_DIR'):
-            self.load_requested.emit(None, KeepOptions.keep_everything())
-            return
-
         from .load_dialog import LoadInputDialog
 
         selected = self.selected_entries()
         dialog = LoadInputDialog(list(self.entries.values()), selected,
-                                 self.settings, parent=self)
-        dialog.settings_requested.connect(self.settings_requested_on_tab.emit)
+                                 self.settings, parent=self, drift=self._scan_drift,
+                                 folder_changed_from=self._folder_changed_from,
+                                 on_remove=self.purge_requested.emit)
         if selected and selected_only is not None:
             dialog.scope_selected.setChecked(bool(selected_only))
             dialog.scope_all.setChecked(not selected_only)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self._take_fresh_drift(dialog)
+        if not accepted:
+            return
+        if dialog.clear_chosen:
+            self.clear_requested.emit()
             return
 
         dialog.remember()
-        self.load_requested.emit(dialog.scope(), dialog.keep_options())
+        if not self._confirm_load_loses_work(dialog):
+            return
+        self.load_requested.emit(dialog.scope(), dialog.keep_options(),
+                                 dialog.load_list_only())
+
+    def _take_fresh_drift(self, dialog) -> None:
+        """The dialog compared the list with the folder just now; the "!" follows it."""
+        drift = getattr(dialog, 'fresh_drift', None)
+        if drift is None:
+            return
+        try:
+            same = (dialog.folder_path() is not None and Path(dialog.folder_path())
+                    == Path(self.settings.get_path('AO_INPUT_DIR')))
+        except Exception:
+            same = False
+        if not same:
+            return
+        stale = any(drift.get(key) for key in ('added', 'missing', 'changed',
+                                               'unreadable', 'empty'))
+        self.set_scan_stale(drift if stale else None)
+
+    def _confirm_load_loses_work(self, dialog) -> bool:
+        """Ask before a load throws away work it cannot get back by reading the disk.
+
+        Values from the databases, the web or the model, values you typed, and your
+        approve/reject decisions exist nowhere else. Tags and file names are simply
+        read again, so losing those is not asked about.
+        """
+        from ..load_options import plan_load
+
+        scope = dialog.scope()
+        entries = list(self.entries.values()) if scope is None else scope
+        plan = plan_load(entries, dialog.keep_options())
+        if not plan.loses_work():
+            return True
+        lines = []
+        if plan.worked:
+            typed = (f', {plan.typed} of them typed by you' if plan.typed else '')
+            lines.append(f'{plan.worked} value{"" if plan.worked == 1 else "s"} found '
+                         f'by identification{typed}')
+        if plan.decisions:
+            lines.append(f'{plan.decisions} Approved / Rejected decision'
+                         f'{"" if plan.decisions == 1 else "s"}')
+        from .item_list import confirm_list
+
+        keep = dialog.keep_options()
+        books = []
+        for entry in entries:
+            one = plan_load([entry], keep)
+            if not one.loses_work():
+                continue
+            lost = [FIELD_LABELS.get(name, name) for name in IDENTITY_FIELDS
+                    if not keep.keeps(entry.get_field(name))
+                    and not entry.get_field(name).is_empty()]
+            if one.decisions:
+                lost.append(f'{entry.status} decision')
+            books.append(f'{self._label_for(entry)}   ({", ".join(lost)})')
+            books.append(f'    {entry.folder}')
+        return confirm_list(
+            self, 'Are you sure?',
+            'This load throws away work:\n\n    ' + '\n    '.join(lines)
+            + '\n\nThey are not read back from the files. The list is backed up first, '
+              'and can be restored from the Inputs right-click menu.',
+            [(f'Books that lose work ({len(books) // 2}):', books)],
+            yes='Load and throw it away', no='Cancel')
 
     def _show_load_menu(self) -> None:
-        """Right-clicking Load Input: the same action, scoped, plus where to load from."""
+        """Right-clicking Inputs: the same action, scoped, plus where to load from."""
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
 
@@ -3961,6 +4780,11 @@ class MainWindow(QMainWindow):
         folder = menu.addAction('Choose input folder...')
         folder.setToolTip('Open Settings and pick the folder to load from')
         folder.triggered.connect(lambda: self.settings_requested_on_tab.emit('General'))
+
+        restore = menu.addAction('Restore a backup...')
+        restore.setToolTip('Put the list back as it was before an earlier load, clear '
+                           'or removal')
+        restore.triggered.connect(self.restore_requested.emit)
 
         if self._scan_drift or self._folder_changed_from:
             what = menu.addAction('What changed since the last load...')
@@ -3990,18 +4814,57 @@ class MainWindow(QMainWindow):
         if parts:
             lines.append('Since this list was written, the input folder has '
                          + ', '.join(parts) + '.')
+        empty = drift.get('empty', 0)
+        if empty:
+            lines.append(f'{empty} book{"" if empty == 1 else "s"} in the list '
+                         f'{"has" if empty == 1 else "have"} no files on disk any more. '
+                         f'Inputs offers to remove them.')
         if not lines:
             lines.append('The list is in step with the input folder.')
 
-        box = QMessageBox(QMessageBox.Icon.Information, 'Since the last load',
-                          '\n\n'.join(lines), parent=self)
-        load = box.addButton('Load now', QMessageBox.ButtonRole.AcceptRole)
-        box.addButton('Close', QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is load:
+        from .item_list import list_dialog
+        if list_dialog(self, 'Since the last load', '\n\n'.join(lines),
+                       self._drift_sections(), ['Load now', 'Close'],
+                       default=0) == 'Load now':
             self._request_load()
 
+    def _drift_sections(self) -> list:
+        """Every book and file behind the "!" on Inputs, by name."""
+        from .item_list import books_lines
+        drift = self._scan_drift or {}
+        files = drift.get('files', {})
+        sections = []
+        if self._folder_changed_from:
+            root = self.settings.get_path('AO_INPUT_DIR')
+            old = [entry for entry in self.entries.values()
+                   if not _is_under(entry.folder, root)]
+            sections.append((f'Books in the list from the old folder ({len(old)}):',
+                             books_lines(old, files=False)))
+        for key, heading in (('added', 'Audio files added'),
+                             ('missing', 'Audio files no longer there'),
+                             ('changed', 'Audio files that changed size')):
+            items = files.get(key) or []
+            sections.append((f'{heading} ({len(items)}):', list(items)))
+        empty = [self.entries[entry_id] for entry_id in files.get('empty') or ()
+                 if entry_id in self.entries]
+        sections.append((f'Books with no files on disk ({len(empty)}):',
+                         books_lines(empty)))
+        return sections
+
+    def _unscanned(self) -> List[BookEntry]:
+        """Books that are listed but have not had the local pass - tags and names."""
+        return [entry for entry in self.entries.values() if not entry.resolved]
+
     def _request_resolve(self) -> None:
+        # Until every book has had the initial scan the button is "Initial Scan":
+        # the audio tags and the file and folder names, read locally, before any
+        # book database, web search or language model is asked anything. It does
+        # not depend on the Sources menu - it is always those two.
+        unscanned = self._unscanned()
+        if unscanned:
+            chosen = [entry for entry in self.selected_entries() if not entry.resolved]
+            self.resolve_requested.emit(chosen or unscanned, list(INITIAL_SCAN_TIERS))
+            return
         tiers = self.selected_tiers()
         if not tiers:
             self.show_message('Tick at least one source in the Sources menu')
@@ -4033,6 +4896,11 @@ class MainWindow(QMainWindow):
                 entries = [e for e in self.entries.values()
                            if e.status == STATUS_APPROVED]
                 scope = 'approved'
+                # The rejected rows come along, shown as skipped in a group of their
+                # own, so the preview says what Finalize leaves out as well.
+                if entries:
+                    entries += [e for e in self.entries.values()
+                                if e.status == STATUS_REJECTED]
             if not entries:
                 entries = list(self.entries.values())
                 scope = 'all'
@@ -4040,9 +4908,13 @@ class MainWindow(QMainWindow):
                 self.show_message('Nothing to preview - load the input folder first')
                 return
             if scope == 'approved':
-                self.show_message(f'Previewing the {len(entries)} approved '
-                                  f'row{"" if len(entries) == 1 else "s"} - what '
-                                  f'Finalize would write')
+                approved = sum(1 for e in entries if e.status == STATUS_APPROVED)
+                rejected = len(entries) - approved
+                self.show_message(f'Previewing the {approved} approved '
+                                  f'row{"" if approved == 1 else "s"} - what '
+                                  f'Finalize would write'
+                                  + (f', and {rejected} rejected it skips'
+                                     if rejected else ''))
             elif scope == 'all':
                 self.show_message('Nothing is approved yet - previewing every row')
             self.apply_requested.emit(entries, True)
@@ -4052,6 +4924,9 @@ class MainWindow(QMainWindow):
         if not entries:
             self.show_message('No approved entries. Approve some rows first (F5).')
             return
+        # Sent along so the results report them as skipped; the write step refuses
+        # every rejected book, so none of them is touched.
+        rejected = [e for e in self.entries.values() if e.status == STATUS_REJECTED]
 
         # Applying is the one action that touches the filesystem, so it is the one
         # action worth a confirmation - and even that is optional.
@@ -4061,19 +4936,24 @@ class MainWindow(QMainWindow):
             # only reciting them and sending you off to Settings to fix one.
             from .apply_dialog import ApplyDialog
 
-            preview_result = (self.preview_provider(entries[0])
-                              if self.preview_provider is not None else None)
-            dialog = ApplyDialog(entries, self.settings, preview_result=preview_result,
-                                 parent=self)
+            # A handful of books spread across the list, so the preview shows more
+            # than one series' naming before anything is written.
+            sample = entries if len(entries) <= PREVIEW_SAMPLE else [
+                entries[round(i * (len(entries) - 1) / (PREVIEW_SAMPLE - 1))]
+                for i in range(PREVIEW_SAMPLE)]
+            preview_results = ([self.preview_provider(entry) for entry in sample]
+                               if self.preview_provider is not None else None)
+            dialog = ApplyDialog(entries, self.settings, preview_results=preview_results,
+                                 parent=self, rejected=rejected)
             dialog.settings_requested.connect(self.settings_requested_on_tab.emit)
             dialog.preview_requested.connect(
-                lambda: self.apply_requested.emit(entries, True))
+                lambda: self.apply_requested.emit(entries + rejected, True))
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             # The dialog writes straight to .env, so the controller has to rebuild
             # FileOperations against the mode and templates just chosen.
             self.settings_changed.emit()
-        self.apply_requested.emit(entries, False)
+        self.apply_requested.emit(entries + rejected, False)
 
     def _search_goodreads(self, entries: Optional[List[BookEntry]] = None,
                           field: Optional[str] = None) -> None:
@@ -4242,6 +5122,20 @@ class MainWindow(QMainWindow):
                 return row
         return None
 
+    def in_view_order(self, entries: List[BookEntry]) -> List[BookEntry]:
+        """The entries in the order the table currently shows them, as sorted.
+
+        Books not in the table (filtered out, or not listed yet) keep their
+        relative order and go after the visible ones.
+        """
+        rows = {}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, COL_FILES)
+            if item is not None:
+                rows[item.data(Qt.ItemDataRole.UserRole)] = row
+        end = self.table.rowCount()
+        return sorted(entries, key=lambda entry: rows.get(entry.entry_id, end))
+
     def refresh_mode_label(self) -> None:
         """Kept as a no-op so callers need not care that the strip is gone.
 
@@ -4351,7 +5245,7 @@ class MainWindow(QMainWindow):
         self._refresh_queue_dialog()
 
     def set_scan_stale(self, drift: Optional[dict]) -> None:
-        """Mark Load Input when the list no longer matches the input folder.
+        """Mark Inputs when the list no longer matches the input folder.
 
         A saved list is a snapshot. Files added, removed or replaced since it was
         written are invisible until it is loaded again, and the whole session after
@@ -4399,20 +5293,35 @@ class MainWindow(QMainWindow):
                      (('added', drift.get('added', 0)),
                       ('missing', drift.get('missing', 0)),
                       ('changed', drift.get('changed', 0))) if count]
-            detail = (', '.join(parts) if parts
-                      else 'the input folder could not be read')
-            why.append(f'! The input folder has changed since this list was written '
-                       f'({detail}).')
+            if parts:
+                why.append(f'! The input folder has changed since this list was '
+                           f'written ({", ".join(parts)}).')
+            elif drift.get('unreadable'):
+                why.append('! The input folder could not be read.')
+            files = drift.get('files', {})
+            for key, word in (('added', 'Added'), ('missing', 'Missing'),
+                              ('changed', 'Changed')):
+                if files.get(key):
+                    why.append(f'{word}:\n' + short_list(files[key]))
+            empty = drift.get('empty', 0)
+            if empty:
+                why.append(f'! {empty} book{"" if empty == 1 else "s"} in the list '
+                           f'{"has" if empty == 1 else "have"} no files on disk any '
+                           f'more - open Inputs to remove them:\n'
+                           + short_list([self._label_for(self.entries[entry_id])
+                                         for entry_id in files.get('empty') or ()
+                                         if entry_id in self.entries]))
         action.setToolTip(
             self._tool_tooltip('scan', base.tooltip) + '\n\n' + '\n'.join(why)
             + '\nLoad it before you review, or you are working on stale data.')
 
     # --------------------------------------------------------- unsaved work
 
-    def flash_unsaved(self, seconds: float = 10.0, announce: bool = True) -> int:
+    def flash_unsaved(self, seconds: float = 10.0, announce: bool = True,
+                      only=None) -> int:
         """Light up the rows carrying work that has not been written out yet.
 
-        Pressing Load Input is the moment to notice that eleven books are approved and
+        Pressing Inputs is the moment to notice that eleven books are approved and
         still sitting here, so they are shown rather than described. The highlight
         fades over `seconds` - but a highlight you looked away from is no help at all,
         so the "Unsaved changes" shape filter can pull exactly these rows back up on
@@ -4423,7 +5332,13 @@ class MainWindow(QMainWindow):
         """
         from ..load_options import unsaved_entries
 
-        waiting = unsaved_entries(self.entries.values())
+        pool = self.entries.values()
+        if only is not None:
+            # A load of some rows speaks for those rows only; lighting up every other
+            # unsaved book as well paints the whole list as if all of it was loaded.
+            wanted = {entry.entry_id for entry in only}
+            pool = [entry for entry in pool if entry.entry_id in wanted]
+        waiting = unsaved_entries(pool)
         self._flash = {entry.entry_id: 1.0 for entry in waiting}
         self._flash_left = float(seconds) if waiting else 0.0
         if not waiting:
@@ -4476,10 +5391,25 @@ class MainWindow(QMainWindow):
         size = self._icon_size()
         action.setIcon(badged_icon('identify', TEXT, size, count))
         base = ITEMS_BY_KEY['identify']
+        unscanned = len(self._unscanned())
+        label = INITIAL_SCAN_LABEL if unscanned else base.label
+        if action.text() != label:
+            action.setText(label)
+            # A different name is a different width; let the toolbar re-decide
+            # whether its labels still fit.
+            self._labelled_toolbar_width = 0
+            QTimer.singleShot(0, self._fit_toolbar)
         # Disabled, the tooltip's job is to say why - the queue count is beside the
         # point when the button cannot be pressed. See refresh_action_states.
-        body = (base.tooltip if action.isEnabled()
-                else 'Nothing is loaded yet - press Ctrl+R')
+        if not action.isEnabled():
+            body = 'Nothing is loaded yet - press Ctrl+R'
+        elif unscanned:
+            body = (f'{plural(unscanned, "book")} not scanned yet. Reads the audio tags '
+                    f'and the file and folder names - locally, no book databases, web '
+                    f'search or language model.\nRuns on the selected rows that need '
+                    f'it, or on all of them. Afterwards this button is Identify again.')
+        else:
+            body = base.tooltip
         action.setToolTip(
             self._tool_tooltip('identify', body)
             + (f'\n\n{plural(count, "identification")} outstanding. '
@@ -4544,6 +5474,7 @@ class MainWindow(QMainWindow):
         self.refresh_action_states()
         self._refresh_identify_badge()
         self._refresh_queue_dialog()
+        self._refresh_history_dialog()
 
     def show_report(self, title: str, body: str) -> None:
         """Scrollable plain-text report, for anything without a richer view."""

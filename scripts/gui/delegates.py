@@ -16,7 +16,7 @@ about ``BookEntry``.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import (QEvent, QModelIndex, QRect, QRectF, QSize, Qt,
+from PyQt6.QtCore import (QEvent, QModelIndex, QPersistentModelIndex, QRect, QRectF, QSize, Qt,
                           pyqtSignal)
 from PyQt6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QLinearGradient,
                          QPainter, QPainterPath, QPen)
@@ -42,6 +42,7 @@ ROLE_PROGRESS_TEXT = Qt.ItemDataRole.UserRole + 6
 ROLE_FLASH = Qt.ItemDataRole.UserRole + 7
 ROLE_WARNING = Qt.ItemDataRole.UserRole + 8
 ROLE_WARNING_IGNORED = Qt.ItemDataRole.UserRole + 9
+ROLE_DUPLICATE_IDENTITY = Qt.ItemDataRole.UserRole + 10
 
 # What a cell should look like. Set as ROLE_KIND on the item.
 KIND_TEXT = 'text'
@@ -94,10 +95,15 @@ class ReviewDelegate(QStyledItemDelegate):
         if event is not None and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                current = QPersistentModelIndex(self.parent().currentIndex())
+                row = current.row()
                 self.commitData.emit(editor)
                 self.closeEditor.emit(editor,
                                       QAbstractItemDelegate.EndEditHint.NoHint)
-                self.move_after_edit.emit(-1 if shift else 1, 0)
+                # A live re-sort already moved this book. Keep it selected so the
+                # next review action applies to the book whose value was edited.
+                if current.isValid() and current.row() == row:
+                    self.move_after_edit.emit(-1 if shift else 1, 0)
                 return True
         return super().eventFilter(editor, event)
 
@@ -130,7 +136,8 @@ class ReviewDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
         self._paint_background(painter, rect, status, selected, hovered,
-                               index.row() % 2 == 1)
+                               index.row() % 2 == 1,
+                               bool(index.data(ROLE_DUPLICATE_IDENTITY)))
 
         # Drawn over the fill and under everything else, so it tints the row without
         # touching the status colour the fill is already carrying.
@@ -187,7 +194,8 @@ class ReviewDelegate(QStyledItemDelegate):
         painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, '!')
 
     def _paint_background(self, painter: QPainter, rect: QRect, status: str,
-                          selected: bool, hovered: bool, odd: bool = False) -> None:
+                          selected: bool, hovered: bool, odd: bool = False,
+                          duplicate: bool = False) -> None:
         """Fill by status, band by row parity, and mark selection with a border.
 
         Selection deliberately does *not* recolour the row: the fill already carries
@@ -203,6 +211,8 @@ class ReviewDelegate(QStyledItemDelegate):
             base = base.lighter(128) if base.value() > 24 else QColor(BG_HOVER)
         if hovered:
             base = base.lighter(122)
+        if duplicate:
+            base = QColor(STATUS_COLORS['risky'])
         painter.fillRect(rect, base)
 
         # Hairline between rows instead of a full grid - separation without a cage.

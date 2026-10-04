@@ -19,7 +19,7 @@ from scripts.gui.settings_dialog import (CREDENTIAL_KEYS, TABS, SettingsComboBox
 
 # Keys that are state rather than settings: window geometry, column widths, the toolbar
 # layout and the recent-folder list are all written by the UI as you use it.
-NOT_ON_A_TAB = {'AO_UI_HIDDEN_COLUMNS', 'AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS',
+NOT_ON_A_TAB = {'AO_UI_HIDDEN_COLUMNS', 'AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS', 'AO_UI_SORT',
                 'AO_UI_COPY_RECENT_LIST', 'AO_TOOLBAR', 'AO_PROVIDER',
                 'AO_TEMPERATURE', 'AO_MAX_TOKENS', 'AO_TIMEOUT', 'AO_MAX_RETRIES'}
 

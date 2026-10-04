@@ -94,6 +94,10 @@ def _skeleton(stem: str) -> str:
     Returns '' when nothing but digits and punctuation is left, which means the name
     identifies no book at all and cannot be grouped on.
     """
+    # Upload descriptions after an explicit chapter number do not name another book.
+    chapter = re.search(r'\bchapter[\s._#-]*\d+\b', stem, re.I)
+    if chapter:
+        stem = stem[:chapter.end()]
     text = re.sub(r'\d+', '', stem)
     text = re.sub(r'[\s._\-\[\]()]+', ' ', text).strip().lower()
     return text if re.search(r'[a-z]', text) else ''
@@ -130,14 +134,21 @@ class FileScanner:
 
     # ---------------------------------------------------------------- scanning
 
-    def scan_directory(self) -> List[BookEntry]:
-        """Walk the input tree and return one entry per detected book."""
+    def scan_directory(self, should_stop=None) -> List[BookEntry]:
+        """Walk the input tree and return one entry per detected book.
+
+        `should_stop` is polled once per folder, so a cancelled load stops walking
+        instead of reading tags from every folder that is left.
+        """
         if not self.input_dir.exists():
             self.logger.error('Input directory does not exist: %s', self.input_dir)
             return []
 
         entries: List[BookEntry] = []
         for root, dirs, files in os.walk(self.input_dir):
+            if should_stop is not None and should_stop():
+                self.logger.info('Scan of %s cancelled', self.input_dir)
+                return []
             dirs.sort()
             root_path = Path(root)
             audio_files = sorted(f for f in files
@@ -153,7 +164,8 @@ class FileScanner:
                          self.input_dir, len(entries), 'y' if len(entries) == 1 else 'ies')
         return entries
 
-    def audio_index(self) -> Optional[Dict[str, int]]:
+    def audio_index(self, names: Optional[Dict[str, str]] = None
+                    ) -> Optional[Dict[str, int]]:
         """Every audio file under the input folder -> its size. None if unreadable.
 
         Directory listings only, no tag reads: enough to answer "does the table still
@@ -169,32 +181,49 @@ class FileScanner:
                 if not name.lower().endswith(self.supported_audio):
                     continue
                 path = Path(root) / name
+                key = os.path.normcase(str(path))
+                if names is not None:
+                    names[key] = str(path)
                 try:
-                    index[os.path.normcase(str(path))] = path.stat().st_size
+                    index[key] = path.stat().st_size
                 except OSError:
-                    index[os.path.normcase(str(path))] = -1
+                    index[key] = -1
         return index
 
     def compare_to_entries(self, entries: List[BookEntry]) -> Dict[str, int]:
         """How far the loaded entries have drifted from what is on disk now.
 
         Returns counts of files ``added``, ``missing`` and ``changed`` (same path, new
-        size). All zero means a rescan would find nothing new - which is the only case
+        size), and ``empty``: books in the list with none of their files left on disk,
+        which Inputs offers to remove. All zero means a rescan would find nothing new - which is the only case
         in which carrying on with saved entries is safe rather than merely convenient.
+
+        ``files`` names exactly which: the paths behind each count, and the entry ids of
+        the empty books, so every warning built on this can list what it is about.
         """
-        index = self.audio_index()
+        from .load_options import entries_without_files
+
+        names: Dict[str, str] = {}
+        index = self.audio_index(names)
         if index is None:
-            return {'added': 0, 'missing': 0, 'changed': 0, 'unreadable': 1}
+            return {'added': 0, 'missing': 0, 'changed': 0, 'unreadable': 1, 'empty': 0,
+                    'files': {'added': [], 'missing': [], 'changed': [], 'empty': []}}
 
         # The size the file had *when it was scanned*, not the size it has now - the
         # whole question is whether those two still agree. An entry saved before sizes
         # were recorded reports None and is compared on paths alone.
         known: Dict[str, Optional[int]] = {}
         for entry in entries:
+            # An applied book was moved to the library; its record still names the
+            # folder it came from. Counted once as an empty book below, not once per
+            # chapter file as "missing".
+            if entry.status == 'applied':
+                continue
             sizes = list(entry.audio_sizes)
             for position, path in enumerate(entry.absolute_files()):
-                known[os.path.normcase(str(path))] = (sizes[position]
-                                                      if position < len(sizes) else None)
+                key = os.path.normcase(str(path))
+                names.setdefault(key, str(path))
+                known[key] = sizes[position] if position < len(sizes) else None
 
         # Entries can point outside the input folder - anything already applied and
         # moved does - and those are not "missing from disk", they are simply not here.
@@ -205,8 +234,14 @@ class FileScanner:
         missing = [key for key in inside if key not in index]
         changed = [key for key, size in inside.items()
                    if size is not None and key in index and index[key] != size]
+        empty = entries_without_files(entries)
         return {'added': len(added), 'missing': len(missing),
-                'changed': len(changed), 'unreadable': 0}
+                'changed': len(changed), 'unreadable': 0,
+                'empty': len(empty),
+                'files': {'added': sorted(names[key] for key in added),
+                          'missing': sorted(names[key] for key in missing),
+                          'changed': sorted(names[key] for key in changed),
+                          'empty': [entry.entry_id for entry in empty]}}
 
     def _entries_for_folder(self, folder: Path, audio_files: List[str],
                             image_files: List[str]) -> List[BookEntry]:
@@ -266,12 +301,34 @@ class FileScanner:
 
         whole = [name for name, size in sizes.items()
                  if size >= 4 * median and size * 2 >= total - size]
+        if whole and self._is_track_run(files):
+            return [], files
         if not whole or len(whole) == len(files):
             return [], files
 
         self.logger.debug('%s: %s look like the whole book, not chapters',
                           folder, ', '.join(whole))
         return sorted(whole), [name for name in files if name not in set(whole)]
+
+    @staticmethod
+    def _is_track_run(files: List[str]) -> bool:
+        """True when every file is one track of a single 1..N numbered set.
+
+        "15 The Road to the Sea.mp3" after "01 I Remember Babylon" .. "14 Dog Star" is
+        track 15 of a numbered set: a long story, not the collection repeated in one
+        file. A real whole-book copy sits outside the run - "05 Ceremony in Death.mp3"
+        beside "05 Ceremony in Death-1" .. "-9" repeats the book number and has no part
+        number, so it does not slot in.
+        """
+        leading = []
+        for each in files:
+            match = re.match(r'\s*(\d+)', Path(each).stem)
+            if not match:
+                return False
+            leading.append(int(match.group(1)))
+        if len(set(leading)) != len(leading):
+            return False
+        return max(leading) - min(leading) + 1 == len(leading)
 
     def _make_entry(self, folder: Path, audio_files: List[str], image_files: List[str],
                     multi_book: bool) -> BookEntry:

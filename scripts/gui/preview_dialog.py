@@ -8,10 +8,12 @@ book folder, files - and lets you collapse the parts you have already eyeballed.
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QHBoxLayout, QLabel, QPushButton, QTreeWidget,
@@ -25,18 +27,48 @@ COLUMNS = ['Destination', 'Operation', 'Source']
 PREVIEW_WIDTHS_KEY = 'AO_UI_PREVIEW_COLUMN_WIDTHS'
 
 
-def restore_preview_widths(tree: QTreeWidget, settings) -> None:
-    """Restore shared preview widths, with a readable Operation default."""
-    saved = (settings.get(PREVIEW_WIDTHS_KEY) if settings is not None else '') or ''
+def restore_preview_widths(tree: QTreeWidget, settings=None) -> None:
+    """Fit the columns to what they hold: Destination first, Source gets the rest.
+
+    Operation is sized to its longest label plus 15%, Destination is widened until
+    every name in it is visible, and Source - the least important column - takes what
+    is left. Widths saved from an earlier drag are not reapplied: they are what left
+    Destination and Operation cut off.
+    """
+    tree.header().setStretchLastSection(True)
+    tree.setTextElideMode(Qt.TextElideMode.ElideLeft)
+    header = tree.header()
+    operation = int(max(tree.sizeHintForColumn(1),
+                        header.sectionSizeHint(1)) * 1.15) + 8
+    destination = max(tree.sizeHintForColumn(0), header.sectionSizeHint(0)) + 24
+    available = tree.viewport().width()
+    if available > 0:
+        # Source keeps a sliver so it never vanishes outright.
+        destination = min(destination, max(200, available - operation - 120))
+    tree.setColumnWidth(1, operation)
+    tree.setColumnWidth(0, destination)
+
+
+def common_source_root(paths) -> str:
+    """The folder every source path starts with, or '' when they share none."""
+    folders = [str(Path(path).parent) for path in paths if str(path)]
+    if not folders:
+        return ''
     try:
-        widths = [int(value) for value in saved.split(',')]
+        root = os.path.commonpath(folders)
     except ValueError:
-        widths = []
-    if len(widths) == len(COLUMNS) and all(value >= 40 for value in widths):
-        for index, width in enumerate(widths):
-            tree.setColumnWidth(index, width)
-    else:
-        tree.setColumnWidth(1, 130)
+        return ''
+    return '' if not root or Path(root) == Path(root).anchor else root
+
+
+def strip_root(path, root: str) -> str:
+    """`path` relative to `root`, or unchanged when it is not under it."""
+    if not root:
+        return str(path)
+    try:
+        return str(Path(path).relative_to(root))
+    except ValueError:
+        return str(path)
 
 
 def save_preview_widths(tree: QTreeWidget, settings) -> None:
@@ -50,25 +82,54 @@ def save_preview_widths(tree: QTreeWidget, settings) -> None:
         pass
 
 
+def _natural_key(text: str) -> tuple:
+    """Sort key that compares runs of digits (and decimals) as numbers."""
+    parts = re.split(r'(\d+(?:\.\d+)?)', text.casefold())
+    return tuple((0, float(part), '') if index % 2 else (1, 0.0, part)
+                 for index, part in enumerate(parts))
+
+
+def _sort_folders(node: QTreeWidgetItem) -> None:
+    """Order a node's folder children naturally; files keep their planned order."""
+    children = node.takeChildren()
+    folders = sorted((c for c in children
+                      if c.data(0, Qt.ItemDataRole.UserRole) != 'file'),
+                     key=lambda c: _natural_key(c.text(0)))
+    files = [c for c in children if c.data(0, Qt.ItemDataRole.UserRole) == 'file']
+    node.addChildren(folders + files)
+    for folder in folders:
+        _sort_folders(folder)
+
+
 class PreviewDialog(QDialog):
     """Tree view of an apply plan (#21). Read-only - nothing here writes anything."""
 
     # Emitted with a Settings tab name when a link on this dialog is followed.
     settings_requested = pyqtSignal(str)
+    # Refresh: build the preview again from the files as they are now.
+    refresh_requested = pyqtSignal()
 
     def __init__(self, results: List, output_root: Path, dry_run: bool = True,
-                 parent=None, settings=None):
+                 parent=None, settings=None, stale_ids=None):
         super().__init__(parent)
         self.results = list(results)
+        # Books shown from the plan they had before Finalize moved them.
+        self.stale_ids = set(stale_ids or ())
+        self.missing_sources = 0
         self.output_root = Path(output_root)
         # When given, the rename switches on this dialog edit it directly.
         self.settings = settings
 
         applied = sum(1 for r in self.results if r.ok)
         skipped = sum(1 for r in self.results if r.skipped)
+        rejected = sum(1 for r in self.results if getattr(r, 'rejected', False))
         failed = sum(1 for r in self.results if r.error)
 
         self.setWindowTitle('Preview' if dry_run else 'Apply results')
+        # A normal window: resizable, with minimise and maximise.
+        self.setWindowFlags(Qt.WindowType.Window
+                            | Qt.WindowType.WindowMinMaxButtonsHint
+                            | Qt.WindowType.WindowCloseButtonHint)
         # The same width as the review table this is a preview of - see
         # theme.table_modal_width. 1500 is the fallback for a dialog with no window
         # behind it: wide enough to read a real tree of author/series/title folders
@@ -82,7 +143,8 @@ class PreviewDialog(QDialog):
         headline = QLabel(
             f'<b>{len(self.results)}</b> entries &nbsp;·&nbsp; '
             f'<span style="color:{STATUS_TEXT["approved"]}">{applied} ok</span> &nbsp;·&nbsp; '
-            f'<span style="color:{STATUS_TEXT["risky"]}">{skipped} skipped</span> &nbsp;·&nbsp; '
+            f'<span style="color:{STATUS_TEXT["risky"]}">{skipped} skipped'
+            f'{f" ({rejected} rejected)" if rejected else ""}</span> &nbsp;·&nbsp; '
             f'<span style="color:{STATUS_TEXT["rejected"]}">{failed} failed</span>')
         layout.addWidget(headline)
 
@@ -98,13 +160,26 @@ class PreviewDialog(QDialog):
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
         self.tree.header().setStretchLastSection(True)
-        self.tree.setColumnWidth(0, 760)
         layout.addWidget(self.tree, stretch=1)
 
         self._build_tree()
-        restore_preview_widths(self.tree, self.settings)
-        self.tree.header().sectionResized.connect(
-            lambda *_: save_preview_widths(self.tree, self.settings))
+        if dry_run:
+            self._collapse_books()
+
+        if self.stale_ids or self.missing_sources:
+            books = len(self.stale_ids)
+            warning = QLabel(
+                f'⚠ {books} book{"" if books == 1 else "s"} '
+                f'{"is" if books == 1 else "are"} shown as last previewed or finalized. '
+                f'{self.missing_sources} source file'
+                f'{"" if self.missing_sources == 1 else "s"} no longer exist'
+                f'{"s" if self.missing_sources == 1 else ""} at the Source path '
+                f'(marked "missing"). Press Refresh to preview the files as they '
+                f'are now.')
+            warning.setWordWrap(True)
+            warning.setStyleSheet(f'color: {STATUS_TEXT["risky"]};')
+            layout.insertWidget(layout.indexOf(self.tree), warning)
+        restore_preview_widths(self.tree)
 
         buttons = QHBoxLayout()
         self.show_files = QCheckBox('Show individual files')
@@ -157,11 +232,24 @@ class PreviewDialog(QDialog):
 
         buttons.addStretch(1)
 
+        refresh = QPushButton('Refresh')
+        refresh.setToolTip('Preview again from the files as they are now')
+        refresh.clicked.connect(self.refresh_requested.emit)
+        buttons.addWidget(refresh)
+
         close = QPushButton('Close')
         close.setProperty('accent', True)
         close.clicked.connect(self.accept)
         buttons.addWidget(close)
         layout.addLayout(buttons)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, lambda: restore_preview_widths(self.tree))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        restore_preview_widths(self.tree)
 
     # ------------------------------------------------------------------ build
 
@@ -180,8 +268,20 @@ class PreviewDialog(QDialog):
         # are looked up by their relative path rather than created per result.
         folders: Dict[Path, QTreeWidgetItem] = {Path('.'): root}
         problems: List = []
+        rejected: List = []
+        # Every source usually sits under the same input folder; printing it on every
+        # row is what pushed the useful part out of view. It goes in the header once.
+        self.source_root = common_source_root(
+            op['source'] for result in self.results
+            if not (result.error or result.skipped) for op in result.operations)
+        if self.source_root:
+            self.tree.headerItem().setText(
+                2, f'Source  (in {self._display(self.source_root)})')
 
         for result in self.results:
+            if getattr(result, 'rejected', False):
+                rejected.append(result)
+                continue
             if result.error or result.skipped:
                 problems.append(result)
                 continue
@@ -200,10 +300,21 @@ class PreviewDialog(QDialog):
                 label = target.name
                 operation = (f'{op["operation"]} + rename' if renamed
                              else op['operation'])
-                child = QTreeWidgetItem([label, operation, self._display(source)])
+                missing = (result.entry_id in self.stale_ids
+                           and not source.exists())
+                if missing:
+                    self.missing_sources += 1
+                    operation += '  (missing)'
+                child = QTreeWidgetItem([label, operation, strip_root(source, self.source_root)
+                                         if self.source_root else self._display(source)])
                 child.setForeground(0, QColor(ACCENT if renamed else TEXT))
-                child.setForeground(1, QColor(TEXT_DIM))
-                child.setForeground(2, QColor(TEXT_FAINT))
+                child.setForeground(1, QColor(STATUS_TEXT['risky'] if missing
+                                              else TEXT_DIM))
+                child.setForeground(2, QColor(STATUS_TEXT['risky'] if missing
+                                              else TEXT_FAINT))
+                if missing:
+                    child.setToolTip(2, 'This file is no longer here - it has been '
+                                        'moved since this plan was made')
                 child.setData(0, Qt.ItemDataRole.UserRole, 'file')
                 parent.addChild(child)
 
@@ -222,16 +333,45 @@ class PreviewDialog(QDialog):
                 trouble.addChild(item)
             trouble.setExpanded(True)
 
+        if rejected:
+            # Last, and on their own: you can see where they would have gone, but
+            # Finalize writes none of them.
+            group = QTreeWidgetItem([f'Skipped - rejected ({len(rejected)})',
+                                     'not written', ''])
+            group.setForeground(0, QColor(STATUS_TEXT['rejected']))
+            group.setForeground(1, QColor(STATUS_TEXT['rejected']))
+            group.setToolTip(0, 'Books you rejected. Finalize skips them - nothing is '
+                                'written for them.')
+            self.tree.addTopLevelItem(group)
+            for result in rejected:
+                has_plan = bool(result.operations)
+                name = (self._display(result.destination) if has_plan
+                        else result.entry_id)
+                book = QTreeWidgetItem([name, 'skip - rejected', ''])
+                book.setForeground(0, QColor(STATUS_TEXT['rejected']))
+                book.setForeground(1, QColor(STATUS_TEXT['rejected']))
+                for op in result.operations:
+                    source = Path(op['source'])
+                    child = QTreeWidgetItem([
+                        Path(op['destination']).name, 'skip',
+                        strip_root(source, self.source_root) if self.source_root
+                        else self._display(source)])
+                    child.setForeground(0, QColor(TEXT_FAINT))
+                    child.setForeground(1, QColor(TEXT_FAINT))
+                    child.setForeground(2, QColor(TEXT_FAINT))
+                    child.setData(0, Qt.ItemDataRole.UserRole, 'file')
+                    book.addChild(child)
+                group.addChild(book)
+
+        # Folders in name order, numbers by value: "07.5" before "10", "Book 2" before
+        # "Book 10". Results arrive in table order, which is not the order a library
+        # lists its books in.
+        _sort_folders(root)
+
         # Everything open by default. Checking an apply means reading the leaves -
         # the renamed files - so opening on a tree of closed author folders hides the
         # only part worth looking at, and "Collapse all" is right there for the rest.
         self.tree.expandAll()
-
-        # Size the name column to its deepest expanded path rather than a guess, so
-        # nothing is elided - this is the one view whose whole job is showing names.
-        self.tree.resizeColumnToContents(0)
-        self.tree.setColumnWidth(
-            0, min(max(self.tree.columnWidth(0) + 24, 420), 1100))
 
     def _folder_node(self, destination: Path, folders: Dict[Path, QTreeWidgetItem],
                      root: QTreeWidgetItem) -> QTreeWidgetItem:

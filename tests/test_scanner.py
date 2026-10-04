@@ -129,6 +129,32 @@ def test_one_books_chapters_are_not_split_by_title(tmp_path):
     assert len(entries[0].audio_files) == 5
 
 
+def test_chapter_upload_descriptions_do_not_split_book(tmp_path):
+    folder = tmp_path / "54 Don't Go to Sleep!"
+    descriptions = {13: ' (Happy 1st day of Summer)', 20: ' (Happy Saturday)',
+                    29: ' (the final chapter)'}
+    names = [f'Goosebumps reads Dont Go to Sleep Chapter {i}'
+             f'{descriptions.get(i, "")}.m4a' for i in range(1, 30)]
+    _touch(folder, names)
+    entries = FileScanner(str(tmp_path)).scan_directory()
+    assert len(entries) == 1
+    assert set(entries[0].audio_files) == set(names)
+    assert not entries[0].is_multi_book_folder
+
+
+def test_chapter_titles_keep_different_books_separate(tmp_path):
+    names = [f'{title} Chapter {i} - {description}.m4a'
+             for title in ('Dont Go to Sleep', 'Stay Out of the Basement')
+             for i, description in [(1, 'Opening'), (2, 'A different chapter')]]
+    _touch(tmp_path / 'loose', names)
+    entries = FileScanner(str(tmp_path)).scan_directory()
+    assert len(entries) == 2
+    assert all(len(entry.audio_files) == 2 for entry in entries)
+    assert all(entry.is_multi_book_folder for entry in entries)
+    assert all(len({name.split(' Chapter ')[0] for name in entry.audio_files}) == 1
+               for entry in entries)
+
+
 def test_numeric_only_names_are_left_alone(tmp_path):
     """"13-17.mp3" names no book, so the folder is judged the old way, not guessed at."""
     folder = tmp_path / 'loose'
@@ -195,13 +221,18 @@ def test_freshness_check_sees_what_changed(tmp_path):
     scanner = FileScanner(str(tmp_path))
     entries = scanner.scan_directory()
     assert scanner.compare_to_entries(entries) == {
-        'added': 0, 'missing': 0, 'changed': 0, 'unreadable': 0}
+        'added': 0, 'missing': 0, 'changed': 0, 'unreadable': 0, 'empty': 0,
+        'files': {'added': [], 'missing': [], 'changed': [], 'empty': []}}
 
     (folder / '03.mp3').write_bytes(b'audio')
-    assert scanner.compare_to_entries(entries)['added'] == 1
+    drift = scanner.compare_to_entries(entries)
+    assert drift['added'] == 1
+    assert drift['files']['added'] == [str(folder / '03.mp3')]
 
     (folder / '01.mp3').write_bytes(b'a different length entirely')
-    assert scanner.compare_to_entries(entries)['changed'] == 1
+    drift = scanner.compare_to_entries(entries)
+    assert drift['changed'] == 1
+    assert drift['files']['changed'] == [str(folder / '01.mp3')]
 
     gone = FileScanner(str(tmp_path / 'nowhere'))
     assert gone.compare_to_entries(entries)['unreadable'] == 1
@@ -292,3 +323,18 @@ def test_no_duration_rule_anywhere(tmp_path):
     assert 'audio.info' not in code and 'getattr(audio' not in code
     assert not hasattr(FileScanner, 'looks_like_chapters')
     assert not hasattr(FileScanner, '_median_duration_minutes')
+
+
+def test_applied_books_with_their_files_gone_count_as_empty_not_missing(tmp_path):
+    """A moved book's chapters are not "missing" files; the book is one empty entry."""
+    folder = tmp_path / 'book'
+    _touch(folder, ['01.mp3', '02.mp3', '03.mp3'])
+    scanner = FileScanner(str(tmp_path))
+    entries = scanner.scan_directory()
+    entries[0].status = 'applied'
+    for name in ('01.mp3', '02.mp3', '03.mp3'):
+        (folder / name).unlink()
+    drift = scanner.compare_to_entries(entries)
+    assert drift['missing'] == 0
+    assert drift['empty'] == 1
+    assert drift['files']['empty'] == [entries[0].entry_id]

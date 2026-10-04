@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
+from .table import ColumnTable
 from .theme import ACCENT, TEXT, TEXT_DIM, TEXT_FAINT
 
 COLUMNS = ['#', 'WHAT HAPPENED', 'KIND']
@@ -62,7 +63,7 @@ class HistoryDialog(QDialog):
         note.setStyleSheet(f'color: {TEXT_DIM};')
         layout.addWidget(note)
 
-        self.table = QTableWidget(0, len(COLUMNS))
+        self.table = ColumnTable(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(

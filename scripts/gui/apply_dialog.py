@@ -14,14 +14,17 @@ not a per-run choice - it is the choice, and this is where people make it.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QRadioButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
-from .preview_dialog import (COLUMNS, restore_preview_widths,
-                             save_preview_widths)
+from .item_list import books_lines, list_dialog
+from .preview_dialog import (COLUMNS, common_source_root, restore_preview_widths,
+                             strip_root)
 from .theme import ACCENT, STATUS_TEXT, TEXT_DIM, TEXT_FAINT
 
 
@@ -31,11 +34,14 @@ class ApplyDialog(QDialog):
     settings_requested = pyqtSignal(str)
     preview_requested = pyqtSignal()
 
-    def __init__(self, entries, settings, preview_result=None, parent=None):
+    def __init__(self, entries, settings, preview_results=None, parent=None,
+                 rejected=None):
         super().__init__(parent)
         self.settings = settings
         self.entries = list(entries)
         self.count = len(self.entries)
+        # Rejected books: skipped, never written. Named here so you know which.
+        self.rejected = list(rejected or ())
 
         self.setWindowTitle('Write approved books to disk')
         self.setMinimumWidth(700)
@@ -58,8 +64,22 @@ class ApplyDialog(QDialog):
             f'color: {TEXT_DIM}; border-left: 2px solid {ACCENT}; padding: 6px 10px;')
         layout.addWidget(self.summary)
 
-        if preview_result is not None:
-            layout.addWidget(self._build_preview(preview_result), stretch=1)
+        if self.rejected:
+            count = len(self.rejected)
+            skipped = QLabel(
+                f'<b>{count} rejected book{"" if count == 1 else "s"} skipped</b> - '
+                f'nothing is written for {"it" if count == 1 else "them"} &middot; '
+                f'<a href="list" style="color:{ACCENT}">show which</a>')
+            skipped.setTextFormat(Qt.TextFormat.RichText)
+            skipped.setStyleSheet(f'color: {STATUS_TEXT["rejected"]};')
+            skipped.linkActivated.connect(lambda _: list_dialog(
+                self, 'Rejected books skipped', 'Nothing is written for these books.',
+                [(f'Rejected ({count}):', books_lines(self.rejected, files=False))],
+                ['Close'], default=0))
+            layout.addWidget(skipped)
+
+        if preview_results:
+            layout.addWidget(self._build_preview(preview_results), stretch=1)
 
         undo = QLabel('Undo (Ctrl+Z) reverses this, and the History window can walk it '
                       'back further.')
@@ -159,20 +179,31 @@ class ApplyDialog(QDialog):
         column.addWidget(self.example)
         return box
 
-    def _build_preview(self, result) -> QGroupBox:
-        box = QGroupBox('One-book preview')
+    def _build_preview(self, results) -> QGroupBox:
+        box = QGroupBox('Preview of ' + (f'{len(results)} books' if len(results) > 1
+                                         else 'one book'))
         column = QVBoxLayout(box)
         self.preview_tree = QTreeWidget()
         self.preview_tree.setHeaderLabels(COLUMNS)
         self.preview_tree.setAlternatingRowColors(True)
         self.preview_tree.setUniformRowHeights(True)
-        for operation in result.operations:
-            self.preview_tree.addTopLevelItem(QTreeWidgetItem([
-                str(operation['destination']), operation['operation'],
-                str(operation['source'])]))
-        restore_preview_widths(self.preview_tree, self.settings)
-        self.preview_tree.header().sectionResized.connect(
-            lambda *_: save_preview_widths(self.preview_tree, self.settings))
+        root = common_source_root(operation['source'] for result in results
+                                  for operation in result.operations)
+        if root:
+            self.preview_tree.headerItem().setText(2, f'Source  (in {root})')
+        # One node per book - its destination folder - with the files under it.
+        for result in results:
+            book = QTreeWidgetItem([
+                str(result.destination),
+                result.error or ('skipped' if result.skipped else ''), ''])
+            self.preview_tree.addTopLevelItem(book)
+            for operation in result.operations:
+                book.addChild(QTreeWidgetItem([
+                    Path(operation['destination']).name, operation['operation'],
+                    strip_root(operation['source'], root)]))
+            book.setExpanded(True)
+        restore_preview_widths(self.preview_tree)
+        QTimer.singleShot(0, lambda: restore_preview_widths(self.preview_tree))
         column.addWidget(self.preview_tree)
 
         full = QPushButton('Open full preview...')

@@ -66,7 +66,7 @@ SCHEMA: Dict[str, tuple] = {
                           'Seconds to remember a failed lookup.'),
     'AO_RESUME_SCANS': ('true', 'bool', 'Reuse previously identified books.'),
 
-    # --- what a load keeps. The Load Input dialog writes these back, so the boxes
+    # --- what a load keeps. The Inputs dialog writes these back, so the boxes
     # you tick are the boxes you get next time.
     'AO_LOAD_KEEP_MANUAL': ('true', 'bool',
                             'Keep manually edited values when loading again.'),
@@ -76,6 +76,9 @@ SCHEMA: Dict[str, tuple] = {
                            'Minimum confidence for values kept when loading again.'),
     'AO_LOAD_KEEP_DECISIONS': ('false', 'bool',
                                'Keep approval and rejection decisions when loading again.'),
+    'AO_LOAD_LIST_ONLY': ('false', 'bool',
+                          'Load only lists the books; the initial scan waits until '
+                          'you start it.'),
 
     # --- review
     'AO_REVIEW_APPROVE_THRESHOLD': ('', 'percent',
@@ -146,8 +149,8 @@ SCHEMA: Dict[str, tuple] = {
                          'Show identification details for the selected row.'),
     'AO_UI_HIDDEN_COLUMNS': ('', 'str',
                              'Columns hidden in the review table.'),
-    'AO_UI_RESORT_LIVE': ('false', 'bool',
-                          'Re-sort the table whenever values change.'),
+    'AO_UI_RESORT_LIVE': ('true', 'bool',
+                          'Re-sort the table after a value or status changes.'),
     'AO_UI_ADVANCE_AFTER_DECISION': ('true', 'bool',
                                      'Select the next row after approving or rejecting.'),
     'AO_UI_CONFIRM_APPLY': ('true', 'bool',
@@ -156,6 +159,7 @@ SCHEMA: Dict[str, tuple] = {
                               'Reopen with the last window size and panel split.'),
     'AO_UI_WINDOW': ('', 'str', 'Saved window layout.'),
     'AO_UI_COLUMN_WIDTHS': ('', 'str', 'Saved table column widths.'),
+    'AO_UI_SORT': ('', 'str', 'Saved table sort: column number and asc/desc.'),
     'AO_UI_COPY_RECENT_LIST': ('', 'str', 'Recently used copy actions.'),
 
     # --- chapter merging (the modal remembers what you chose last time)
@@ -179,6 +183,9 @@ SCHEMA: Dict[str, tuple] = {
     'AO_FFMPEG_PATH': ('ffmpeg', 'str',
                        'ffmpeg executable used for chapter merging.'),
     'AO_LOG_LEVEL': ('DEBUG', 'choice:DEBUG|INFO|WARNING|ERROR', 'Log detail level.'),
+    'AO_CHANGE_LOG_MB': ('200', 'int',
+                         'Size in MB at which logs/changes.jsonl is rotated to '
+                         'changes.1.jsonl.'),
     'AO_THREADS': ('4', 'int', 'Maximum number of parallel jobs.'),
 }
 

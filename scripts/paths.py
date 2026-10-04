@@ -141,6 +141,9 @@ def sanitize_component(text: str, fallback: str = 'Unknown',
         return fallback
 
     text = unicodedata.normalize('NFC', str(text))
+    # A colon is always " - " whatever the strategy: "Title: Subtitle" reads as
+    # "Title - Subtitle", never "Title- Subtitle" or "Title -Subtitle".
+    text = re.sub(r'\s*:+\s*', ' - ', re.sub(r'^[\s:]*:|:[\s:]*$', '', text))
     for bad, good in _STRATEGIES.get(mode or _mode, _REPLACEMENTS).items():
         text = text.replace(bad, good)
     text = text.translate({ord(c): None for c in _CONTROL_CHARS})
@@ -177,7 +180,10 @@ def render_template(template: str, values: Dict[str, str]) -> str:
                                             else ''))
 
     for key in ('author', 'series', 'title', 'extension'):
-        value = sanitize_component(str(values.get(key, '') or ''), fallback='')
+        value = str(values.get(key, '') or '')
+        if key == 'title':
+            value = pad_title_number(value)
+        value = sanitize_component(value, fallback='')
         text = text.replace(f'{{{key}}}', value)
 
     # ".{extension}" with nothing to put in it leaves a trailing dot behind.
@@ -199,6 +205,35 @@ def render_template(template: str, values: Dict[str, str]) -> str:
             parts.append(part)
 
     return '/'.join(parts) if parts else 'Unknown'
+
+
+def display_index(value: Any) -> str:
+    """A stored book number as the output will write it: "2" -> "02", "1-3" -> "01-03".
+
+    The stored value stays unpadded (see ``clean_value``); this is for showing it, so
+    the grid reads the same as the names that Apply produces.
+    """
+    text = str(value or '').strip()
+    if not text or _index_pad < 2:
+        return text
+    return '-'.join(_format_number(part, f':0{_index_pad}d') for part in text.split('-'))
+
+
+def pad_title_number(title: str) -> str:
+    """Pad a book number the title ends in to the book-number width.
+
+    Plenty of series title each book by the series name and a number -
+    "Accidental Astronaut 2", "Arena 6" - so the number never passes through
+    ``{series_index}`` and sorts "Arena 10" before "Arena 2". Only a standalone
+    trailing number shorter than the width is touched: "Catch-22" and "1984" are left
+    alone, and AO_INDEX_PAD below 2 switches this off with the rest of the padding.
+    """
+    if _index_pad < 2:
+        return title
+    match = re.search(r'(?<=\s)(\d+)$', title.rstrip())
+    if not match or len(match.group(1)) >= _index_pad:
+        return title
+    return title.rstrip()[:match.start()] + match.group(1).zfill(_index_pad)
 
 
 def _render_number(text: str, key: str, raw: Any, default_spec: str = '') -> str:
@@ -236,6 +271,10 @@ def _format_number(value: str, spec: str) -> str:
     # integer format would round it away to "02". Pad the whole part, keep the rest.
     whole, dot, fraction = value.partition('.')
     if dot and fraction.isdigit() and whole.isdigit() and 'd' in spec:
+        # A prequel novella is "0.5", not "00.5": a leading zero alone is the number,
+        # and padding it only adds a second one.
+        if int(whole) == 0:
+            return '0.' + fraction
         return _format_number(whole, spec) + '.' + fraction
     try:
         return format(as_int if 'd' in spec and as_int is not None else value,

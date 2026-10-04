@@ -13,10 +13,15 @@ confidence, no network call is made at all.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from .models import (STATUS_PENDING, STATUS_RISKY, BookEntry, normalize)
+from .models import (STATUS_PENDING, STATUS_RISKY, BookEntry, Field, _llm_overrules,
+                     normalize)
+from .name_compare import compare_names
+
+SERIES_FIELDS = ("series", "series_index")
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +57,47 @@ class Resolver:
         self._api = api_client
         self._search = search_client
         self._llm = llm_client
-        self._llm_failed = False
+        self._llm_down = False
+        # Set by the controller: the queue run's record of source trouble. Sources
+        # that keep refusing are switched off for the rest of the run through it.
+        self.run_issues = None
+        # Set by the controller: every loaded entry, so the model can be shown the
+        # other books sharing a folder even when only one of them is being identified.
+        self.all_entries: Optional[Callable[[], List[BookEntry]]] = None
+        self._cancel: Optional[CancelCheck] = None
+
+    def _cancelled(self) -> bool:
+        """For the clients' backoff waits, so Cancel does not sit out a minute."""
+        return bool(self._cancel and self._cancel())
+
+    @property
+    def _llm_failed(self) -> bool:
+        if self.run_issues is not None:
+            return self.run_issues.is_disabled('llm')
+        return self._llm_down
+
+    def _llm_unavailable(self, entries: List[BookEntry], exc: Exception) -> None:
+        self._llm_down = True
+        if self.run_issues is not None:
+            self.run_issues.limited('llm', f'unavailable: {exc}', permanent=True)
+            for entry in entries:
+                self.run_issues.failed('llm', entry.entry_id, f'unavailable: {exc}')
+
+    def _llm_available(self) -> None:
+        """The provider answered, so a forced retry switches it back on for the run."""
+        self._llm_down = False
+        if self.run_issues is not None:
+            self.run_issues.restore('llm')
+
+    def _note_sources(self, entry: BookEntry, prefix: str, failures: Dict[str, str],
+                      skipped: List[str]) -> None:
+        """Tell the run which sources failed or were skipped for this book."""
+        if self.run_issues is None:
+            return
+        for name, why in (failures or {}).items():
+            self.run_issues.failed(f'{prefix}:{name}', entry.entry_id, why)
+        for name in skipped or []:
+            self.run_issues.skipped(f'{prefix}:{name}', entry.entry_id)
 
     # ----------------------------------------------------------- lazy clients
 
@@ -67,7 +112,7 @@ class Resolver:
     def api(self):
         if self._api is None:
             from .api_query import BookAPIClient
-            self._api = BookAPIClient(
+            self._api = api = BookAPIClient(
                 cache=self.cache,
                 sources=self.settings.get_list('AO_API_SOURCES'),
                 threshold=self.settings.get_float('AO_CONFIDENCE_SCORE', 0.80),
@@ -78,6 +123,8 @@ class Resolver:
                 # good-enough hit is a bandwidth optimisation, and you did not press
                 # the button to save bandwidth.
                 query_all=True)
+            api.run_issues = self.run_issues
+            api.should_cancel = self._cancelled
         return self._api
 
     @property
@@ -87,6 +134,8 @@ class Resolver:
             self._search = WebSearchClient(
                 cache=self.cache, timeout=self.settings.get_int('AO_TIMEOUT', 20),
                 settings=self.settings)
+            self._search.run_issues = self.run_issues
+            self._search.should_cancel = self._cancelled
         return self._search
 
     @property
@@ -120,17 +169,24 @@ class Resolver:
 
     def resolve(self, entry: BookEntry, tiers: Optional[List[str]] = None,
                 should_cancel: Optional[CancelCheck] = None,
-                on_tier: Optional[Callable[[str, int, int], None]] = None) -> BookEntry:
-        """Run the chain over one entry, in place. Returns the same entry."""
+                on_tier: Optional[Callable[[str, int, int], None]] = None,
+                fresh: bool = False) -> BookEntry:
+        """Run the chain over one entry, in place. Returns the same entry.
+
+        `fresh` skips the lookup cache and goes to the network. Only "Run again" on a
+        source's card asks for that; Identify reuses whatever was already looked up.
+        """
+        self._cancel = should_cancel
         tiers, api_sources = self._split_tiers(tiers)
         steps = [
             ('metadata', self.enable_metadata, self._tier_metadata),
             ('regex', self.enable_regex, self._tier_regex),
             ('api', self.enable_api,
              lambda e: self._tier_api(e, sources=api_sources,
-                                      forced=tiers is not None)),
-            ('search', self.enable_search, self._tier_search),
-            ('llm', self.enable_llm, self._tier_llm),
+                                      forced=tiers is not None, fresh=fresh)),
+            ('search', self.enable_search,
+             lambda e: self._tier_search(e, fresh=fresh)),
+            ('llm', self.enable_llm, lambda e: self._tier_llm(e, fresh=fresh)),
         ]
         selected = [(name, enabled, handler) for name, enabled, handler in steps
                     if (name in tiers if tiers is not None else enabled)]
@@ -177,13 +233,20 @@ class Resolver:
 
     def resolve_folder(self, entries: List[BookEntry], tiers: Optional[List[str]] = None,
                        should_cancel: Optional[CancelCheck] = None,
-                       on_tier: Optional[Callable[[str, int, int], None]] = None
-                       ) -> List[BookEntry]:
+                       on_tier: Optional[Callable[[str, int, int, BookEntry],
+                                                  None]] = None,
+                       fresh: bool = False) -> List[BookEntry]:
         """Resolve every entry in one folder, sharing what we learn between them (#11).
 
         `tiers` overrides the enabled-tier settings for this run, which is what the
         mode checkboxes on the main window pass in.
+
+        `on_tier` is called per entry. The network tiers run one book at a time, so
+        only the book being worked on reports them; the rest of the folder reports
+        "waiting" until its turn. Reporting every step to every book made a folder of
+        forty look like forty searches running at once.
         """
+        self._cancel = should_cancel
         if not entries:
             return entries
 
@@ -196,13 +259,16 @@ class Resolver:
             ('metadata', self.enable_metadata), ('regex', self.enable_regex),
             ('api', self.enable_api), ('search', self.enable_search),
             ('llm', self.enable_llm)) if wanted(name, enabled)]
-        completed_tiers = set()
+        completed: Dict[str, set] = {entry.entry_id: set() for entry in entries}
 
-        def report(name: str, finished: bool = False) -> None:
-            if finished:
-                completed_tiers.add(name)
-            if on_tier is not None:
-                on_tier(name, len(completed_tiers), len(selected))
+        def report(name: str, finished: bool = False,
+                   only: Optional[BookEntry] = None) -> None:
+            for target in ([only] if only is not None else entries):
+                done = completed[target.entry_id]
+                if finished:
+                    done.add(name)
+                if on_tier is not None:
+                    on_tier(name, len(done), len(selected), target)
 
         # Local tiers first, per entry - they're free and inform the shared step.
         for entry in entries:
@@ -226,48 +292,62 @@ class Resolver:
 
         self._share_within_folder(entries)
 
-        # One LLM call for the whole folder, when there's still something missing -
-        # or whenever the user asked for the LLM specifically.
-        needs_help = [e for e in entries
-                      if tiers is not None or not self._is_satisfied(e)]
-        if (needs_help and wanted('llm', self.enable_llm) and self.folder_reasoning
-                and len(entries) > 1 and not self._llm_failed):
-            if not (should_cancel and should_cancel()):
-                report('llm')
-                self._tier_llm_folder(entries)
-                self._share_within_folder(entries)
-                report('llm', True)
-
         # Then per-entry network tiers. An explicit request (`tiers` given) runs them
         # whatever we already know; only the automatic chain is allowed to skip.
         forced = tiers is not None
+        networked = [name for name in ('api', 'search') if name in selected]
+        if networked:
+            report('waiting')
         for entry in entries:
             if should_cancel and should_cancel():
                 return entries
             if forced or not self._is_satisfied(entry):
                 if wanted('api', self.enable_api):
-                    if entry is entries[0]:
-                        report('api')
+                    report('api', only=entry)
                     entry.begin_tier('api')
-                    self._tier_api(entry, sources=api_sources, forced=forced)
+                    self._tier_api(entry, sources=api_sources, forced=forced,
+                                   fresh=fresh)
+                    report('api', True, only=entry)
                 if wanted('search', self.enable_search) and (
                         forced or not self._is_satisfied(entry)):
-                    if entry is entries[0]:
-                        report('search')
+                    report('search', only=entry)
                     entry.begin_tier('search')
-                    self._tier_search(entry)
-                if (wanted('llm', self.enable_llm)
-                        and (forced or not self._is_satisfied(entry))
-                        and not self.folder_reasoning):
-                    if entry is entries[0]:
-                        report('llm')
+                    self._tier_search(entry, fresh=fresh)
+                    report('search', True, only=entry)
+            if networked:
+                for name in networked:
+                    completed[entry.entry_id].add(name)
+                report('waiting', only=entry)
+        # The model must see the database and search evidence from this run.
+        self._share_within_folder(entries)
+        needs_help = [entry for entry in entries
+                      if forced or not self._is_satisfied(entry)]
+        if needs_help and wanted('llm', self.enable_llm) and (
+                fresh or not self._llm_failed):
+            if should_cancel and should_cancel():
+                return entries
+            if self.folder_reasoning and len(entries) > 1:
+                # One request covers the whole folder, so every book is in it.
+                report('llm')
+                self._tier_llm_folder(entries)
+                self._share_within_folder(entries)
+            else:
+                for entry in needs_help:
+                    if should_cancel and should_cancel():
+                        return entries
+                    report('llm', only=entry)
                     entry.begin_tier('llm')
-                    self._tier_llm(entry)
+                    self._tier_llm(entry, fresh=fresh)
+                    report('llm', True, only=entry)
+                    report('waiting', only=entry)
+            report('llm', True)
+
+        for entry in entries:
             entry.resolved = True
             self._finalise(entry)
 
         for name in selected:
-            if name not in completed_tiers:
+            if any(name not in done for done in completed.values()):
                 report(name, True)
 
         self._share_within_folder(entries)
@@ -323,7 +403,7 @@ class Resolver:
                    'from': contributions, 'result': dict(found)})
 
     def _tier_api(self, entry: BookEntry, sources: Optional[List[str]] = None,
-                  forced: bool = False) -> None:
+                  forced: bool = False, fresh: bool = False) -> None:
         """Query the book databases and report what every one of them said.
 
         A manual run always queries every configured database and always goes to the
@@ -338,8 +418,18 @@ class Resolver:
                              f'yielded a title, an author, or even a usable filename')
             return
 
-        result = self.api.search(hints, sources=sources or None, force=forced)
+        # `forced` means "run even though the book looks resolved"; only `fresh`
+        # bypasses the cache. Tying the two together made every Identify you started
+        # re-query every database from scratch.
+        result = self.api.search(hints, sources=sources or None, force=fresh)
         ran = list(getattr(self.api, 'last_sources', []) or self.api.sources)
+        skipped = list(getattr(self.api, 'last_skipped', []) or [])
+        if not getattr(self.api, 'last_from_cache', False):
+            self._note_sources(entry, 'api', getattr(self.api, 'last_errors', {}),
+                               skipped)
+        if skipped:
+            entry.log('api', 'Skipped ' + ', '.join(skipped) + ': switched off for the '
+                      'rest of this run after it kept refusing requests.')
         sources_text = ', '.join(ran)
         candidates = list(getattr(self.api, 'last_candidates', []))
         by_source = dict(getattr(self.api, 'last_by_source', {}))
@@ -441,10 +531,17 @@ class Resolver:
             blocks.append(f'{source}: {len(rows)} result(s)\n{listing}{more}')
         return '\n'.join(blocks)
 
-    def _tier_search(self, entry: BookEntry) -> None:
+    def _tier_search(self, entry: BookEntry, fresh: bool = False) -> None:
         hints = self._hints(entry)
-        result = self.search.search(hints)
+        result = self.search.search(hints, force=fresh)
         raw = list(getattr(self.search, 'last_results', []))
+        skipped = list(getattr(self.search, 'last_skipped', []) or [])
+        if not getattr(self.search, 'last_from_cache', False):
+            self._note_sources(entry, 'search',
+                               getattr(self.search, 'last_failures', {}), skipped)
+        if skipped:
+            entry.log('search', 'Skipped ' + ', '.join(skipped) + ': switched off for '
+                      'the rest of this run after it kept refusing requests.')
         if raw:
             # Snippets are the single richest context the LLM tier gets: they routinely
             # spell out "Title by Author" even when no pattern here could parse them.
@@ -483,23 +580,59 @@ class Resolver:
                   {'applied': changed, 'held': held, 'result': dict(result),
                    'results': raw[:10]})
 
-    def _tier_llm(self, entry: BookEntry) -> None:
-        if self._llm_failed:
+    def _tier_llm(self, entry: BookEntry, fresh: bool = False) -> None:
+        # "Run again" forces the call even after the provider was switched off.
+        if self._llm_failed and not fresh:
             entry.log('llm', 'Skipped: the LLM provider is unreachable')
+            if self.run_issues is not None:
+                self.run_issues.skipped('llm', entry.entry_id)
             return
 
         hints = self._hints(entry)
         hints['path'] = self._relative_path(entry)
-        context = self._folder_context(entry)
+        hints['human'] = _human_fields(entry)
+        hints['sources'] = {name: entry.get_field(name).source
+                            for name in ('title', 'author', 'series', 'series_index')}
+        hints['findings'] = _findings(entry)
+        hints['extent'] = _extent(entry)
+        siblings = self._folder_siblings(entry)
+        if siblings or entry.is_multi_book_folder:
+            # The folder is shared with other entries, so the folder alone is not this
+            # item's path - given only that, the model identifies the folder instead.
+            hints['path'] = str(Path(hints['path']) / Path(entry.primary_audio).name)
+        sibling_files = {name for sibling in siblings for name in sibling['files']}
+        own_files = [Path(name).name for name in entry.audio_files]
+        context = [name for name in self._folder_context(entry)
+                   if name not in sibling_files and name not in own_files]
+        if siblings:
+            hints['name_parts'] = compare_names(
+                Path(entry.primary_audio).stem,
+                [Path(sibling['files'][0]).stem for sibling in siblings])
+            # Stated as a fact, not a conclusion: the same guess on several entries
+            # may be a shared collection name, or may be right for all of them.
+            own_title = normalize(entry.value('title'))
+            if own_title:
+                hints['title_shared'] = sum(
+                    normalize(sibling['title']) == own_title
+                    and sibling['sources'].get('title') != 'llm'
+                    for sibling in siblings)
 
         try:
-            result = self.llm.query_book(hints, context, evidence=entry.evidence)
+            result = self.llm.query_book(hints, context, evidence=entry.evidence,
+                                         book_files=own_files,
+                                         sibling_books=siblings)
         except Exception as exc:
-            self._llm_failed = True
+            self._llm_unavailable([entry], exc)
             entry.log('llm', f'Provider unavailable: {exc}', self._exchange())
             return
+        self._llm_available()
         if not result:
             entry.log('llm', 'No usable answer from the model', self._exchange())
+            return
+        if not result.get('identified', True):
+            entry.log('llm', 'The model found no name for this book: '
+                      + (result.get('reasoning') or 'the evidence does not name it'),
+                      self._exchange({'applied': [], 'held': [], 'result': result}))
             return
 
         confidence = result.get('confidence', 0.6)
@@ -523,7 +656,17 @@ class Resolver:
                 'author': entry.value('author'),
                 'series': entry.value('series'),
                 'series_index': entry.value('series_index'),
+                'human': _human_fields(entry),
+                'files': [Path(name).name for name in entry.audio_files],
             })
+        batch = {entry.entry_id for entry in entries}
+        siblings = [sibling for sibling in self._folder_siblings(entries[0])
+                    if sibling['entry_id'] not in batch]
+
+        stems = [Path(book['file']).stem for book in books]
+        stems += [Path(sibling['files'][0]).stem for sibling in siblings]
+        for i, book in enumerate(books):
+            book['name_parts'] = compare_names(stems[i], stems[:i] + stems[i + 1:])
 
         merged_evidence: Dict[str, Any] = {}
         for entry in entries:
@@ -535,12 +678,14 @@ class Resolver:
 
         try:
             result = self.llm.query_folder(folder_name, books,
-                                           evidence=merged_evidence or None)
+                                           evidence=merged_evidence or None,
+                                           sibling_books=siblings)
         except Exception as exc:
-            self._llm_failed = True
+            self._llm_unavailable(entries, exc)
             for entry in entries:
                 entry.log('llm', f'Provider unavailable: {exc}', self._exchange())
             return
+        self._llm_available()
         if not result:
             for entry in entries:
                 entry.log('llm', 'No usable answer from the model', self._exchange())
@@ -558,6 +703,11 @@ class Resolver:
                 entry = next((e for name, e in by_file.items()
                               if normalize(name) == normalize(item.get('file', ''))), None)
             if entry is None:
+                continue
+            if not item.get('identified', True):
+                entry.log('llm', 'The model found no name for this book'
+                          + (f': {reasoning}' if reasoning else ''),
+                          self._exchange({'applied': [], 'held': [], 'result': item}))
                 continue
             confidence = item.get('confidence', 0.6)
             offered = dict(item)
@@ -591,6 +741,15 @@ class Resolver:
         for name in ('author', 'title', 'series', 'series_index'):
             offered = values.get(name)
             if not offered:
+                # The model answering "no series" is an answer: a series the filename
+                # parser made out of the folder name is removed, not kept.
+                before = entry.get_field(name)
+                if (source == 'llm' and name in values and name in SERIES_FIELDS
+                        and not before.is_empty()
+                        and _llm_overrules(source, confidence or 0.0, before)):
+                    setattr(entry, name, Field(source='llm',
+                                               confidence=confidence or 0.0))
+                    applied.append(name)
                 continue
             before = entry.get_field(name)
             if entry.set_field(name, offered, source, confidence):
@@ -662,10 +821,43 @@ class Resolver:
             pass
         return list(entry.audio_files)
 
+    def _folder_siblings(self, entry: BookEntry) -> List[Dict[str, Any]]:
+        """The other books in this entry's folder, with what is believed about each.
+
+        Only the same folder: books in the parent or in subfolders are a library, not
+        a set of siblings, and would drown the model in unrelated names.
+        """
+        if self.all_entries is None or not entry.folder:
+            return []
+        try:
+            others = list(self.all_entries())
+        except Exception:
+            self.logger.exception('Could not list the loaded entries')
+            return []
+        here = _folder_key(entry.folder)
+        siblings = []
+        for other in others:
+            if other.entry_id == entry.entry_id or _folder_key(other.folder) != here:
+                continue
+            siblings.append({
+                'entry_id': other.entry_id,
+                'files': [Path(name).name for name in other.audio_files]
+                         or [Path(other.primary_audio).name],
+                'title': other.value('title'),
+                'author': other.value('author'),
+                'series': other.value('series'),
+                'series_index': other.value('series_index'),
+                'extent': _extent(other),
+                'sources': {name: other.get_field(name).source
+                            for name in ('title', 'author', 'series', 'series_index')},
+            })
+        siblings.sort(key=lambda sibling: sibling['files'][0].lower())
+        return siblings
+
     @staticmethod
     def _is_satisfied(entry: BookEntry) -> bool:
         """True when there's nothing worth spending a network call on."""
-        if entry.author.is_empty() or entry.title.is_empty():
+        if not entry.is_complete():
             return False
         # A book that claims a series but has no index is still incomplete.
         if not entry.series.is_empty() and entry.series_index.is_empty():
@@ -767,3 +959,75 @@ class Resolver:
             entry.status = STATUS_RISKY
         else:
             entry.status = STATUS_PENDING
+
+
+def _human_fields(entry: BookEntry) -> List[str]:
+    """The fields a person typed. The model is told these are fact, not a guess."""
+    return [name for name in ('title', 'author', 'series', 'series_index')
+            if entry.get_field(name).source == 'user' and entry.value(name)]
+
+
+def _folder_key(folder: str) -> str:
+    """A folder path in a form two spellings of the same directory compare equal in."""
+    return os.path.normcase(os.path.normpath(folder)) if folder else ''
+
+
+def _findings(entry: BookEntry) -> List[tuple]:
+    """What each tier found on its own this run, labelled, before any merging.
+
+    The combined values hide where each piece came from: a number the file name
+    carries and a different one a web result claimed collapse into a single guess, and
+    the model can no longer weigh one against the other.
+    """
+    fields = ('title', 'author', 'series', 'series_index', 'isbn')
+    file_name = Path(entry.primary_audio).name
+    found = []
+    for step in entry.trace:
+        data = step.get('data')
+        tier = step.get('tier')
+        if not isinstance(data, dict) or not isinstance(data.get('result'), dict):
+            continue
+        result = {key: str(data['result'][key]) for key in fields
+                  if data['result'].get(key)}
+        if not result:
+            continue
+        notes: Dict[str, str] = {}
+        if tier == 'metadata':
+            label = 'File tags'
+        elif tier == 'regex':
+            label = 'Parsed from the file and folder names'
+            for key, origin in (data.get('from') or {}).items():
+                if key in result:
+                    notes[key] = ('from the file name' if origin == file_name
+                                  else f'from the folder "{origin}"')
+        elif tier == 'api':
+            row = data['result']
+            label = (f'Book database {row.get("source", "")}, best match '
+                     f'(word-similarity score {float(row.get("score", 0) or 0):.2f})')
+        elif tier == 'search':
+            label = 'Web search, best parsed result'
+        else:
+            continue
+        found.append((label, result, notes))
+    return found
+
+
+def _extent(entry: BookEntry) -> str:
+    """How much audio an entry holds - "512 MB, 9 h 05 min" - for the model to weigh.
+
+    The length is only known for the file whose tags were read, so it is given only
+    when that one file is the whole entry.
+    """
+    sizes = [size for size in entry.audio_sizes if size and size > 0]
+    parts = []
+    if sizes:
+        parts.append(f'{sum(sizes) / (1024 * 1024):.0f} MB')
+    seconds = (entry.raw_tags or {}).get('_duration_seconds')
+    if len(entry.audio_files) == 1 and seconds:
+        try:
+            minutes = int(float(seconds)) // 60
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes:
+            parts.append(f'{minutes // 60} h {minutes % 60:02d} min')
+    return ', '.join(parts)

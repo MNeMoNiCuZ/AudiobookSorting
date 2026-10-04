@@ -16,11 +16,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
-from PyQt6.QtCore import QEvent, QPointF, QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import (QEvent, QPointF, QRect, QRectF, QSize, Qt, QTimer,
+                          pyqtSignal)
 from PyQt6.QtGui import (QColor, QFont, QKeyEvent, QPainter, QPainterPath, QPen,
                          QPixmap)
-from PyQt6.QtWidgets import (QAbstractButton, QDialog, QLabel, QSizePolicy,
-                             QVBoxLayout)
+from PyQt6.QtWidgets import (QAbstractButton, QApplication, QDialog, QLabel,
+                             QMessageBox,
+                             QSizePolicy, QVBoxLayout)
 
 from .theme import BG_DARKEST, BG_RAISED, BORDER, TEXT, TEXT_DIM, TEXT_FAINT
 
@@ -62,8 +64,10 @@ class _Arrow(QAbstractButton):
         painter.setPen(QPen(QColor(BORDER), 1))
         painter.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
 
-        centre = self.rect().center()
-        reach = ARROW // 5
+        # QRect.center() rounds down, which put every chevron a pixel up and left of
+        # the disc's true centre.
+        centre = QRectF(self.rect()).center()
+        reach = ARROW / 5
         painter.setPen(QPen(QColor(TEXT if lit else TEXT_DIM), 2.4,
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                             Qt.PenJoinStyle.RoundJoin))
@@ -102,6 +106,8 @@ class CoverViewer(QDialog):
 
     # +1 / -1: move to the next or previous book in the visible table order.
     step_book = pyqtSignal(int)
+    # The path of an image file that was just deleted from disk.
+    image_deleted = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -160,7 +166,8 @@ class CoverViewer(QDialog):
         self.caption.setStyleSheet(f'color: {TEXT}; font-size: 13px;')
         layout.addWidget(self.caption)
 
-        self.hint = QLabel('← → images  ·  ↑ ↓ or scroll for books  ·  Esc closes')
+        self.hint = QLabel('← → images  ·  ↑ ↓ or scroll for books  ·  Del deletes the '
+                           'image  ·  Esc closes')
         self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.hint.setStyleSheet(f'color: {TEXT_FAINT}; font-size: 11px;')
         layout.addWidget(self.hint)
@@ -190,6 +197,37 @@ class CoverViewer(QDialog):
         if len(self._sources) < 2:
             return
         self._index = (self._index + delta) % len(self._sources)
+        self._load()
+
+    def _delete_current(self) -> None:
+        """Delete the image on screen from disk, after asking."""
+        if not self._sources:
+            return
+        label, source = self._sources[self._index]
+        if isinstance(source, bytes):
+            QMessageBox.information(
+                self, 'Delete image',
+                'This cover is embedded in the audio file, not a separate image, so '
+                'there is no file to delete.')
+            return
+        answer = QMessageBox.question(
+            self, 'Delete image',
+            f'Delete this image from disk?\n\n{source}',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            Path(source).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            QMessageBox.warning(self, 'Delete image', f'Could not delete {label}:\n{exc}')
+            return
+        del self._sources[self._index]
+        if self._index >= len(self._sources):
+            self._index = max(0, len(self._sources) - 1)
+        self.image_deleted.emit(Path(source))
         self._load()
 
     def _load(self) -> None:
@@ -313,11 +351,58 @@ class CoverViewer(QDialog):
 
     # ------------------------------------------------------------------ events
 
+    # --------------------------------------------------------- click-away close
+
+    def _artwork_rect(self) -> QRect:
+        """Where the scaled picture sits inside the image label."""
+        pixmap = self.image.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return QRect()
+        size = pixmap.deviceIndependentSize().toSize()
+        area = self.image.rect()
+        return QRect(area.center().x() - size.width() // 2,
+                     area.center().y() - size.height() // 2,
+                     size.width(), size.height())
+
+    def mousePressEvent(self, event) -> None:
+        # A click on the margin, caption or hint - anywhere but the picture - closes.
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.close()
+            return
+        super().mousePressEvent(event)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
+            # Deferred, because the window taking focus is only known afterwards. A
+            # dialog of our own (the delete confirmation) is not "outside".
+            QTimer.singleShot(0, self._close_if_clicked_away)
+
+    def _close_if_clicked_away(self) -> None:
+        if not self.isVisible() or self.isActiveWindow():
+            return
+        active = QApplication.activeWindow()
+        if active is None:
+            # Focus went to another program, not to a window of ours.
+            return
+        while active is not None:
+            if active is self:
+                return
+            active = active.parentWidget()
+        if QApplication.activeModalWidget() is not None:
+            return
+        self.close()
+
     def eventFilter(self, watched, event) -> bool:
         if watched is self.image and event.type() == QEvent.Type.Resize:
             # Safe against recursion: the label's size policy is Ignored, so setting a
             # pixmap here cannot resize it back.
             self._render()
+        elif (watched is self.image and event.type() == QEvent.Type.MouseButtonPress
+              and event.button() == Qt.MouseButton.LeftButton
+              and not self._artwork_rect().contains(event.position().toPoint())):
+            self.close()
+            return True
         elif event.type() == QEvent.Type.Wheel:
             # The picture and the arrows cover most of the window, and a wheel notch
             # over a child is still a wheel notch over the viewer. Handled here rather
@@ -361,5 +446,8 @@ class CoverViewer(QDialog):
             return
         if key == Qt.Key.Key_Up and self._has_prev:
             self.step_book.emit(-1)
+            return
+        if key == Qt.Key.Key_Delete:
+            self._delete_current()
             return
         super().keyPressEvent(event)

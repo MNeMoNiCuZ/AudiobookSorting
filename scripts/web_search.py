@@ -70,19 +70,30 @@ class WebSearchClient:
         self.last_results: List[Dict[str, str]] = []
         self.last_from_cache = False
         self.last_error = ''
+        # Shared across the queue run (see run_issues): growing waits for a site that
+        # throttles, and switching it off once it keeps refusing.
+        self.run_issues = None
+        self.should_cancel = None
+        # site -> why it failed on the last search; sites skipped because the run had
+        # switched them off.
+        self.last_failures: Dict[str, str] = {}
+        self.last_skipped: List[str] = []
 
-    def search(self, hints: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """Return recovered fields, or None."""
+    def search(self, hints: Dict[str, str],
+               force: bool = False) -> Optional[Dict[str, Any]]:
+        """Return recovered fields, or None. `force` skips the cache."""
         self.last_sites = []
         self.last_results = []
         self.last_from_cache = False
+        self.last_failures = {}
+        self.last_skipped = []
         subject = _subject(hints)
         self.last_query = query = (f'{subject} audiobook series' if subject else '')
         if not subject:
             return None
 
         cache_key = normalize(query)
-        if self.cache is not None:
+        if self.cache is not None and not force:
             cached = self.cache.get('websearch', cache_key, default=_UNSET)
             if cached is not _UNSET:
                 self.last_from_cache = True
@@ -113,7 +124,8 @@ class WebSearchClient:
 
         result = {k: v for k, v in result.items() if v}
         if not result:
-            if self.cache is not None:
+            # A miss caused by a refusing site is not an answer; ask again next run.
+            if self.cache is not None and not (self.last_failures or self.last_skipped):
                 self.cache.set_miss('websearch', cache_key)
             return None
 
@@ -127,11 +139,11 @@ class WebSearchClient:
     def _from_goodreads(self, hints: Dict[str, str]) -> Dict[str, str]:
         """Scrape the first Goodreads search hit, which carries clean series data."""
         query = _subject(hints)
-        if not query:
+        if not query or self._off('goodreads'):
             return {}
 
         html = self._get_text(
-            f'https://www.goodreads.com/search?q={quote_plus(query)}')
+            f'https://www.goodreads.com/search?q={quote_plus(query)}', 'goodreads')
         if not html:
             return {}
 
@@ -139,7 +151,8 @@ class WebSearchClient:
         if not match:
             return {}
 
-        book_html = self._get_text(urljoin('https://www.goodreads.com', match.group(1)))
+        book_html = self._get_text(urljoin('https://www.goodreads.com', match.group(1)),
+                                   'goodreads')
         if not book_html:
             return {}
         return self._parse_book_page(book_html)
@@ -293,18 +306,27 @@ class WebSearchClient:
         """
         self.last_error = ''
 
-        if self.brave_key:
+        if self.brave_key and self._off('brave'):
+            self.last_error = 'Brave was switched off for this run after refusing'
+        elif self.brave_key:
             try:
+                self._wait('brave')
                 results = self._brave(query)
+                self._ok('brave')
                 if results:
                     return results
                 self.last_error = 'Brave returned no rows'
             except Exception as exc:
                 self.last_error = f'Brave search failed: {exc}'
+                self._limited('brave', str(exc), permanent='rejected' in str(exc))
                 self.logger.debug('Brave failed (%s), falling back to DuckDuckGo', exc)
         else:
             self.last_error = ('no AO_SEARCH_BRAVE_KEY set, so only DuckDuckGo is '
                                'available and it blocks automated callers')
+
+        if self._off('duckduckgo'):
+            self._note('DuckDuckGo was switched off for this run after refusing')
+            return []
 
         try:
             from duckduckgo_search import DDGS
@@ -317,9 +339,12 @@ class WebSearchClient:
             self._note('duckduckgo-search is not installed')
         except Exception as exc:
             self._note(f'duckduckgo_search failed: {exc}')
+            if 'ratelimit' in type(exc).__name__.lower() or '429' in str(exc):
+                self._limited('duckduckgo', f'rate-limited: {exc}')
             self.logger.debug('duckduckgo_search failed (%s), falling back to HTML', exc)
 
-        html = self._get_text(f'https://html.duckduckgo.com/html/?q={quote_plus(query)}')
+        html = self._get_text(f'https://html.duckduckgo.com/html/?q={quote_plus(query)}',
+                              'duckduckgo')
         if not html:
             self._note('the HTML endpoint returned nothing (blocked or rate-limited)')
             return []
@@ -410,9 +435,33 @@ class WebSearchClient:
 
     # --------------------------------------------------------------- plumbing
 
-    def _get_text(self, url: str) -> str:
+    # ------------------------------------------------------------ run issues
+
+    def _off(self, site: str) -> bool:
+        if self.run_issues is not None and self.run_issues.is_disabled(f'search:{site}'):
+            if site not in self.last_skipped:
+                self.last_skipped.append(site)
+            return True
+        return False
+
+    def _wait(self, site: str) -> None:
+        if self.run_issues is not None:
+            self.run_issues.wait(f'search:{site}', self.should_cancel)
+
+    def _ok(self, site: str) -> None:
+        if self.run_issues is not None:
+            self.run_issues.ok(f'search:{site}')
+
+    def _limited(self, site: str, message: str, permanent: bool = False) -> None:
+        self.last_failures[site] = message
+        if self.run_issues is not None:
+            self.run_issues.limited(f'search:{site}', message, permanent=permanent)
+
+    def _get_text(self, url: str, site: str = '') -> str:
         import requests
 
+        if site:
+            self._wait(site)
         wait = self.min_interval - (time.time() - self._last_request)
         if wait > 0:
             time.sleep(wait)
@@ -426,10 +475,18 @@ class WebSearchClient:
                          'Accept-Language': 'en-US,en;q=0.9'})
         except requests.RequestException as exc:
             self.logger.debug('Fetch failed for %s: %s', url, exc)
+            if site:
+                self._limited(site, f'could not be reached: {exc}')
             return ''
         if response.status_code != 200:
             self.logger.debug('Fetch returned HTTP %d for %s', response.status_code, url)
+            code = response.status_code
+            if site and (code == 429 or code == 403 or code >= 500):
+                self._limited(site, 'rate-limited (HTTP 429)' if code == 429
+                              else f'refused the request (HTTP {code})')
             return ''
+        if site:
+            self._ok(site)
         return response.text
 
 

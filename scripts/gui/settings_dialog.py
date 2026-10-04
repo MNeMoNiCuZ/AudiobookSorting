@@ -105,10 +105,11 @@ TABS: Dict[str, list] = {
     ],
     # The load keys sit under the input folder because that is what they are about:
     # what survives when you load that folder over work you have already done. The
-    # Load Input dialog writes the same keys, so the two always agree.
+    # Inputs dialog writes the same keys, so the two always agree.
     'General': ['AO_INPUT_DIR', 'AO_OUTPUT_DIR', 'AO_LOAD_KEEP_MANUAL',
                 'AO_LOAD_KEEP_CONFIDENT', 'AO_LOAD_KEEP_ABOVE',
-                'AO_LOAD_KEEP_DECISIONS', 'AO_LOG_LEVEL', 'AO_THREADS'],
+                'AO_LOAD_KEEP_DECISIONS', 'AO_LOAD_LIST_ONLY', 'AO_LOG_LEVEL',
+                'AO_CHANGE_LOG_MB', 'AO_THREADS'],
 }
 
 # Settings that genuinely cannot take effect until the program is restarted, because
@@ -280,6 +281,7 @@ class SettingsDialog(QDialog):
             ('Ctrl+Z', 'Undo'),
             ('Ctrl+Y / Ctrl+Shift+Z', 'Redo'),
             ('Ctrl+H', 'Open undo history'),
+            ('Ctrl+O', 'Open the folders of the selected books'),
             ('Esc', 'Cancel the running operation'),
         )
         hotkeys = QGroupBox('Keyboard shortcuts')
@@ -1197,7 +1199,8 @@ class SettingsDialog(QDialog):
 
     # The saved layout is not on any tab as a field, so it is not covered by Restore
     # Defaults - these keys hold pixel counts written by the window when it closes.
-    LAYOUT_KEYS = ('AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS', 'AO_UI_HIDDEN_COLUMNS')
+    LAYOUT_KEYS = ('AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS', 'AO_UI_HIDDEN_COLUMNS',
+                   'AO_UI_SORT')
 
     def _reset_layout(self) -> None:
         """Throw away the remembered window size, split and column widths.

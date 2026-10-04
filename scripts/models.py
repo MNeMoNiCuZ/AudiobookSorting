@@ -89,6 +89,9 @@ class BookEntry:
     primary_audio: str = ''               # absolute path to the representative file
     image_files: List[str] = field(default_factory=list)
     is_multi_book_folder: bool = False    # siblings in this folder are other books
+    # Set when you combined entries into this one. A rescan groups these files back
+    # into this entry instead of splitting them the way the scanner would.
+    combined_by_user: bool = False
 
     # --- identity
     author: Field = field(default_factory=Field)
@@ -125,7 +128,7 @@ class BookEntry:
     quality_penalties: Dict[str, Any] = field(default_factory=dict)
     resolved: bool = False
     # Set only when a user-requested Identify or individual source run actually starts.
-    # The automatic metadata and filename pass performed by Load Input does not count.
+    # The automatic metadata and filename pass performed by Inputs does not count.
     explicit_work_pending: bool = False
 
     # ------------------------------------------------------------------ helpers
@@ -146,9 +149,23 @@ class BookEntry:
         value = clean_value(name, value)
         if not value:
             return False
+        # "Volume 3" or "Chapter 01" is a label, not a book's title, whoever says so.
+        # Only a value you typed yourself is taken as written.
+        if name == 'title' and source != 'user':
+            from .quality import PLACEHOLDER_TITLE
+            if PLACEHOLDER_TITLE.fullmatch(value):
+                return False
 
         current: Field = getattr(self, name)
         new_confidence = SOURCE_CONFIDENCE.get(source, 0.5) if confidence is None else confidence
+
+        # The model has the final say. It was shown the tags, the filename and every
+        # database row, so a later catalogue match ("Red Company: Contact") may only
+        # corroborate its answer ("Contact"), never replace it. That includes the
+        # model saying a book has no series: the empty field is still its answer.
+        if (current.source == 'llm' and source not in ('llm', 'user')
+                and _norm(current.value) != _norm(value)):
+            return False
 
         if not current.is_empty():
             # A value you typed is the one value here that is known rather than
@@ -161,6 +178,22 @@ class BookEntry:
                 if proposal not in self.pending_overwrites:
                     self.pending_overwrites.append(proposal)
                 return False
+            # Same words, different spelling: "THE LAZARUS PROTOCOL" against the
+            # model's "The Lazarus Protocol", or "Judicator Jane 2" against "Judicator
+            # Jane 02". The model's spelling wins whatever its confidence, and whoever
+            # held the old spelling counts as agreeing with it.
+            if (source == 'llm' and str(current.value) != value
+                    and _unpadded(current.value) == _unpadded(value)):
+                corroborated = list(current.corroborated_by)
+                if current.source and current.source not in corroborated:
+                    corroborated.append(current.source)
+                setattr(self, name, Field(
+                    value=value, source=source,
+                    confidence=min(0.99, max(current.confidence, new_confidence)
+                                   + (1.0 - max(current.confidence,
+                                                new_confidence)) * 0.4),
+                    corroborated_by=corroborated))
+                return True
             if _norm(current.value) == _norm(value):
                 if source not in current.corroborated_by and source != current.source:
                     current.corroborated_by.append(source)
@@ -169,7 +202,22 @@ class BookEntry:
                                              (1.0 - current.confidence) * 0.4)
                     return True
                 return False
-            if new_confidence <= current.confidence:
+            # The model read every source and cut the subtitle, series name or file
+            # label off a value we already hold: "The Quest Giver: An NPC LitRPG
+            # Adventure" -> "The Quest Giver". That is the same answer, cleaned, so it
+            # takes the place of the dirty one and keeps its confidence.
+            if source == 'llm' and name in ('title', 'series') and _is_cleaned_form(
+                    value, current.value):
+                corroborated = list(current.corroborated_by)
+                if current.source and current.source not in corroborated:
+                    corroborated.append(current.source)
+                setattr(self, name, Field(
+                    value=value, source=source,
+                    confidence=max(current.confidence, new_confidence),
+                    corroborated_by=corroborated))
+                return True
+            if (new_confidence <= current.confidence
+                    and not _llm_overrules(source, new_confidence, current)):
                 return False  # keep the better-sourced value, but record the disagreement
         setattr(self, name, Field(value=value, source=source, confidence=new_confidence))
         return True
@@ -209,7 +257,9 @@ class BookEntry:
         return [name for name in IDENTITY_FIELDS if getattr(self, name).is_empty()]
 
     def is_complete(self) -> bool:
-        return not self.author.is_empty() and not self.title.is_empty()
+        from .quality import has_multiple_authors
+        return (not self.author.is_empty() and not self.title.is_empty()
+                and not has_multiple_authors(self.value('author')))
 
     def dedupe_key(self) -> str:
         return f'{_norm(self.value("author"))}|{_norm(self.value("title"))}'
@@ -258,7 +308,7 @@ def pretty_status(status: str) -> str:
     The stored value is an identifier and stays lower-case forever; every place a
     human reads one goes through here so they all agree.
     """
-    labels = {'risky': 'Unsure'}
+    labels = {'risky': 'Unsure', 'applied': 'Finalized'}
     return labels.get(str(status or '').lower(),
                       str(status or '').replace('_', ' ').title())
 
@@ -342,6 +392,11 @@ def _drop_unbalanced_brackets(text: str) -> str:
     if not doomed:
         return text
     return ''.join(c for i, c in enumerate(text) if i not in doomed)
+
+
+def replace_colons(text: str) -> str:
+    """Every colon becomes " - ", with exactly one space on each side."""
+    return re.sub(r'\s*:+\s*', ' - ', text).strip()
 
 
 def tidy_text(text: str) -> str:
@@ -447,6 +502,9 @@ def clean_value(name: str, value: Any) -> str:
 
     text = re.sub(r'\s+', ' ', text)
     if name in FILTERED_FIELDS:
+        # ":" is never part of a name: it is illegal in a filename, so
+        # "Title: Subtitle" is stored as "Title - Subtitle".
+        text = replace_colons(text)
         text = apply_text_filters(text)
         if _tidy_punctuation:
             text = tidy_text(text)
@@ -466,6 +524,28 @@ def _clean_index(text: str) -> str:
     return str(int(number)) if number.is_integer() else str(number)
 
 
+def _llm_overrules(source: str, confidence: float, current: 'Field') -> bool:
+    """True when the model's answer replaces the value we hold.
+
+    "Introduction and Preface" read from a chapter's title tag scored 85%, the model
+    said "The Fountains of Paradise" at 85%, and the tie kept the chapter title. A
+    catalogue's "Red Company: Contact" at 98% likewise beat the model's "Contact".
+    Tags and catalogues are messy; only a value you typed outranks the model.
+
+    A fresh answer always replaces the model's own earlier one, whatever either
+    confidence: the earlier answer was drawn from older evidence and an older prompt,
+    and letting it outrank the new one leaves a stale answer that can never be fixed.
+    """
+    return (source == 'llm' and current.source != 'user'
+            and (confidence >= SOURCE_CONFIDENCE['llm'] or current.source == 'llm'))
+
+
+def _is_cleaned_form(cleaned: str, original: str) -> bool:
+    """True when `cleaned` is `original` with words trimmed off, and nothing added."""
+    short, long = _norm(cleaned), _norm(original)
+    return bool(short) and short != long and f' {short} ' in f' {long} '
+
+
 def _norm(text: str) -> str:
     """Aggressive normalisation used for comparison only, never for display."""
     text = unicodedata.normalize('NFKD', str(text)).encode('ascii', 'ignore').decode()
@@ -473,6 +553,11 @@ def _norm(text: str) -> str:
     text = re.sub(r'^(the|a|an)\s+', '', text)
     text = re.sub(r'[^a-z0-9]+', ' ', text)
     return text.strip()
+
+
+def _unpadded(text: str) -> str:
+    """The comparison form with book-number padding ignored: "Jane 02" == "Jane 2"."""
+    return re.sub(r'\b0+(?=\d)', '', _norm(text))
 
 
 def normalize(text: str) -> str:

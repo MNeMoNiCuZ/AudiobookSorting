@@ -62,7 +62,13 @@ def values(window, name):
     return [window.entries[f'e{index}'].value(name) for index in range(3)]
 
 
-def test_delete_clears_the_selected_cells(window):
+def test_delete_clears_the_selected_cells(window, monkeypatch):
+    from PyQt6.QtWidgets import QMessageBox
+
+    def unexpected_confirmation(*args):
+        pytest.fail('Clearing individual cells must not ask for whole-row confirmation')
+
+    monkeypatch.setattr(QMessageBox, 'question', unexpected_confirmation)
     select(window, [(0, COL_AUTHOR), (2, COL_TITLE)])
     press(window, Qt.Key.Key_Delete)
 
@@ -72,6 +78,41 @@ def test_delete_clears_the_selected_cells(window):
     window._undo_last()
     assert values(window, 'author') == ['A1', 'A2', 'A3']
     assert values(window, 'title') == ['One', 'Two', 'Three']
+
+
+@pytest.mark.parametrize('choice', ['list', 'drive', 'cancel'])
+@pytest.mark.parametrize('column', [None, 1, 6, 7])  # whole row, files, confidence, status
+def test_delete_on_a_book_asks_to_remove_it(window, monkeypatch, choice, column):
+    from PyQt6.QtWidgets import QMessageBox
+    from scripts.models import IDENTITY_FIELDS
+
+    book = window.entries['e0']
+    original = {name: book.value(name) for name in IDENTITY_FIELDS}
+    calls = []
+    monkeypatch.setattr(window, '_remove_from_list', lambda e: calls.append(('list', e)))
+    monkeypatch.setattr(window, '_delete_from_drive', lambda e: calls.append(('drive', e)))
+
+    def exec_(box):
+        buttons = {b.text(): b for b in box.buttons()}
+        target = {'list': 'Remove from list', 'drive': 'Delete from drive...'}.get(choice)
+        button = buttons[target] if target else box.button(
+            QMessageBox.StandardButton.Cancel)
+        button.click()
+        return 0
+
+    monkeypatch.setattr(QMessageBox, 'exec', exec_)
+    row = window._row_for(book.entry_id)
+    if column is None:
+        window.table.selectRow(row)
+    else:
+        select(window, [(row, column)])
+    press(window, Qt.Key.Key_Delete)
+
+    assert {name: book.value(name) for name in IDENTITY_FIELDS} == original
+    if choice == 'cancel':
+        assert calls == []
+    else:
+        assert calls == [(choice, [book])]
 
 
 def test_copy_puts_the_selected_block_on_the_clipboard(window):
@@ -115,7 +156,7 @@ def test_paste_leaves_read_only_columns_alone(window):
 
 
 def test_preview_with_no_selection_shows_what_finalize_would_write(window):
-    """Preview used to list every row, rejected books included."""
+    """The approved rows, plus the rejected ones - which the preview shows as skipped."""
     from scripts.models import STATUS_APPROVED, STATUS_REJECTED
 
     window.entries['e0'].status = STATUS_APPROVED
@@ -126,10 +167,24 @@ def test_preview_with_no_selection_shows_what_finalize_would_write(window):
 
     window.table.clearSelection()
     window._request_apply(preview=True)
-    assert sent == [(['e0'], True)]
+    assert sent == [(['e0', 'e1'], True)]
 
     # Nothing approved yet is the one case where previewing the lot is the answer.
     window.entries['e0'].status = 'pending'
     sent.clear()
     window._request_apply(preview=True)
     assert sent == [(['e0', 'e1', 'e2'], True)]
+
+
+def test_finalize_sends_rejected_rows_to_be_reported_as_skipped(window):
+    from scripts.models import STATUS_APPROVED, STATUS_REJECTED
+
+    window.settings.set('AO_UI_CONFIRM_APPLY', False)
+    window.entries['e0'].status = STATUS_APPROVED
+    window.entries['e1'].status = STATUS_REJECTED
+    sent = []
+    window.apply_requested.connect(lambda entries, preview: sent.append(
+        ([entry.entry_id for entry in entries], preview)))
+
+    window._request_apply(preview=False)
+    assert sent == [(['e0', 'e1'], False)]

@@ -24,6 +24,7 @@ from scripts.journal import ApplyJournal
 from scripts.models import (STATUS_APPROVED, STATUS_PENDING, STATUS_RISKY, BookEntry)
 from scripts.paths import PROJECT_ROOT, clean_temp
 from scripts.resolver import Resolver
+from scripts.run_issues import RunIssues
 from scripts.settings import get_settings
 from scripts.utils import setup_logging
 from scripts.version import APP_VERSION
@@ -38,12 +39,17 @@ class Application:
         self.settings = settings or get_settings()
         self.cache = Cache(self.settings.get_path('AO_CACHE_DB'),
                            miss_ttl=self.settings.get_int('AO_CACHE_MISS_TTL', 86400))
-        self.data = DataManager()
+        self.data = DataManager(
+            change_log_mb=self.settings.get_int('AO_CHANGE_LOG_MB', 200))
         # PROJECT_ROOT, not __file__: frozen into a one-file .exe the sources live in
         # a temp folder that is deleted on exit, and the undo journal with them.
         self.journal = ApplyJournal(PROJECT_ROOT / 'apply_journal.jsonl')
         self.scanner = FileScanner(str(self.settings.get_path('AO_INPUT_DIR')))
+        # Source trouble during one queue run, summarised when the queue drains.
+        self.run_issues = RunIssues()
         self.resolver = Resolver(self.settings, cache=self.cache)
+        self.resolver.run_issues = self.run_issues
+        self.resolver.all_entries = lambda: list(self.data.entries.values())
         self.file_ops = FileOperations(self.settings, journal=self.journal)
         self._apply_global_settings()
 
@@ -69,7 +75,11 @@ class Application:
         self.settings.reload()
         self.scanner = FileScanner(str(self.settings.get_path('AO_INPUT_DIR')))
         self.resolver = Resolver(self.settings, cache=self.cache)
+        self.resolver.run_issues = self.run_issues
+        self.resolver.all_entries = lambda: list(self.data.entries.values())
         self.file_ops = FileOperations(self.settings, journal=self.journal)
+        self.data.change_log_limit = (
+            max(1, self.settings.get_int('AO_CHANGE_LOG_MB', 200)) * 1024 * 1024)
         self._apply_global_settings()
 
     def scan(self) -> List[BookEntry]:
@@ -209,9 +219,14 @@ def check_scan_freshness(app: 'Application', window) -> Optional[dict]:
         window.set_scan_stale(None)
         return None
 
-    stale = any(drift.get(key) for key in ('added', 'missing', 'changed', 'unreadable'))
+    stale = any(drift.get(key) for key in ('added', 'missing', 'changed', 'unreadable',
+                                                'empty'))
     if stale:
-        logger.info('Input folder has drifted from the saved entries: %s', drift)
+        logger.info('Input folder has drifted from the saved entries: %s',
+                    {key: value for key, value in drift.items() if key != 'files'})
+        for kind, items in drift.get('files', {}).items():
+            for item in items:
+                logger.info('  %s: %s', kind, item)
     window.set_scan_stale(drift if stale else None)
     return drift if stale else None
 
@@ -279,7 +294,7 @@ def _under(folder: str, root: Path) -> bool:
 
 
 def run_gui(app: Application) -> int:
-    from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QMessageBox)
+    from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QMessageBox)
 
     from scripts.gui import MainWindow, PreviewDialog, SettingsDialog, apply_theme
     from scripts.workers import (ApplyWorker, FunctionWorker, ResolveWorker, ScanWorker,
@@ -351,9 +366,29 @@ def run_gui(app: Application) -> int:
         window.show_queue(workers.labels())
 
     workers.on_queue_change = sync_queue_rows
+
+    def run_finished():
+        """The queue drained: show what the sources had trouble with, if anything."""
+        summary = app.run_issues.summary()
+        app.run_issues.reset()
+        if summary:
+            window.show_run_issues(summary)
+
+    workers.on_idle = run_finished
     window.queue_remove_requested.connect(lambda index: (
         workers.remove(index), window.show_queue(workers.labels()),
         window.show_message('Removed a queued job')))
+    window.waiting_entries_provider = workers.waiting_entry_ids
+
+    def dequeue_entries(entry_ids):
+        removed = workers.remove_entries(entry_ids)
+        window.show_queue(workers.labels())
+        if removed:
+            window.show_message(
+                f'Removed {removed} book' + ('' if removed == 1 else 's')
+                + ' from the queue')
+
+    window.dequeue_entries_requested.connect(dequeue_entries)
     window.queue_clear_requested.connect(lambda: (
         workers.clear_queue(), window.show_queue(workers.labels()),
         window.show_message('Cleared the queue')))
@@ -411,12 +446,14 @@ def run_gui(app: Application) -> int:
         return True
 
     # --- load
-    def do_load(targets=None, keep=None):
+    def do_load(targets=None, keep=None, list_only=False):
         """The one load action: read the input folder, keeping what was asked for.
 
         `targets` is the books to load, or None for the whole input folder. `keep` is
         a KeepOptions; the window decides it (from the dialog, or "keep everything"
-        when the list is empty and there is nothing to decide).
+        when the list is empty and there is nothing to decide). `list_only` puts the
+        books in the list and stops there: no tag and filename pass, so nothing is
+        processed until you ask for it.
         """
         from scripts.load_options import KeepOptions, apply_keep
 
@@ -425,6 +462,7 @@ def run_gui(app: Application) -> int:
         if not require_path('AO_INPUT_DIR', 'input'):
             return
         keep = keep or KeepOptions.keep_everything()
+        app.data.backup('before-load')
 
         def cleared_note(plan):
             if not plan.cleared:
@@ -444,11 +482,13 @@ def run_gui(app: Application) -> int:
             for entry in targets:
                 window.upsert_entry(entry)
                 app.data.update(entry)
-            waiting = window.flash_unsaved(announce=False)
-            window.show_message(f'Loading {len(targets)} book'
+            waiting = window.flash_unsaved(announce=False, only=targets)
+            window.show_message(f'{"Listed" if list_only else "Loading"} '
+                                f'{len(targets)} book'
                                 f'{"" if len(targets) == 1 else "s"}'
                                 + cleared_note(plan) + unsaved_note(waiting))
-            do_resolve(targets, ['metadata', 'regex'], explicit=False)
+            if not list_only:
+                do_resolve(targets, ['metadata', 'regex'], explicit=False)
             return
 
         # The whole folder. Clearing happens before the scan, because the scan's own
@@ -458,7 +498,7 @@ def run_gui(app: Application) -> int:
         app.data.mark_dirty()
         worker = ScanWorker(app.scanner, app.data,
                             resume=app.settings.get_bool('AO_RESUME_SCANS', True),
-                            resolver=app.resolver,
+                            resolver=None if list_only else app.resolver,
                             dedupe=app.settings.get_bool('AO_DETECT_DUPLICATES', True),
                             cache=app.cache)
 
@@ -466,7 +506,11 @@ def run_gui(app: Application) -> int:
             entries = result.get('entries', [])
             flagged = result.get('duplicates', 0)
             # One rebuild after the duplicate pass, so the table and the library card
-            # on the right both reflect the final statuses.
+            # on the right both reflect the final statuses. The whole list, not only
+            # what the scan found: finalized books and books from another folder are
+            # kept by a load, so they stay in view.
+            if entries:
+                entries = app.data.all()
             window.set_entries(entries)
             window.set_busy(workers.busy)
             # The list has just been rebuilt from disk, so both reasons the badge can
@@ -487,14 +531,19 @@ def run_gui(app: Application) -> int:
         wire(worker)
 
     # --- identify
-    def do_resolve(entries, tiers, explicit=True):
-        worker = ResolveWorker(app.resolver, entries, tiers=list(tiers))
+    def do_resolve(entries, tiers, explicit=True, fresh=False):
+        entries = window.in_view_order(entries)
+        worker = ResolveWorker(app.resolver, entries, tiers=list(tiers), fresh=fresh)
+        if set(tiers) == {'metadata', 'regex'}:
+            worker.label = (f'Initial scan of {len(entries)} '
+                            f'book{"" if len(entries) == 1 else "s"}')
 
         def started(entry):
             if explicit:
                 entry.explicit_work_pending = True
                 app.data.update(entry)
             window.clear_identification_queued(entry.entry_id)
+            window.clear_run_failures(entry.entry_id, tiers)
             window.set_row_progress(entry.entry_id, 0.03, 'Identifying')
 
         worker.signals.entry_started.connect(started)
@@ -503,9 +552,19 @@ def run_gui(app: Application) -> int:
         tier_labels = {'metadata': 'Reading metadata', 'regex': 'Parsing filename',
                        'api': 'Checking book databases',
                        'search': 'Searching the web', 'llm': 'Asking the AI'}
-        worker.signals.entry_progress.connect(
-            lambda entry, fraction, tier: window.update_identification_progress(
-                entry, fraction, tier, tier_labels.get(tier, tier.title())))
+        def progress(entry, fraction, tier):
+            # A book in a folder waits while the others ahead of it are looked up.
+            # It is not being worked on, so it is drawn queued - not as a running
+            # job - and the panel is not told it is running.
+            if tier == 'waiting':
+                window.set_row_progress(entry.entry_id, fraction,
+                                        'Done' if fraction >= 1.0 else 'Queued')
+                window.why_panel.clear_running(entry)
+            else:
+                window.update_identification_progress(
+                    entry, fraction, tier, tier_labels.get(tier, tier.title()))
+
+        worker.signals.entry_progress.connect(progress)
 
         def done(result):
             for entry in entries:
@@ -550,6 +609,9 @@ def run_gui(app: Application) -> int:
             window.set_busy(workers.busy)
             window.refresh_stats()
             results = result.get('results', [])
+            for r in results:
+                if r.ok:
+                    last_plans[r.entry_id] = r
             failures = sum(1 for r in results if r.error)
             skipped = sum(1 for r in results if r.skipped)
             preview = result.get('preview')
@@ -573,16 +635,35 @@ def run_gui(app: Application) -> int:
         worker.signals.finished.connect(done)
         wire(worker)
 
-    def do_preview(entries):
+    # The last plan seen for each book, by entry id: the preview, or what Finalize
+    # actually did. Once Finalize has moved a book its sources are gone and a fresh
+    # preview has nothing to show, so the preview keeps showing this instead.
+    last_plans = {}
+
+    def do_preview(entries, fresh=False):
         """Render the preview here and now - no worker, no queue, no waiting."""
         app.file_ops.reset_batch()
-        results = [app.file_ops.preview(entry) for entry in entries]
+        results, stale = [], set()
+        for entry in entries:
+            result = app.file_ops.preview(entry)
+            kept = last_plans.get(entry.entry_id)
+            if not fresh and result.error and kept is not None:
+                result = kept
+                stale.add(entry.entry_id)
+            elif result.ok:
+                last_plans[entry.entry_id] = result
+            results.append(result)
         window.show_message(f'Previewed {len(results)} entries')
         dialog = PreviewDialog(results, app.settings.get_path('AO_OUTPUT_DIR'),
-                               dry_run=True, parent=window, settings=app.settings)
+                               dry_run=True, parent=window, settings=app.settings,
+                               stale_ids=stale)
         dialog.settings_requested.connect(do_settings)
+        refresh = []
+        dialog.refresh_requested.connect(lambda: (refresh.append(True), dialog.accept()))
         dialog.exec()
         app.reload_settings()
+        if refresh:
+            do_preview(entries, fresh=True)
 
     # --- undo
     def history_labels():
@@ -626,6 +707,52 @@ def run_gui(app: Application) -> int:
             window.show_message(message)
             if problems:
                 window.show_report('Undo finished with problems', '\n'.join(problems))
+
+        worker.signals.finished.connect(done)
+        wire(worker)
+
+    def finalize_log():
+        """Every Finalize transaction, oldest first, for the Finalize log window."""
+        pending = app.journal.pending()
+        records = []
+        for transaction in app.journal.all():
+            index = next((i for i, t in enumerate(pending) if t is transaction), None)
+            records.append({
+                'key': f'{transaction.entry_id}@{transaction.timestamp}',
+                'index': index,
+                'when': time.strftime('%Y-%m-%d %H:%M:%S',
+                                      time.localtime(transaction.timestamp)),
+                'name': Path(transaction.destination).name or transaction.entry_id,
+                'destination': transaction.destination,
+                'undone': transaction.undone,
+                'moves': [{'source': m.source, 'destination': m.destination,
+                           'operation': m.operation, 'undone': m.undone}
+                          for m in transaction.moves],
+            })
+        return records
+
+    window.finalize_log_provider = finalize_log
+
+    def do_revert(selection):
+        if not selection:
+            return
+        if QMessageBox.question(
+                window, 'Revert', 'Move the selected files back to where they came '
+                                  'from?') != QMessageBox.StandardButton.Yes:
+            return
+
+        def work():
+            reverted, problems = app.journal.undo_selected(selection)
+            return f'Reverted {reverted} file(s)', problems
+
+        worker = FunctionWorker(work)
+
+        def done(result):
+            window.set_busy(workers.busy)
+            message, problems = result
+            window.show_message(message)
+            if problems:
+                window.show_report('Revert finished with problems', '\n'.join(problems))
 
         worker.signals.finished.connect(done)
         wire(worker)
@@ -704,46 +831,52 @@ def run_gui(app: Application) -> int:
         Nothing about the books already in the list is wrong - they are all still
         exactly where the list says they are - they are simply somewhere nobody is
         pointing at any more. No file comparison can detect that, so it is said here,
-        once, at the moment it happens, and the Load Input button carries it
+        once, at the moment it happens, and the Inputs button carries it
         afterwards.
         """
         from scripts.load_options import KeepOptions, unsaved_entries
 
+        logger.info('Input folder changed: %s -> %s', previous or '(nothing)',
+                    app.settings.get('AO_INPUT_DIR'))
         window.set_input_folder_changed(previous or '(nothing)')
         stale = [entry for entry in app.data.all()
                  if not _under(entry.folder, app.scanner.input_dir)]
         if not stale:
-            do_load(None, KeepOptions.keep_everything())
+            do_load(None, KeepOptions.keep_everything(), list_only=True)
             return
 
-        unsaved = len(unsaved_entries(stale))
-        box = QMessageBox(QMessageBox.Icon.Warning, 'Input folder changed',
-                          f'The input folder is now:\n\n'
-                          f'    {app.settings.display_path(app.scanner.input_dir)}\n\n'
-                          f'The list still holds {len(stale)} book'
-                          f'{"" if len(stale) == 1 else "s"} from the old folder. They '
-                          f'stay editable and can still be saved, but they are not in '
-                          f'the folder you are now pointing at.'
-                          + (f'\n\n{unsaved} of them have changes you have not saved '
-                             f'yet.' if unsaved else ''),
-                          parent=window)
-        drop = QCheckBox(f'Remove those {len(stale)} books from the list first')
-        # Ticked by default only when nothing would be lost by it. With unsaved work
-        # among them, tidying the list is not a thing to do without being asked.
-        drop.setChecked(not unsaved)
-        box.setCheckBox(drop)
-        load = box.addButton('Load the new folder', QMessageBox.ButtonRole.AcceptRole)
-        box.addButton('Later', QMessageBox.ButtonRole.RejectRole)
-        box.exec()
+        from scripts.gui.item_list import books_lines, list_dialog
 
-        if drop.isChecked():
-            for entry in stale:
-                app.data.remove(entry.entry_id)
-            window.set_entries(app.data.all())
-            window.show_message(f'Removed {len(stale)} book'
-                                f'{"" if len(stale) == 1 else "s"} from the old folder')
-        if box.clickedButton() is load:
-            do_load(None, KeepOptions.keep_everything())
+        unsaved_books = unsaved_entries(stale)
+        unsaved = len(unsaved_books)
+        load = f'Remove {len(stale)} and load the new folder'
+        chosen = list_dialog(
+            window, 'Input folder changed',
+            f'The input folder is now:\n\n'
+            f'    {app.settings.display_path(app.scanner.input_dir)}\n\n'
+            f'The list holds {len(stale)} book'
+            f'{"" if len(stale) == 1 else "s"} from the old folder. '
+            f'Loading the new folder removes them from the list and '
+            f'from the saved data, along with everything identified, '
+            f'edited and decided for them.'
+            + (f'\n\n{unsaved} of them have changes you have not saved '
+               f'yet, and those changes will be lost.' if unsaved else '')
+            + '\n\nThe books in the new folder are only listed - nothing '
+              'is identified until you start it.',
+            [(f'Unsaved changes lost ({unsaved}):', books_lines(unsaved_books, files=False)),
+             (f'Removed from the list ({len(stale)}):', books_lines(stale, files=False))],
+            [load, 'Later'], default=0)
+
+        if chosen != load:
+            return
+        for entry in stale:
+            app.data.remove(entry.entry_id)
+        app.data.flush()
+        window.set_entries(app.data.all())
+        logger.info('Removed %d books from the old input folder', len(stale))
+        window.show_message(f'Removed {len(stale)} book'
+                            f'{"" if len(stale) == 1 else "s"} from the old folder')
+        do_load(None, KeepOptions.keep_everything(), list_only=True)
 
     def do_settings(tab: str = ''):
         def restyle():
@@ -751,7 +884,7 @@ def run_gui(app: Application) -> int:
             window.refresh_toolbar()
             window.apply_ui_settings()
 
-        before_input = app.settings.get('AO_INPUT_DIR')
+        before = {'input': app.settings.get('AO_INPUT_DIR')}
         dialog = SettingsDialog(app.settings, window, live_preview=restyle)
         if tab:
             dialog.show_tab(tab)
@@ -774,8 +907,12 @@ def run_gui(app: Application) -> int:
                                 + (f', {len(renamed)} name'
                                    f'{"" if len(renamed) == 1 else "s"} re-cleaned'
                                    if renamed else ''))
-            if app.settings.get('AO_INPUT_DIR') != before_input:
-                input_folder_changed(before_input)
+            if app.settings.get('AO_INPUT_DIR') != before['input']:
+                previous = before['input']
+                # Saving twice in one visit to Settings must not ask about the same
+                # change twice.
+                before['input'] = app.settings.get('AO_INPUT_DIR')
+                input_folder_changed(previous)
 
         dialog.saved.connect(saved)
         dialog.layout_reset.connect(window.reset_layout)
@@ -785,11 +922,86 @@ def run_gui(app: Application) -> int:
         restyle()
         window.refresh_mode_label()
 
+    def do_clear():
+        """Empty the list: every book and everything known about it. Disk is untouched."""
+        workers.cancel()
+        app.data.backup('before-clear')
+        count = len(app.data.all())
+        for entry in app.data.all():
+            app.data.remove(entry.entry_id)
+        app.data.flush()
+        window.set_entries([])
+        window.set_input_folder_changed(None)
+        window.set_scan_stale(None)
+        window.show_message(f'Cleared {count} book{"" if count == 1 else "s"} '
+                            f'from the list')
+
+    def do_purge(entry_ids):
+        """Drop books whose files are all gone from the list. Disk is untouched."""
+        app.data.backup('before-remove')
+        for entry_id in entry_ids:
+            app.data.remove(entry_id)
+        app.data.flush()
+        window.set_entries(app.data.all())
+        logger.info('Removed %d books with no files left on disk', len(entry_ids))
+        window.show_message(f'Removed {len(entry_ids)} book'
+                            f'{"" if len(entry_ids) == 1 else "s"} with no files on disk')
+
+    def do_remove(entry_ids, message):
+        """Drop the given books from the list, after taking a backup."""
+        app.data.backup('before-remove')
+        for entry_id in entry_ids:
+            app.data.remove(entry_id)
+        app.data.flush()
+        window.set_entries(app.data.all())
+        logger.info('Removed %d books from the list', len(entry_ids))
+        window.show_message(message)
+
+    def do_restore():
+        """Replace the list with one of the backups taken before loads and clears."""
+        folder = app.data.save_file.parent / 'backups'
+        path, _ = QFileDialog.getOpenFileName(window, 'Restore a backup', str(folder),
+                                              'List backups (*.json)')
+        if not path:
+            return
+        if QMessageBox.question(
+                window, 'Are you sure?',
+                f'Replace the list with this backup?\n\n{Path(path).name}\n\nThe list '
+                f'as it is now is backed up first.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        workers.cancel()
+        count = app.data.restore(Path(path))
+        window.set_entries(app.data.all())
+        check_scan_freshness(app, window)
+        logger.info('Restored %d entries from %s', count, path)
+        window.show_message(f'Restored {count} book{"" if count == 1 else "s"} from '
+                            f'{Path(path).name}')
+
     window.load_requested.connect(do_load)
+    window.restore_requested.connect(do_restore)
+    window.clear_requested.connect(do_clear)
+    window.purge_requested.connect(do_purge)
+    window.remove_entries_requested.connect(do_remove)
     window.resolve_requested.connect(do_resolve)
+    window.refresh_requested.connect(
+        lambda entries, tiers: do_resolve(entries, tiers, fresh=True))
     window.apply_requested.connect(do_apply)
     window.undo_requested.connect(do_undo)
+    window.revert_requested.connect(do_revert)
     window.merge_requested.connect(do_merge)
+
+    def do_combine(entries, fields):
+        combined = app.data.combine(entries, fields)
+        if combined is None:
+            window.show_message('Only entries in the same folder can be combined')
+            return
+        window.show_combined_entry(combined, entries)
+        window.show_message(f'Combined {len(entries)} entries into one book '
+                            f'({len(combined.audio_files)} files)')
+
+    window.combine_requested.connect(do_combine)
     window.settings_requested.connect(lambda: do_settings())
     window.settings_requested_on_tab.connect(do_settings)
     window.cancel_requested.connect(workers.cancel)
@@ -805,7 +1017,7 @@ def run_gui(app: Application) -> int:
         window.set_entries(existing)
         # A saved list describes the input folder as it was when it was written. If
         # files have come or gone since, every decision made from here rests on stale
-        # data - so it is checked now, once, and Load Input carries the answer.
+        # data - so it is checked now, once, and Inputs carries the answer.
         drift = check_scan_freshness(app, window)
         # The other way a saved list can be wrong, and the one no file comparison can
         # see: the input folder was changed to somewhere else entirely, so not one of
@@ -825,7 +1037,7 @@ def run_gui(app: Application) -> int:
                if drift else 'press Ctrl+R to load the input folder'))
     elif app.settings.is_set('AO_INPUT_DIR'):
         from scripts.load_options import KeepOptions
-        do_load(None, KeepOptions.keep_everything())
+        do_load(None, KeepOptions.keep_everything(), list_only=True)
     else:
         # A first run has no input folder yet. The banner above the table says so and
         # links to the page that fixes it; a modal on top of an empty window that the
@@ -833,6 +1045,9 @@ def run_gui(app: Application) -> int:
         window.show_message('Set an input folder to get started')
 
     exit_code = qt_app.exec()
+    # A load still walking the folder would keep the process alive, invisibly, after
+    # the window has closed - and write its results over the next session's.
+    workers.cancel()
     app.data.flush()
     return exit_code
 

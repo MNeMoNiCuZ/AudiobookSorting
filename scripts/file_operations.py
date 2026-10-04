@@ -3,7 +3,7 @@
 The critical correctness rule: **an entry owns only its own files.** The previous
 version iterated the whole source directory, so applying one book out of a four-book
 folder physically moved the other three with it. Here, the file list comes from the
-entry, and sidecar files (cover art, cue sheets) are only claimed when they
+entry, and companion files (e-books, cover art, cue sheets) are only claimed when they
 unambiguously belong to it.
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -22,10 +23,46 @@ from .settings import display_path
 
 logger = logging.getLogger(__name__)
 
-# Non-audio files worth carrying along with the book.
-SIDECAR_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif',
-                      '.cue', '.nfo', '.txt', '.opf', '.pdf', '.epub', '.json')
+# Non-audio files that travel with a book: e-books and documents, cover art and
+# scans, cue sheets, chapter and metadata files, transcripts, playlists, checksums.
+# Matched against the end of the name, so compound ones like ".fb2.zip" work.
+COMPANION_EXTENSIONS = (
+    # E-books and documents
+    '.epub', '.kepub', '.kepub.epub', '.mobi', '.azw', '.azw1', '.azw3', '.azw4',
+    '.azw8', '.kfx', '.kfx-zip', '.kf8', '.prc', '.pdb', '.lit', '.lrf', '.lrx',
+    '.fb2', '.fb2.zip', '.fbz', '.fb3', '.djvu', '.djv', '.pdf', '.xps', '.oxps',
+    '.cbz', '.cbr', '.cb7', '.cbt', '.cba', '.ibooks', '.iba', '.chm', '.tcr', '.snb',
+    '.rb', '.pml', '.pmlz', '.txtz', '.htmlz', '.rtf', '.doc', '.docx', '.odt',
+    '.pages', '.wpd', '.ps', '.txt', '.md', '.html', '.htm', '.xhtml', '.mht',
+    '.mhtml', '.daisy', '.dtb', '.ncx', '.smil',
+    # Cover art and scans
+    '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.webp', '.bmp', '.gif', '.tif',
+    '.tiff', '.heic', '.heif', '.avif',
+    # Audiobook metadata, chapters and cue sheets
+    '.cue', '.nfo', '.opf', '.json', '.xml', '.yaml', '.yml', '.abs', '.chapters',
+    '.ffmetadata', '.metadata', '.id3', '.toc',
+    # Transcripts, lyrics and subtitles
+    '.srt', '.vtt', '.lrc', '.ass', '.ssa', '.sub', '.sbv', '.ttml',
+    # Playlists
+    '.m3u', '.m3u8', '.pls', '.xspf', '.wpl', '.asx',
+    # Checksums, parity and rip logs
+    '.sfv', '.md5', '.sha1', '.sha256', '.sha512', '.par2', '.log', '.accurip',
+    # Links and notes
+    '.url', '.webloc', '.desktop', '.csv', '.ini',
+)
+# Files the OS drops into folders by itself. A source folder holding only these is
+# empty as far as a move is concerned.
+CLUTTER_NAMES = ('thumbs.db', 'desktop.ini', '.ds_store', 'ehthumbs.db')
 COVER_NAMES = ('cover', 'folder', 'front', 'albumart', 'thumb', 'poster')
+
+
+# The skip reason of a book you rejected - the preview groups these on their own.
+REJECTED_REASON = 'rejected'
+
+
+def _name_key(name: str) -> str:
+    """A filename stem reduced to letters and digits, for matching a book's files."""
+    return re.sub(r'[^0-9a-z]+', '', name.lower())
 
 
 class ApplyResult:
@@ -48,6 +85,10 @@ class ApplyResult:
     @property
     def ok(self) -> bool:
         return not self.error and not self.skipped
+
+    @property
+    def rejected(self) -> bool:
+        return self.skipped and self.reason == REJECTED_REASON
 
     def describe(self) -> str:
         if self.error:
@@ -112,10 +153,14 @@ class FileOperations:
     def files_for(self, entry: BookEntry) -> List[Path]:
         """Exactly the files this entry owns - never a sibling's.
 
-        Audio files come from the entry itself. Sidecars are included only when the
-        folder holds a single book; in a multi-book folder a shared "cover.jpg" can't
-        be attributed to any one entry, so a per-book image is matched by name instead.
+        Audio files come from the entry itself. Companion files (COMPANION_EXTENSIONS:
+        e-books, covers, cue sheets, playlists...) travel with it when the folder holds
+        a single book, plus those in subfolders ("Extras", "Scans") that hold no audio
+        of their own. In a multi-book folder a shared "cover.jpg" can't be attributed
+        to any one entry, so a companion file is matched to the book by name instead.
         """
+        from .file_scanner import AUDIO_EXTENSIONS
+
         folder = Path(entry.folder)
         files: List[Path] = []
 
@@ -124,27 +169,57 @@ class FileOperations:
             if path.is_file():
                 files.append(path)
 
+        def companion(path: Path) -> bool:
+            name = path.name.lower()
+            return (path.is_file() and path not in files
+                    and path.suffix.lower() not in AUDIO_EXTENSIONS
+                    and name not in CLUTTER_NAMES
+                    and name.endswith(COMPANION_EXTENSIONS))
+
+        try:
+            children = sorted(folder.iterdir())
+        except OSError as exc:
+            self.logger.warning('Could not list %s: %s', folder, exc)
+            return files
+
         if not entry.is_multi_book_folder:
             # Sole occupant: take the loose extras with it.
-            try:
-                for path in sorted(folder.iterdir()):
-                    if (path.is_file() and path not in files
-                            and path.suffix.lower() in SIDECAR_EXTENSIONS):
-                        files.append(path)
-            except OSError as exc:
-                self.logger.warning('Could not list %s: %s', folder, exc)
+            for path in children:
+                if companion(path):
+                    files.append(path)
+                elif path.is_dir() and not self._holds_audio(path):
+                    files.extend(p for p in sorted(path.rglob('*'))
+                                 if companion(p))
         else:
-            # Shared folder: only take an image whose name matches this book's file.
-            stem = Path(entry.primary_audio).stem.lower()
-            try:
-                for path in sorted(folder.iterdir()):
-                    if (path.is_file() and path.suffix.lower() in SIDECAR_EXTENSIONS
-                            and path.stem.lower() == stem):
-                        files.append(path)
-            except OSError:
-                pass
+            # Shared folder: only take a file whose name matches this book's.
+            stems = {_name_key(Path(name).stem) for name in entry.audio_files}
+            title = _name_key(entry.value('title') or '')
+            if title:
+                stems.add(title)
+            stems.discard('')
+            for path in children:
+                if companion(path) and _name_key(path.stem) in stems:
+                    files.append(path)
 
         return files
+
+    @staticmethod
+    def _holds_audio(folder: Path) -> bool:
+        """Whether any audio sits in this folder or below - that is another book."""
+        from .file_scanner import AUDIO_EXTENSIONS
+        try:
+            return any(p.suffix.lower() in AUDIO_EXTENSIONS and p.is_file()
+                       for p in folder.rglob('*'))
+        except OSError:
+            return True
+
+    @staticmethod
+    def _relative_name(entry: BookEntry, path: Path) -> str:
+        """The file's path below the book's folder - its name, or "Extras/x.pdf"."""
+        try:
+            return path.relative_to(Path(entry.folder)).as_posix()
+        except ValueError:
+            return path.name
 
     def preview(self, entry: BookEntry) -> ApplyResult:
         """What applying this entry would do. No filesystem writes."""
@@ -160,11 +235,26 @@ class FileOperations:
         # A rejected book is never written, whoever asked. The window already sends
         # only approved rows, but "rejected" is a decision about the book itself, not
         # about one caller's list, and the place to enforce it is the one function
-        # that actually touches the disk. A preview may still render one - looking at
-        # where a book would have gone is not the same as putting it there.
-        if not dry_run and entry.status == STATUS_REJECTED:
-            return ApplyResult(entry.entry_id, Path(), [], skipped=True,
-                               reason='you rejected this book')
+        # that actually touches the disk. A preview still shows where it would have
+        # gone - looking is not putting it there - but as skipped, and without
+        # claiming the destination from a book that will really be written.
+        if entry.status == STATUS_REJECTED:
+            planned: List[Dict] = []
+            destination = Path()
+            if dry_run:
+                files = self.files_for(entry)
+                if files:
+                    destination = self.destination_for(entry)
+                    rename_map = self._rename_map(entry, files)
+                    operation = 'copy' if self.copy_mode else 'move'
+                    planned = [{'source': str(path),
+                                'destination': str(destination
+                                                   / rename_map.get(
+                                                   path, self._relative_name(entry,
+                                                                             path))),
+                                'operation': operation} for path in files]
+            return ApplyResult(entry.entry_id, destination, planned, skipped=True,
+                               dry_run=dry_run, reason=REJECTED_REASON)
 
         files = self.files_for(entry)
         if not files:
@@ -182,7 +272,8 @@ class FileOperations:
         rename_map = self._rename_map(entry, files)
 
         for path in files:
-            target = destination / rename_map.get(path, path.name)
+            target = destination / rename_map.get(path,
+                                                  self._relative_name(entry, path))
             planned.append({'source': str(path), 'destination': str(target),
                             'operation': operation})
 
@@ -204,6 +295,10 @@ class FileOperations:
         for plan in planned:
             source, target = Path(plan['source']), Path(plan['destination'])
             try:
+                if target.parent != destination and not target.parent.exists():
+                    for folder in self._existing_ancestors(target.parent):
+                        transaction.created_dirs.append(str(folder))
+                    target.parent.mkdir(parents=True, exist_ok=True)
                 final = self._transfer(source, target, operation)
                 transaction.moves.append(
                     FileMove(source=str(source), destination=str(final),
@@ -220,25 +315,31 @@ class FileOperations:
         entry.applied_path = str(destination)
 
         self._write_extras(entry, destination, transaction)
+        if operation == 'move':
+            self._remove_emptied_source(Path(entry.folder))
         return ApplyResult(entry.entry_id, destination, done)
 
     # --------------------------------------------------------------- internals
 
     def _rename_map(self, entry: BookEntry, files: List[Path]) -> Dict[Path, str]:
-        """New filenames, when file renaming is enabled (#22)."""
-        if not self.settings.get_bool('AO_RENAME_FILES', False):
-            return {}
+        """New filenames, when file renaming is enabled (#22).
 
+        The audio and the companion files are two separate switches: renaming the
+        e-book and the cover to match does not depend on renaming the audio.
+        """
         from .paths import render_template
 
         from .file_scanner import AUDIO_EXTENSIONS
 
         template = self.settings.get('AO_FILE_TEMPLATE')
+        mapping: Dict[Path, str] = {}
+        mapping.update(self._support_rename_map(entry, files, template))
+        if not self.settings.get_bool('AO_RENAME_FILES', False):
+            return mapping
         # Audio is what the audio template names. Everything else is a companion file,
         # whatever its extension - testing against the sidecar list left anything
         # unlisted (.m3u, .sfv, .log) to be renamed as though it were a chapter.
         audio = [p for p in files if p.suffix.lower() in AUDIO_EXTENSIONS]
-        mapping: Dict[Path, str] = {}
         width = max(2, len(str(len(audio))))
         # A multi-part book whose template has no per-file placeholder would render
         # the same name for every part, and they would collide into "(2)", "(3)"...
@@ -273,7 +374,6 @@ class FileOperations:
                 stem = f'{stem} - Part {number:0{width}d}'
             mapping[path] = f'{stem}{name_suffix}'
 
-        mapping.update(self._support_rename_map(entry, files, template))
         return mapping
 
     def _support_rename_map(self, entry: BookEntry, files: List[Path],
@@ -292,7 +392,9 @@ class FileOperations:
         from .file_scanner import AUDIO_EXTENSIONS
         from .paths import render_template
 
-        support = [p for p in files if p.suffix.lower() not in AUDIO_EXTENSIONS]
+        folder = Path(entry.folder)
+        support = [p for p in files if p.suffix.lower() not in AUDIO_EXTENSIONS
+                   and p.parent == folder]
         by_extension: Dict[str, List[Path]] = {}
         for path in support:
             by_extension.setdefault(path.suffix.lower(), []).append(path)
@@ -351,6 +453,66 @@ class FileOperations:
         except OSError:
             shutil.move(src, dst)
         return target
+
+    def _remove_emptied_source(self, folder: Path) -> None:
+        """Remove the book's source folder once a move has left it empty.
+
+        Then its parents, while they are empty too, up to - never including - the
+        input folder. Only OS clutter (Thumbs.db, desktop.ini, .DS_Store) and empty
+        subfolders count as empty; anything else keeps the folder.
+        """
+        try:
+            root = self.settings.get_path('AO_INPUT_DIR').resolve()
+        except (OSError, ValueError):
+            root = None
+        current = folder
+        while True:
+            try:
+                resolved = current.resolve()
+            except OSError:
+                return
+            if root is not None and resolved == root:
+                return
+            if not self._clear_if_empty(current):
+                return
+            try:
+                current.rmdir()
+            except OSError as exc:
+                self.logger.info('Could not remove %s: %s', current, exc)
+                return
+            self.logger.info('Removed emptied source folder %s', current)
+            parent = current.parent
+            # Past the book's own folder, only climb inside the input folder.
+            if root is None or parent == current:
+                return
+            try:
+                parent.resolve().relative_to(root)
+            except (OSError, ValueError):
+                return
+            current = parent
+
+    @classmethod
+    def _clear_if_empty(cls, folder: Path) -> bool:
+        """Delete clutter and empty subfolders; True if the folder is now empty."""
+        try:
+            children = list(folder.iterdir())
+        except OSError:
+            return False
+        for child in children:
+            if child.is_dir():
+                if not cls._clear_if_empty(child):
+                    return False
+            elif child.name.lower() not in CLUTTER_NAMES:
+                return False
+        for child in children:
+            try:
+                if child.is_dir():
+                    child.rmdir()
+                else:
+                    child.unlink()
+            except OSError:
+                return False
+        return True
 
     @staticmethod
     def _existing_ancestors(destination: Path) -> List[Path]:

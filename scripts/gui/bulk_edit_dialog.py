@@ -35,8 +35,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from ..models import BookEntry
+from ..models import BookEntry, clean_value
+from ..paths import display_index
 from ..settings import display_path
+from .table import ColumnTable
 from .theme import (ACCENT, BG_BASE, BG_RAISED, FIELD, FIELD_BORDER, FIELD_HOVER,
                     RADIUS, TEXT, TEXT_DIM, TEXT_FAINT)
 
@@ -165,7 +167,7 @@ class _NumberItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
-class _Grid(QTableWidget):
+class _Grid(ColumnTable):
     """A table whose Enter/Tab keys move the way the docstring above describes."""
 
     # Set by the dialog that owns it, right after construction. Not `parent()`: the
@@ -320,7 +322,9 @@ class BulkEditDialog(QDialog):
 
         for row, entry in enumerate(self.entries):
             for column, (name, _) in enumerate(FIELDS):
-                text = self._row_label(entry) if name == 'file' else entry.value(name)
+                text = (self._row_label(entry) if name == 'file'
+                        else display_index(entry.value(name)) if name == 'series_index'
+                        else entry.value(name))
                 item = (_NumberItem(text) if name == 'series_index'
                         else QTableWidgetItem(text))
                 if name == 'file':
@@ -837,7 +841,7 @@ class BulkEditDialog(QDialog):
         column = self._column_for('series_index')
         self._group()
         for row in range(self.grid.rowCount()):
-            self.grid.item(row, column).setText(str(start + row))
+            self.grid.item(row, column).setText(display_index(start + row))
         self._ungroup()
 
     def values(self) -> Dict[str, Dict[str, str]]:
@@ -853,6 +857,9 @@ class BulkEditDialog(QDialog):
                 if item is None:
                     continue
                 text = item.text().strip()
+                # "02" on screen is the stored "2": only a different number is a change.
+                if name == 'series_index' and clean_value(name, text) == entry.value(name):
+                    continue
                 if text != entry.value(name):
                     changes.setdefault(entry.entry_id, {})[name] = text
         return changes

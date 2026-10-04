@@ -18,6 +18,17 @@ if exist "venv\Scripts\python.exe" (
     set "PY=python"
 )
 
+REM  Windows will not overwrite an executable that is running, so a build made while
+REM  the program is open lands in dist\ and never reaches the root copy you start.
+tasklist /fi "imagename eq AudiobookOrganizer.exe" /nh 2>nul | find /i "AudiobookOrganizer.exe" >nul
+if not errorlevel 1 (
+    echo(
+    echo *** STOPPED: AudiobookOrganizer.exe is running. ***
+    echo Close it, then build again - a running exe cannot be replaced.
+    pause
+    exit /b 1
+)
+
 echo(
 echo === Checking the build tools ===
 "%PY%" -m pip install --quiet --upgrade pyinstaller pillow
@@ -37,28 +48,14 @@ if errorlevel 1 (
 
 echo(
 echo === Packaging ===
-REM  --windowed          no console window behind the GUI
-REM  --onefile           one .exe, nothing to install
-REM  --icon              the .ico just drawn, embedded in the executable
-REM  --collect-submodules  mutagen is imported lazily in places, so PyInstaller's
-REM                        static analysis does not find all of it
-REM  --paths             note the trailing dot in "%~dp0." - %~dp0 ends in a
-REM                      backslash, which would escape the closing quote and swallow
-REM                      the next argument
+REM  What goes into the executable, and what is kept out of it, is in
+REM  AudiobookOrganizer.spec.
 "%PY%" -m PyInstaller ^
     --noconfirm ^
     --clean ^
-    --onefile ^
-    --windowed ^
-    --name "AudiobookOrganizer" ^
-    --icon "%~dp0build\audiobook_organizer.ico" ^
-    --paths "%~dp0." ^
-    --collect-submodules mutagen ^
-    --hidden-import "scripts.gui.app_icon" ^
     --distpath "dist" ^
     --workpath "build\pyinstaller" ^
-    --specpath "build" ^
-    main.py
+    AudiobookOrganizer.spec
 if errorlevel 1 (
     echo Packaging failed.
     exit /b 1
@@ -66,11 +63,23 @@ if errorlevel 1 (
 
 echo(
 echo === Copying the executable to the project root ===
-copy /y "dist\AudiobookOrganizer.exe" "AudiobookOrganizer.exe" >nul
-if errorlevel 1 (
-    echo Could not copy the executable to the root.
-    exit /b 1
+REM  A freshly written exe is often held for a moment by antivirus scanning it, so a
+REM  failed copy is retried before it is reported.
+set "TRIES=0"
+:copy_again
+copy /y "dist\AudiobookOrganizer.exe" "AudiobookOrganizer.exe" >nul 2>&1
+if not errorlevel 1 goto copied
+set /a TRIES+=1
+if %TRIES% lss 10 (
+    ping -n 3 127.0.0.1 >nul
+    goto copy_again
 )
+echo(
+echo *** FAILED: AudiobookOrganizer.exe in this folder was NOT replaced. ***
+echo Something still has it open. The new build is in dist\AudiobookOrganizer.exe.
+pause
+exit /b 1
+:copied
 
 echo(
 echo Built AudiobookOrganizer.exe

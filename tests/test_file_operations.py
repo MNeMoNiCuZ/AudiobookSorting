@@ -188,4 +188,124 @@ def test_a_rejected_book_can_still_be_previewed(settings, entries):
     entry.status = STATUS_REJECTED
 
     result = FileOperations(settings).preview(entry)
-    assert result.ok and result.operations
+    assert result.skipped and result.rejected and not result.ok
+    assert result.operations, 'the preview still shows where it would have gone'
+
+
+def test_move_removes_the_emptied_source_folder(settings, entries, tmp_library):
+    """Moving a book that owns its folder takes the folder away too, not just the files."""
+    settings.set('AO_COPY_MODE', 'false')
+    wind = next(e for e in entries if 'Name of the Wind' in e.folder)
+    wind.author = Field('Patrick Rothfuss', 'user', 1.0)
+    folder = Path(wind.folder)
+    (folder / 'Thumbs.db').write_bytes(b'')
+
+    result = FileOperations(settings).apply_entry(wind)
+    assert result.ok, result.error
+    assert not folder.exists()
+    assert tmp_library.is_dir()
+
+
+def test_move_keeps_a_source_folder_that_still_holds_books(settings, entries):
+    settings.set('AO_COPY_MODE', 'false')
+    first = _bladeborn(entries)[0]
+    first.author = Field('Test Author', 'user', 1.0)
+
+    assert FileOperations(settings).apply_entry(first).ok
+    assert Path(first.folder).is_dir()
+
+
+def test_preview_dialog_groups_rejected_books_last_as_skipped(qt_app, settings, entries):
+    from scripts.gui.preview_dialog import PreviewDialog
+    from scripts.models import STATUS_APPROVED, STATUS_REJECTED
+
+    books = _bladeborn(entries)
+    kept = next(e for e in entries if e not in books)
+    kept.author = Field('Kept Author', 'user', 1.0)
+    kept.status = STATUS_APPROVED
+    turned_down = books[0]
+    turned_down.author = Field('Test Author', 'user', 1.0)
+    turned_down.status = STATUS_REJECTED
+
+    ops = FileOperations(settings)
+    results = [ops.preview(turned_down), ops.preview(kept)]
+    dialog = PreviewDialog(results, settings.get_path('AO_OUTPUT_DIR'),
+                           settings=settings)
+    last = dialog.tree.topLevelItem(dialog.tree.topLevelItemCount() - 1)
+    assert last.text(0) == 'Skipped - rejected (1)'
+    assert last.childCount() == 1 and last.child(0).childCount() > 0, \
+        'the rejected book still shows where its files would have gone'
+    assert not any(dialog.tree.topLevelItem(i).text(0).startswith('Not applied')
+                   for i in range(dialog.tree.topLevelItemCount()))
+    dialog.done(0)
+
+
+def test_a_book_zero_point_five_is_not_padded_to_double_zero():
+    """"0.5" is the number; "00.5" only adds a zero. Whole books still pad."""
+    from scripts.paths import display_index, render_template
+
+    assert display_index('0.5') == '0.5'
+    assert display_index('3.5') == '03.5'
+    assert display_index('1') == '01'
+    assert render_template('{series} {series_index:02d} - {title}',
+                           {'series': 'S', 'series_index': '0.5', 'title': 'T'}) == 'S 0.5 - T'
+
+
+def test_move_takes_every_companion_file_and_extras_folder(settings, entries):
+    """E-books of any format, and a subfolder of extras, go with the book."""
+    settings.set('AO_COPY_MODE', 'false')
+    settings.set('AO_RENAME_FILES', 'false')
+    settings.set('AO_RENAME_SUPPORT_FILES', 'false')
+    wind = next(e for e in entries if 'Name of the Wind' in e.folder)
+    wind.author = Field('Patrick Rothfuss', 'user', 1.0)
+    folder = Path(wind.folder)
+    for name in ('book.mobi', 'book.azw3', 'book.epub', 'Thumbs.db'):
+        (folder / name).write_bytes(b'x')
+    (folder / 'Extras').mkdir()
+    (folder / 'Extras' / 'map.pdf').write_bytes(b'x')
+
+    result = FileOperations(settings).apply_entry(wind)
+    assert result.ok, result.error
+    names = {p.relative_to(result.destination).as_posix()
+             for p in result.destination.rglob('*') if p.is_file()}
+    assert {'book.mobi', 'book.azw3', 'book.epub', 'Extras/map.pdf'} <= names
+    assert 'Thumbs.db' not in names
+    assert not folder.exists()
+
+
+def test_companion_files_are_renamed_without_renaming_audio(settings, entries):
+    settings.set('AO_RENAME_FILES', 'false')
+    settings.set('AO_RENAME_SUPPORT_FILES', 'true')
+    settings.set('AO_FILE_TEMPLATE', '{title} {file_index:03d}')
+    wind = next(e for e in entries if 'Name of the Wind' in e.folder)
+    wind.author = Field('Patrick Rothfuss', 'user', 1.0)
+    (Path(wind.folder) / 'whatever.mobi').write_bytes(b'x')
+
+    result = FileOperations(settings).apply_entry(wind)
+    assert result.ok, result.error
+    names = {p.name for p in result.destination.iterdir()}
+    assert 'The Name of the Wind.mobi' in names
+    assert '01.mp3' in names
+
+
+def test_shared_folder_takes_the_ebook_named_like_its_book(settings, entries):
+    saga = _bladeborn(entries)
+    first = saga[0]
+    folder = Path(first.folder)
+    stem = Path(first.primary_audio).stem
+    (folder / f'{stem}.mobi').write_bytes(b'x')
+    (folder / f'{Path(saga[1].primary_audio).stem}.epub').write_bytes(b'x')
+
+    owned = {p.name for p in FileOperations(settings).files_for(first)}
+    assert owned == {Path(first.primary_audio).name, f'{stem}.mobi'}
+
+
+def test_only_whitelisted_companion_formats_travel(settings, entries):
+    wind = next(e for e in entries if 'Name of the Wind' in e.folder)
+    folder = Path(wind.folder)
+    for name in ('book.kfx', 'book.fb2.zip', 'book.cbz', 'tracks.m3u', 'setup.exe'):
+        (folder / name).write_bytes(b'x')
+
+    owned = {p.name for p in FileOperations(settings).files_for(wind)}
+    assert {'book.kfx', 'book.fb2.zip', 'book.cbz', 'tracks.m3u'} <= owned
+    assert 'setup.exe' not in owned

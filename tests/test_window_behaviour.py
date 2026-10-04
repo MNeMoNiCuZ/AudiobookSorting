@@ -419,27 +419,101 @@ def test_scan_badge_survives_a_toolbar_rebuild(window, qt_app):
     assert '2 added' in action.toolTip()
 
 
-# ------------------------------------------------------------------- Load Input
+# ------------------------------------------------------------------- Inputs
 
 def _loaded(window, *entries):
     window.set_entries(list(entries))
     QApplication.processEvents()
 
 
-def test_loading_an_empty_list_asks_nothing(window, monkeypatch):
-    """There is nothing to lose, so there is no question worth putting on screen."""
+def test_loading_an_empty_list_asks_only_folder_and_scan(window, monkeypatch):
+    """Nothing to lose, so no keep question - but the folder and the scan still are."""
+    from PyQt6.QtWidgets import QDialog
+
     from scripts.gui import load_dialog
 
-    monkeypatch.setattr(load_dialog.LoadInputDialog, 'exec',
-                        lambda self: pytest.fail('a dialog for an empty list'))
+    shown = []
+
+    def accept(self):
+        shown.append(not self.summary.isVisibleTo(self))
+        self.list_only.setChecked(True)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(load_dialog.LoadInputDialog, 'exec', accept)
     seen = []
-    window.load_requested.connect(lambda targets, keep: seen.append((targets, keep)))
+    window.load_requested.connect(lambda *a: seen.append(a))
 
     window._request_load()
 
+    assert shown == [True], 'no keep summary for an empty list'
     assert len(seen) == 1
-    targets, keep = seen[0]
-    assert targets is None and keep.keeps_everything()
+    targets, _keep, list_only = seen[0]
+    assert targets is None and list_only is True
+
+
+def test_clear_list_from_the_load_dialog(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+
+    from scripts.gui import load_dialog
+
+    _loaded(window, BookEntry(entry_id='a'))
+
+    def clear(self):
+        self.clear_chosen = True
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(load_dialog.LoadInputDialog, 'exec', clear)
+    loads, clears = [], []
+    window.load_requested.connect(lambda *a: loads.append(a))
+    window.clear_requested.connect(lambda: clears.append(True))
+
+    window._request_load()
+
+    assert clears and not loads
+
+
+def test_the_load_dialog_saves_the_folder_it_was_given(qt_app, tmp_path):
+    from scripts.gui.load_dialog import LoadInputDialog
+    from scripts.settings import Settings
+
+    books = tmp_path / 'books'
+    books.mkdir()
+    config = Settings(tmp_path / '.env')
+    dialog = LoadInputDialog([], [], config)
+    dialog.folder.setText(str(books))
+    assert dialog.go.isEnabled()
+    dialog.remember()
+    dialog.done(0)
+
+    assert Settings(tmp_path / '.env').get('AO_INPUT_DIR') == str(books)
+
+
+def test_the_load_dialog_counts_the_folder_against_the_list(qt_app, tmp_path):
+    """Last load against this load: +new and -gone, before you press anything."""
+    import time
+
+    from PyQt6.QtWidgets import QApplication
+
+    from scripts.gui.load_dialog import LoadInputDialog
+    from scripts.settings import Settings
+
+    for name in ('One', 'Two'):
+        (tmp_path / 'books' / name).mkdir(parents=True)
+        (tmp_path / 'books' / name / 'book.mp3').write_bytes(b'')
+    gone = BookEntry(entry_id='old', folder=str(tmp_path / 'books' / 'Old'))
+    dialog = LoadInputDialog([gone], [], Settings(tmp_path / '.env'))
+    dialog.folder.setText(str(tmp_path / 'books'))
+    dialog._recount()
+    deadline = time.time() + 10
+    while dialog._folder_ids is None and time.time() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.02)
+
+    text = dialog.counts.text()
+    assert 'In the list now: <b>1 book</b>' in text
+    assert 'after updating: <b>2 books</b>' in text
+    assert '2 new books added' in text and '1 book removed' in text
+    dialog.done(0)
 
 
 def test_loading_over_work_asks_what_to_keep(window, monkeypatch):
@@ -453,14 +527,39 @@ def test_loading_over_work_asks_what_to_keep(window, monkeypatch):
     monkeypatch.setattr(load_dialog.LoadInputDialog, 'exec',
                         lambda self: QDialog.DialogCode.Accepted)
     seen = []
-    window.load_requested.connect(lambda targets, keep: seen.append((targets, keep)))
+    window.load_requested.connect(lambda targets, keep, _list_only:
+                                  seen.append((targets, keep)))
 
     window._request_load()
 
     assert len(seen) == 1
     targets, keep = seen[0]
     assert targets is None, 'no selection means the whole input folder'
-    assert keep.manual is True
+    assert keep.keeps_everything(), 'a plain load updates the list and loses nothing'
+
+
+def test_the_load_dialog_opens_on_update_whatever_was_ticked_last(qt_app, tmp_path):
+    """Remembered keep ticks used to turn a plain Load into a reset of every author."""
+    from scripts.gui.load_dialog import LoadInputDialog
+    from scripts.settings import Settings
+
+    config = Settings(tmp_path / '.env')
+    for key in ('AO_LOAD_KEEP_MANUAL', 'AO_LOAD_KEEP_CONFIDENT',
+                'AO_LOAD_KEEP_DECISIONS'):
+        config.set(key, False)
+    book = BookEntry(entry_id='a', author=Field('Sanderson', 'api', 0.9),
+                     status='approved')
+    dialog = LoadInputDialog([book], [], config)
+
+    assert dialog.mode_update.isChecked() and not dialog.resetting()
+    assert dialog.keep_options().keeps_everything()
+    assert dialog.go.text() == 'Update list'
+
+    dialog.mode_reset.setChecked(True)
+    assert dialog.resetting()
+    assert not dialog.keep_options().keeps_everything()
+    assert dialog.go.text().startswith('Reload and reset')
+    dialog.done(0)
 
 
 def test_the_load_dialog_defaults_to_the_selection(qt_app, settings):
@@ -482,6 +581,7 @@ def test_a_fresh_load_dialog_keeps_only_what_you_typed(qt_app, tmp_path):
     from scripts.settings import Settings
 
     dialog = LoadInputDialog([BookEntry(entry_id='a')], [], Settings(tmp_path / '.env'))
+    dialog.mode_reset.setChecked(True)
 
     assert dialog.keep_manual.isChecked()
     assert not dialog.keep_confident.isChecked()
@@ -511,6 +611,7 @@ def test_the_summary_counts_each_field_separately(qt_app, settings):
                        series=Field(value='Mistborn', source='regex', confidence=0.4))
              for i in range(3)]
     dialog = LoadInputDialog(books, [], settings)
+    dialog.mode_reset.setChecked(True)
     dialog.keep_confident.setChecked(True)
     dialog.threshold.setValue(75)
 
@@ -530,6 +631,7 @@ def test_the_load_dialog_remembers_what_you_ticked(qt_app, tmp_path):
 
     config = Settings(tmp_path / '.env')
     dialog = LoadInputDialog([BookEntry(entry_id='a')], [], config)
+    dialog.mode_reset.setChecked(True)
     dialog.keep_decisions.setChecked(True)
     dialog.remember()
 
@@ -641,7 +743,7 @@ def _identified(entry_id, confidence, status='pending'):
     return BookEntry(
         entry_id=entry_id, folder=f'/library/{entry_id}', status=status,
         author=Field(value='Author', source='test', confidence=confidence),
-        title=Field(value='Title', source='test', confidence=confidence))
+        title=Field(value=f'Title {entry_id}', source='test', confidence=confidence))
 
 
 def test_confidence_setting_is_not_on_the_main_filter_row(window):
@@ -674,7 +776,7 @@ def test_status_filter_lists_coloured_review_statuses(window):
     items = [window.status_filter.itemText(index)
              for index in range(window.status_filter.count())]
     assert items == ['All statuses', 'Pending', 'Unsure', 'Approved', 'Rejected',
-                     'Applied', 'Duplicate', 'Has Warning']
+                     'Finalized', 'Duplicate', 'Has Warning']
     for index in range(1, window.status_filter.count()):
         assert window.status_filter.itemData(
             index, Qt.ItemDataRole.ForegroundRole) is not None
@@ -790,6 +892,7 @@ def test_initial_warning_previews_configured_fix_and_marks_only_nonmatching_rows
     warned.author = Field(value='A. B. Exampleton', source='test', confidence=0.8)
     clean = _identified('clean', 0.8)
     clean.author = Field(value='A.B. Exampleton', source='test', confidence=0.8)
+    clean.title = Field(value='Another book', source='test', confidence=0.8)
     _loaded(window, warned, clean)
 
     warned_row = window._row_for(warned.entry_id)
@@ -1039,6 +1142,42 @@ def test_first_subfolder_filter_is_added_to_shape_filter(window, tmp_path):
     assert shown == {'target'}
 
 
+@pytest.mark.parametrize('selected_count', [1, 20])
+def test_book_context_menu_does_not_access_book_paths(
+        window, tmp_path, monkeypatch, selected_count):
+    from pathlib import Path
+    from PyQt6.QtWidgets import QMenu
+    from scripts.gui import main_window
+    from scripts.gui.main_window import COL_FILES
+
+    root = tmp_path / 'library'
+    window.settings.set('AO_INPUT_DIR', str(root))
+    books = [BookEntry(entry_id=str(i), folder=str(root / 'Author' / str(i)),
+                       audio_files=['book.m4b']) for i in range(selected_count)]
+    window.set_entries(books)
+    window._select_entry_ids([book.entry_id for book in books])
+    position = window.table.visualItemRect(window.table.item(0, COL_FILES)).center()
+    shown = []
+    monkeypatch.setattr(QMenu, 'exec',
+                        lambda menu, *_args: shown.append(
+                            [action.text() for action in menu.actions()]))
+
+    def blocked(*_args, **_kwargs):
+        raise AssertionError('Opening the context menu must not access book paths')
+
+    with monkeypatch.context() as guard:
+        for method in ('resolve', 'stat', 'iterdir', 'rglob'):
+            guard.setattr(Path, method, blocked)
+        guard.setattr(main_window, 'open_folder_selection', blocked)
+        window._show_context_menu(position)
+
+    assert len(shown) == 1
+    assert 'Filter by Author' in shown[0]
+    suffix = '' if selected_count == 1 else f' ({selected_count})'
+    noun = 'folder' if selected_count == 1 else 'folders'
+    assert f'Open {noun}{suffix}  (Ctrl+O)' in shown[0]
+
+
 def test_unsure_rows_have_no_status_background_tint():
     from scripts.gui.theme import BG_BASE, STATUS_COLORS
 
@@ -1172,3 +1311,392 @@ def test_every_toolbar_hotkey_is_installed_and_advertised(window):
         action = window.tool_actions.get(key)
         if action is not None:
             assert action.toolTip().splitlines()[0].endswith(f'({sequence})'), key
+
+
+def _book(entry_id, author, series, index, title):
+    return BookEntry(entry_id=entry_id, author=Field(author, 'user', 1.0),
+                     series=Field(series, 'user', 1.0),
+                     series_index=Field(index, 'user', 1.0),
+                     title=Field(title, 'user', 1.0))
+
+
+def _column(window, column):
+    return [window.table.item(row, column).text()
+            for row in range(window.table.rowCount())]
+
+
+def test_author_sort_breaks_ties_by_series_then_number_then_title(window):
+    from scripts.gui.main_window import COL_AUTHOR, COL_TITLE
+    window.set_entries([
+        _book('a', 'Larson', 'Red Company', '10', 'Ten'),
+        _book('b', 'Larson', 'Red Company', '2', 'Two'),
+        _book('c', 'Larson', 'Rift Warrior', '1', 'Techborn'),
+        _book('d', 'Clarke', '', '', 'Hammer'),
+        _book('e', 'Larson', 'Red Company', '2', 'Also Two'),
+    ])
+    window.table.sortItems(COL_AUTHOR, Qt.SortOrder.AscendingOrder)
+    assert _column(window, COL_TITLE) == ['Hammer', 'Also Two', 'Two', 'Ten', 'Techborn']
+    window.table.sortItems(COL_AUTHOR, Qt.SortOrder.DescendingOrder)
+    assert _column(window, COL_TITLE) == ['Also Two', 'Two', 'Ten', 'Techborn', 'Hammer']
+
+
+def test_series_sort_breaks_ties_by_number_then_title(window):
+    from scripts.gui.main_window import COL_SERIES, COL_TITLE
+    window.set_entries([
+        _book('a', 'Z', 'Mistborn', '3', 'Hero'),
+        _book('b', 'A', 'Mistborn', '1', 'Final Empire'),
+        _book('c', 'M', 'Mistborn', '1-3', 'Box Set'),
+    ])
+    window.table.sortItems(COL_SERIES, Qt.SortOrder.AscendingOrder)
+    assert _column(window, COL_TITLE) == ['Box Set', 'Final Empire', 'Hero']
+
+
+def test_table_sort_is_remembered(qt_app, settings):
+    from scripts.gui.main_window import COL_SERIES
+    first = MainWindow(settings)
+    header = first.table.horizontalHeader()
+    header.setSortIndicator(COL_SERIES, Qt.SortOrder.DescendingOrder)
+    header.sectionClicked.emit(COL_SERIES)
+    first.close()
+    second = MainWindow(settings)
+    header = second.table.horizontalHeader()
+    assert header.sortIndicatorSection() == COL_SERIES
+    assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+    second.close()
+
+
+def test_load_dialog_removes_books_with_no_files_at_once_after_asking(qt_app, tmp_path,
+                                                                    monkeypatch):
+    import time
+
+    from scripts.gui import load_dialog
+    from scripts.gui.load_dialog import LoadInputDialog
+    from scripts.settings import Settings
+
+    folder = tmp_path / 'books' / 'Here'
+    folder.mkdir(parents=True)
+    (folder / 'book.mp3').write_bytes(b'x')
+    here = BookEntry(entry_id='here', folder=str(folder), audio_files=['book.mp3'])
+    moved = BookEntry(entry_id='moved', folder=str(tmp_path / 'books' / 'Moved'),
+                      audio_files=['01.mp3', '02.mp3'], status='applied')
+    removed = []
+    dialog = LoadInputDialog([here, moved], [], Settings(tmp_path / '.env'),
+                             on_remove=removed.extend)
+    deadline = time.time() + 10
+    while dialog._empty_ids is None and time.time() < deadline:
+        qt_app.processEvents()
+        time.sleep(0.02)
+
+    assert dialog._empty_ids == {'moved'}
+    assert not dialog.notice.isHidden() and not dialog.purge.isHidden()
+    assert '1 book' in dialog.notice_text.text()
+    from scripts.gui.item_list import sections_text
+    listed = sections_text(dialog._notice_sections())
+    assert 'show which' in dialog.notice_text.text()
+    assert 'Moved' in listed and '01.mp3' in listed and '02.mp3' in listed, \
+        'the notice names the book and its files'
+
+    asked = []
+
+    def answer(value):
+        def confirm(_parent, _title, _text, sections, **_kw):
+            asked.append(sections)
+            return value
+        return confirm
+
+    monkeypatch.setattr(load_dialog, 'confirm_list', answer(False))
+    dialog.purge.click()
+    assert removed == [], 'answering No removes nothing'
+    assert any('01.mp3' in line for line in asked[0][0][1]), 'the question lists them'
+
+    monkeypatch.setattr(load_dialog, 'confirm_list', answer(True))
+    dialog.purge.click()
+    assert removed == ['moved'], 'removed immediately, not on Load'
+    assert [e.entry_id for e in dialog.all_entries] == ['here']
+    assert dialog.purge.isHidden()
+    dialog.done(0)
+
+
+def test_load_that_loses_work_asks_first(window, monkeypatch):
+    from scripts.gui import item_list
+    from scripts.load_options import KeepOptions
+
+    book = BookEntry(entry_id='b', status='approved',
+                     title=Field('Contact', 'llm', 0.85))
+    window.set_entries([book])
+
+    class FakeDialog:
+        def scope(self):
+            return None
+
+        def keep_options(self):
+            return KeepOptions(manual=False, above=101, decisions=False)
+
+    shown = []
+
+    def fake_confirm(_parent, _title, text, sections, **_kw):
+        shown.append(text)
+        shown.append(sections)
+        return False
+
+    monkeypatch.setattr(item_list, 'confirm_list', fake_confirm)
+    assert window._confirm_load_loses_work(FakeDialog()) is False
+    assert '1 value' in shown[0] and '1 Approved / Rejected' in shown[0]
+    assert 'Contact' in shown[1][0][1][0], 'the book losing work is named'
+
+    class KeepAll(FakeDialog):
+        def keep_options(self):
+            return KeepOptions.keep_everything()
+
+    shown.clear()
+    assert window._confirm_load_loses_work(KeepAll()) is True
+    assert shown == [], 'nothing lost, nothing asked'
+
+
+def test_rejecting_in_a_status_sorted_table_rejects_that_book(window):
+    """Sorted by Status, rejecting a book re-sorted it mid-update and the stripe and
+    pill landed on whichever book took its row."""
+    from scripts.gui.main_window import COL_FILES, COL_STATUS
+    from scripts.gui.delegates import ROLE_STATUS
+    from scripts.models import STATUS_REJECTED
+    entries = [BookEntry(entry_id=name, folder=f'C:/books/{name}') for name in 'abc']
+    for entry in entries:
+        entry.set_field('title', entry.entry_id, 'user')
+    window.set_entries(entries)
+    window._sorted_by_user(COL_STATUS)
+    order = [window._entry_at(row).entry_id for row in range(3)]
+
+    target = window.entries[order[0]]
+    window._set_entries_status([target], STATUS_REJECTED)
+
+    # Re-sorted after the change, so the rejected book has moved past the others.
+    assert [window._entry_at(row).entry_id for row in range(3)] == order[1:] + order[:1]
+    row = window._row_for(target.entry_id)
+    assert window.table.item(row, COL_STATUS).data(ROLE_STATUS) == STATUS_REJECTED
+    for other in order[1:]:
+        other_row = window._row_for(other)
+        assert window.table.item(other_row, COL_FILES).data(ROLE_STATUS) != STATUS_REJECTED
+    assert [e.entry_id for e in window.entries.values()
+            if e.status == STATUS_REJECTED] == [target.entry_id]
+
+
+def test_rejecting_moves_on_to_the_book_that_was_below_it(window):
+    """After the re-sort the selection goes to the next book you saw, not to
+    whichever book took the rejected one's row."""
+    from scripts.gui.main_window import COL_STATUS
+    entries = [BookEntry(entry_id=name, folder=f'C:/books/{name}') for name in 'abc']
+    for entry in entries:
+        entry.set_field('title', entry.entry_id, 'user')
+    window.set_entries(entries)
+    window._sorted_by_user(COL_STATUS)
+    order = [window._entry_at(row).entry_id for row in range(3)]
+    window.table.selectRow(0)
+
+    window._set_status_selected('rejected')
+
+    assert [e.entry_id for e in window.selected_entries()] == [order[1]]
+
+
+@pytest.mark.parametrize('edit_in_place', [False, True])
+@pytest.mark.parametrize('original_title', ['Alpha', 'Zulu'])
+@pytest.mark.parametrize('descending', [False, True])
+@pytest.mark.parametrize('whole_row', [False, True])
+@pytest.mark.parametrize('modifier', [Qt.KeyboardModifier.NoModifier,
+                                    Qt.KeyboardModifier.ShiftModifier])
+def test_approve_after_edit_resorts_the_selected_book(
+        window, qt_app, edit_in_place, original_title, descending, whole_row, modifier):
+    from PyQt6.QtWidgets import QLineEdit
+    from scripts.gui.delegates import ROLE_STATUS
+    from scripts.gui.main_window import COL_STATUS, COL_TITLE
+
+    target = _book('a', 'Author', '', '', original_title)
+    other = _book('b', 'Author', '', '', 'Beta')
+    last = _book('c', 'Author', '', '', 'Omega')
+    window.set_entries([target, other, last])
+    window._sorted_by_user(COL_TITLE)
+    if descending:
+        window._sorted_by_user(COL_TITLE)
+    window.table.setCurrentCell(window._row_for(target.entry_id), COL_TITLE)
+    if whole_row:
+        window.table.selectRow(window._row_for(target.entry_id))
+        window.table.selectionModel().setCurrentIndex(
+            window.table.model().index(window._row_for(target.entry_id), COL_TITLE),
+            window.table.selectionModel().SelectionFlag.NoUpdate)
+
+    if edit_in_place:
+        window.table.editItem(window.table.currentItem())
+        editor = window.table.findChild(QLineEdit)
+        assert editor is not None
+        editor.selectAll()
+        QTest.keyClicks(editor, 'Gamma')
+        QTest.keyClick(editor, Qt.Key.Key_Return, modifier)
+    else:
+        window._write_field([target], 'title', 'Gamma')
+    qt_app.processEvents()
+
+    assert window._row_for(target.entry_id) == 1
+    assert [entry.entry_id for entry in window.selected_entries()] == [target.entry_id]
+    assert window.table.currentRow() == 1
+    window.table.setFocus()
+    QTest.keyClick(window.table, Qt.Key.Key_F5)
+    qt_app.processEvents()
+
+    assert target.status == 'approved'
+    assert other.status == 'pending'
+    assert last.status == 'pending'
+    for book in (target, other, last):
+        assert window.table.item(window._row_for(book.entry_id), COL_STATUS).data(
+            ROLE_STATUS) == book.status
+
+
+@pytest.mark.parametrize('modifier, start_row, next_row', [
+    (Qt.KeyboardModifier.NoModifier, 0, 1),
+    (Qt.KeyboardModifier.ShiftModifier, 1, 0),
+])
+def test_enter_after_edit_still_advances_when_the_book_does_not_move(
+        window, qt_app, modifier, start_row, next_row):
+    from PyQt6.QtWidgets import QLineEdit
+    from scripts.gui.main_window import COL_TITLE
+
+    window.set_entries([_book('a', 'Author', '', '', 'Alpha'),
+                        _book('b', 'Author', '', '', 'Beta')])
+    window._sorted_by_user(COL_TITLE)
+    window.table.setCurrentCell(start_row, COL_TITLE)
+    window.table.editItem(window.table.currentItem())
+    editor = window.table.findChild(QLineEdit)
+    assert editor is not None
+    editor.selectAll()
+    QTest.keyClicks(editor, 'Alpha edited' if start_row == 0 else 'Beta edited')
+    QTest.keyClick(editor, Qt.Key.Key_Return, modifier)
+    qt_app.processEvents()
+
+    assert window.table.currentRow() == next_row
+
+
+def test_duplicate_identity_warns_and_highlights_every_matching_book(window):
+    from scripts.gui.delegates import ROLE_DUPLICATE_IDENTITY, ROLE_WARNING
+    from scripts.gui.main_window import COL_CONF, COL_TITLE
+    books = [_book(name, 'Author', 'Series', '1', 'Title') for name in 'abc']
+    window.set_entries(books)
+
+    for book in books:
+        row = window._row_for(book.entry_id)
+        assert any('Duplicate book identity' in warning for warning in book.warnings)
+        assert window.table.item(row, COL_TITLE).data(ROLE_DUPLICATE_IDENTITY)
+        assert window.table.item(row, COL_CONF).data(ROLE_WARNING)
+        assert book.status == 'pending'
+        assert window._suggested_warning_fixes(book) == []
+
+
+@pytest.mark.parametrize('live_sort', [False, True])
+def test_duplicate_warning_updates_both_books_when_an_edit_creates_or_resolves_it(
+        window, live_sort):
+    from scripts.gui.delegates import ROLE_DUPLICATE_IDENTITY, ROLE_WARNING
+    from scripts.gui.main_window import COL_CONF, COL_TITLE
+    window.settings.set('AO_UI_RESORT_LIVE', str(live_sort).lower())
+    first = _book('a', 'Author', 'Series', '1', 'Alpha')
+    second = _book('b', 'Author', 'Series', '1', 'Beta')
+    window.set_entries([first, second])
+    window._sorted_by_user(COL_TITLE)
+    window.table.setCurrentCell(window._row_for(first.entry_id), COL_TITLE)
+    window.table.currentItem().setText('Beta')
+    for book in (first, second):
+        assert any('Duplicate book identity' in warning for warning in book.warnings)
+        assert window.table.item(window._row_for(book.entry_id), COL_CONF).data(ROLE_WARNING)
+    assert [e.entry_id for e in window.selected_entries()] == ['a']
+
+    window._write_field([first], 'series_index', '2')
+    for book in (first, second):
+        row = window._row_for(book.entry_id)
+        assert not book.warnings
+        assert not window.table.item(row, COL_TITLE).data(ROLE_DUPLICATE_IDENTITY)
+        assert not window.table.item(row, COL_CONF).data(ROLE_WARNING)
+
+
+def test_newly_loaded_duplicate_updates_the_existing_book(window):
+    first = _book('a', 'Author', '', '', 'Title')
+    second = _book('b', 'Author', '', '', 'Title')
+    window.set_entries([first])
+    window.upsert_entry(second)
+    assert first.warnings and second.warnings
+    window.set_entries([first])
+    assert not first.warnings
+
+
+def test_sort_preserves_the_selected_books_and_columns(window):
+    from scripts.gui.main_window import COL_AUTHOR, COL_TITLE
+    books = [_book(name, 'Author', '', '', title)
+             for name, title in [('a', 'Zulu'), ('b', 'Beta'), ('c', 'Alpha')]]
+    window.set_entries(books)
+    window.table.setCurrentCell(window._row_for('a'), COL_TITLE)
+    window.table.item(window._row_for('c'), COL_AUTHOR).setSelected(True)
+    window._sorted_by_user(COL_TITLE)
+
+    assert {(window._entry_at(i.row()).entry_id, i.column())
+            for i in window.table.selectedIndexes()} == {('a', COL_TITLE), ('c', COL_AUTHOR)}
+    assert window._entry_at(window.table.currentRow()).entry_id == 'a'
+    window._set_status_selected('approved')
+    assert window.entries['a'].status == 'approved'
+    assert window.entries['c'].status == 'approved'
+    assert window.entries['b'].status == 'pending'
+
+
+@pytest.mark.parametrize('selection', ['none', 'cells', 'rows'])
+def test_clicking_sort_header_preserves_selection(window, qt_app, selection):
+    from scripts.gui.main_window import COL_AUTHOR, COL_SERIES, COL_TITLE
+
+    window.set_entries([
+        _book('a', 'Author', 'Zulu', '1', 'A'),
+        _book('b', 'Author', 'Beta', '1', 'B'),
+        _book('c', 'Author', 'Alpha', '1', 'C'),
+    ])
+    if selection == 'cells':
+        window.table.setCurrentCell(window._row_for('a'), COL_TITLE)
+        window.table.item(window._row_for('c'), COL_AUTHOR).setSelected(True)
+    elif selection == 'rows':
+        window._select_entry_ids(['a', 'c'])
+    else:
+        window.table.clearSelection()
+
+    def selected_cells():
+        return {(window._entry_at(index.row()).entry_id, index.column())
+                for index in window.table.selectedIndexes()}
+
+    expected = selected_cells()
+    current = window.table.currentIndex()
+    expected_current = ((window._entry_at(current.row()).entry_id, current.column())
+                        if current.isValid() else None)
+    header = window.table.horizontalHeader()
+    position = QPoint(header.sectionViewportPosition(COL_SERIES)
+                      + header.sectionSize(COL_SERIES) // 2,
+                      header.height() // 2)
+    for expected_order in [['c', 'b', 'a'], ['a', 'b', 'c']]:
+        QTest.mouseClick(header.viewport(), Qt.MouseButton.LeftButton, pos=position)
+        qt_app.processEvents()
+        assert [window._entry_at(row).entry_id for row in range(3)] == expected_order
+        assert selected_cells() == expected
+        current = window.table.currentIndex()
+        actual_current = ((window._entry_at(current.row()).entry_id, current.column())
+                          if current.isValid() else None)
+        assert actual_current == expected_current
+
+
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_preview_defaults_to_collapsed_books(qt_app, tmp_path, dry_run):
+    from scripts.file_operations import ApplyResult
+    from scripts.gui.preview_dialog import PreviewDialog
+
+    root = tmp_path / 'output'
+    destination = root / 'Author' / 'Series' / 'Title'
+    result = ApplyResult('book', destination, [
+        {'source': str(tmp_path / 'book.m4b'),
+         'destination': str(destination / 'book.m4b'), 'operation': 'copy'}])
+    dialog = PreviewDialog([result], root, dry_run=dry_run)
+    root_item = dialog.tree.topLevelItem(0)
+    author = root_item.child(0)
+    series = author.child(0)
+    book = series.child(0)
+    assert root_item.isExpanded() and author.isExpanded() and series.isExpanded()
+    assert book.isExpanded() == (not dry_run)
+    assert book.childCount() == 1
+    dialog.close()

@@ -60,10 +60,13 @@ class ApplyJournal:
         self._transactions: Optional[List[Transaction]] = None
 
     def record(self, transaction: Transaction) -> None:
+        # Load the cache before writing, or the first read would pick up this line
+        # from the file and the append below would list it twice.
+        transactions = self.all()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, 'a', encoding='utf-8') as handle:
             handle.write(json.dumps(transaction.to_dict(), ensure_ascii=False) + '\n')
-        self.all().append(transaction)
+        transactions.append(transaction)
 
     def all(self) -> List[Transaction]:
         """Every transaction ever recorded, oldest first. Cached after first read."""
@@ -94,13 +97,19 @@ class ApplyJournal:
         pending = self.pending()
         return pending[-1] if pending else None
 
-    def undo(self, transaction: Transaction) -> List[str]:
-        """Reverse one transaction. Returns a list of human-readable problems."""
+    def undo(self, transaction: Transaction,
+             only: Optional[List[int]] = None) -> List[str]:
+        """Reverse one transaction, or just the moves at the indices in `only`.
+
+        Returns a list of human-readable problems. The transaction counts as undone
+        once every one of its moves is.
+        """
         problems: List[str] = []
 
         # Reverse order, so files come back before their directories are removed.
-        for move in reversed(transaction.moves):
-            if move.undone:
+        for index in reversed(range(len(transaction.moves))):
+            move = transaction.moves[index]
+            if move.undone or (only is not None and index not in only):
                 continue
             source = Path(move.source)
             destination = Path(move.destination)
@@ -131,9 +140,45 @@ class ApplyJournal:
             except OSError:
                 pass  # not empty, or in use - harmless, leave it
 
-        transaction.undone = True
+        transaction.undone = all(move.undone for move in transaction.moves)
         self._rewrite()
         return problems
+
+    def undo_selected(self, selection: Dict[int, Optional[List[int]]]) -> tuple:
+        """Revert chosen transactions, or chosen files within them, in any order.
+
+        `selection` maps an index into ``pending()`` to the move indices to revert,
+        or None for the whole transaction. A later transaction that moved one of the
+        selected files onward is reverted first (that file only), otherwise the file
+        would not be where the earlier transaction expects to find it.
+        Returns (files reverted, problems).
+        """
+        pending = self.pending()
+        wanted: Dict[int, set] = {}
+        for index, moves in selection.items():
+            if 0 <= index < len(pending):
+                transaction = pending[index]
+                wanted[index] = set(range(len(transaction.moves))
+                                    if moves is None else moves)
+
+        # Pull in later moves that took a selected file further. Ascending, so a
+        # move pulled in here is itself checked when its own index comes round.
+        for index in range(len(pending)):
+            for position in list(wanted.get(index, ())):
+                move = pending[index].moves[position]
+                for later in range(index + 1, len(pending)):
+                    for other_position, other in enumerate(pending[later].moves):
+                        if (not other.undone and other.operation == 'move'
+                                and Path(other.source) == Path(move.destination)):
+                            wanted.setdefault(later, set()).add(other_position)
+
+        reverted, problems = 0, []
+        for index in sorted(wanted, reverse=True):
+            transaction = pending[index]
+            before = sum(1 for m in transaction.moves if m.undone)
+            problems.extend(self.undo(transaction, only=sorted(wanted[index])))
+            reverted += sum(1 for m in transaction.moves if m.undone) - before
+        return reverted, problems
 
     def undo_last(self) -> tuple:
         transaction = self.last()

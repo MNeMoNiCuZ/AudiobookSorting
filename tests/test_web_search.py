@@ -111,7 +111,7 @@ def no_ddg(monkeypatch):
 def test_no_brave_key_is_explained_rather_than_reported_as_no_results(no_ddg):
     """A blocked engine and a book nobody has heard of must not look identical."""
     client = WebSearchClient()
-    client._get_text = lambda url: ''  # every HTTP route dead
+    client._get_text = lambda url, site='': ''  # every HTTP route dead
     client._ddg('anything')
     assert 'AO_SEARCH_BRAVE_KEY' in client.last_error
     assert 'blocked or rate-limited' in client.last_error
@@ -135,6 +135,6 @@ def test_brave_failure_falls_through_to_duckduckgo_and_says_so(no_ddg):
         raise RuntimeError('HTTP 401 - the API key was rejected')
 
     client._brave = refuse
-    client._get_text = lambda url: ''
+    client._get_text = lambda url, site='': ''
     client._ddg('mistborn')
     assert 'HTTP 401' in client.last_error

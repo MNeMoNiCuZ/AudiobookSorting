@@ -29,7 +29,7 @@ TOOL_ITEMS: List[ToolItem] = [
     # Key stays 'scan' so saved AO_TOOLBAR layouts keep working - only the name the
     # user reads changed, because "Scan" said nothing about what it did to the list
     # you already had.
-    ToolItem('scan', '⟳', 'Load Input',
+    ToolItem('scan', '⟳', 'Inputs',
              'Read the input folder into the list.\n'
              'With books already loaded you are asked what to keep first.\n'
              'Right-click for the same thing on the selected rows only, and to\n'
@@ -58,7 +58,8 @@ TOOL_ITEMS: List[ToolItem] = [
              'The program auto-saves identification results, edits, and review choices.\n'
              'Finalize is the only step that touches your files. Every approved row - including\n'
              'any edits you typed - is renamed and moved/copied into the output\n'
-             'folder. Preview it first; you are asked to confirm before anything moves.'),
+             'folder. Preview it first; you are asked to confirm before anything moves.\n'
+             'RMB: Finalize log - see what was moved and revert books or files'),
     ToolItem('goodreads', '⌕', 'Goodreads',
              'Open a Goodreads search for the selected book in your browser,\n'
              'using whatever author/title we currently have.'),

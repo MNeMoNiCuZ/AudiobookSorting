@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
+from .table import ColumnTable
 from .theme import (ACCENT, FIELD, FIELD_BORDER, STATUS_HUES, TEXT_DIM,
                     table_modal_width)
 
@@ -86,7 +87,7 @@ class OverwriteDialog(QDialog):
         note.setStyleSheet(f'color: {TEXT_DIM};')
         layout.addWidget(note)
 
-        self.table = QTableWidget(count, len(COLUMNS))
+        self.table = ColumnTable(count, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(

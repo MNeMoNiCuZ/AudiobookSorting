@@ -21,6 +21,7 @@ MANIFEST
 # PyInstaller
 *.manifest
 *.spec
+!AudiobookOrganizer.spec
 
 # Installer logs
 pip-log.txt
@@ -97,3 +98,7 @@ api_cache.json
 
 # Internal documentation
 docs/
+
+# List backups and the change log, written next to book_entries.json
+backups/
+logs/

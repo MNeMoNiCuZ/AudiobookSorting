@@ -35,6 +35,14 @@ class APIError(RuntimeError):
     """Raised when a provider call fails after all retries."""
 
 
+# Sanctum's answer while it has switched a provider off after repeated failures.
+CIRCUIT_OPEN = 'provider_circuit_open'
+
+
+class ProviderBlocked(APIError):
+    """The server has blocked the provider for now. Retrying only keeps it blocked."""
+
+
 class ProviderConfig:
     """One provider's ``AO_PROVIDER_<NAME>_*`` keys, resolved into usable values."""
 
@@ -234,6 +242,8 @@ class APIEngine:
                     except ValueError as exc:
                         raise APIError(f"{cfg.name} returned non-JSON body: {exc}") from exc
                 last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+                if CIRCUIT_OPEN in response.text:
+                    raise ProviderBlocked(f"Call to {cfg.name} ({url}) failed - {last_error}")
                 # 4xx other than rate-limiting will not get better by retrying.
                 if 400 <= response.status_code < 500 and response.status_code != 429:
                     break

@@ -107,12 +107,13 @@ SECTIONS: List[Tuple[str, str, List[str]]] = [
 
     ('Loading',
      'What survives when you load the input folder over work you have already done. '
-     'The Load Input dialog sets these as you use it.',
+     'The Inputs dialog sets these as you use it.',
      ['AO_RESUME_SCANS', 'AO_LOAD_KEEP_MANUAL', 'AO_LOAD_KEEP_CONFIDENT',
-      'AO_LOAD_KEEP_ABOVE', 'AO_LOAD_KEEP_DECISIONS']),
+      'AO_LOAD_KEEP_ABOVE', 'AO_LOAD_KEEP_DECISIONS', 'AO_LOAD_LIST_ONLY']),
 
     ('Cache and logging', '',
-     ['AO_CACHE_DB', 'AO_CACHE_MISS_TTL', 'AO_LOG_LEVEL', 'AO_THREADS']),
+     ['AO_CACHE_DB', 'AO_CACHE_MISS_TTL', 'AO_LOG_LEVEL', 'AO_CHANGE_LOG_MB',
+      'AO_THREADS']),
 
     ('Interface', '',
      ['AO_UI_DENSITY', 'AO_UI_ICON_SIZE', 'AO_UI_TOOLBAR_LABELS',
@@ -126,7 +127,7 @@ SECTIONS: List[Tuple[str, str, List[str]]] = [
     ('Remembered layout',
      'Written by the app as you use the window. Editing these by hand achieves '
      'nothing - move the window instead.',
-     ['AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS', 'AO_UI_HIDDEN_COLUMNS',
+     ['AO_UI_WINDOW', 'AO_UI_COLUMN_WIDTHS', 'AO_UI_SORT', 'AO_UI_HIDDEN_COLUMNS',
       'AO_UI_GRID_WINDOW', 'AO_UI_GRID_COLUMNS', 'AO_UI_COPY_RECENT_LIST']),
 ]
 

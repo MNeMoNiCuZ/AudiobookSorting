@@ -111,7 +111,7 @@ class ScanWorker(CancellableWorker):
 
     def work(self) -> Dict:
         self.signals.progress.emit(0, 0, 'Scanning...')
-        entries = self.scanner.scan_directory()
+        entries = self.scanner.scan_directory(should_stop=lambda: self._cancelled)
         if self._cancelled:
             return {}
 
@@ -135,7 +135,9 @@ class ScanWorker(CancellableWorker):
                     self.resolver.resolve(entry, tiers=['metadata', 'regex'])
                 except Exception:
                     logger.exception('Offline pass failed for %s', entry.entry_id)
-            self.signals.entry_done.emit(entry)
+            # No entry_done per book: the finished handler puts the whole list in the
+            # table in one go, and a row-by-row insert of thousands of books is what
+            # froze the window.
             if index % 25 == 0 or index == total:
                 self.signals.progress.emit(index, total, f'Read {index} of {total}')
 
@@ -154,19 +156,42 @@ class ResolveWorker(CancellableWorker):
     """Run the resolution chain over a set of entries, folder by folder."""
 
     def __init__(self, resolver, entries: List[BookEntry],
-                 tiers: Optional[List[str]] = None, only_incomplete: bool = False):
+                 tiers: Optional[List[str]] = None, only_incomplete: bool = False,
+                 fresh: bool = False):
         super().__init__()
         self.resolver = resolver
         self.entries = list(entries)
         self.tiers = tiers
         self.only_incomplete = only_incomplete
+        # Skip the lookup cache - set only for "Run again" on a source's card.
+        self.fresh = fresh
         # The controller uses this to distinguish members of a bundled identify job
         # that are still waiting from the folder currently being processed.
         self.started_entry_ids = set()
-        using = ', '.join(tiers) if tiers else 'the configured sources'
-        self.label = (f'Identify {len(self.entries)} '
-                      f'book{"" if len(self.entries) == 1 else "s"} using {using}')
+        # Books taken back out of the queue before their turn came. Checked as each
+        # folder comes up, because the running job has already grouped its entries.
+        self.removed_entry_ids = set()
+        self._using = ', '.join(tiers) if tiers else 'the configured sources'
+        self._set_label()
         self.kind = 'identify'
+
+    def _set_label(self) -> None:
+        self.label = (f'Identify {len(self.entries)} '
+                      f'book{"" if len(self.entries) == 1 else "s"} using {self._using}')
+
+    def waiting_entry_ids(self) -> set:
+        """Books in this job that have not been started yet."""
+        return {entry.entry_id for entry in self.entries
+                if entry.entry_id not in self.started_entry_ids}
+
+    def remove_entries(self, entry_ids: set) -> int:
+        """Take books that have not been started out of this job. Returns how many."""
+        dropped = self.waiting_entry_ids() & set(entry_ids)
+        if dropped:
+            self.removed_entry_ids |= dropped
+            self.entries = [e for e in self.entries if e.entry_id not in dropped]
+            self._set_label()
+        return len(dropped)
 
     def work(self) -> Dict:
         targets = self.entries
@@ -186,6 +211,9 @@ class ResolveWorker(CancellableWorker):
         for index, (folder, group) in enumerate(groups.items(), start=1):
             if self._cancelled:
                 break
+            group = [e for e in group if e.entry_id not in self.removed_entry_ids]
+            if not group:
+                continue
             name = folder.rsplit('\\', 1)[-1].rsplit('/', 1)[-1]
             for entry in group:
                 self.started_entry_ids.add(entry.entry_id)
@@ -196,6 +224,7 @@ class ResolveWorker(CancellableWorker):
                 if len(group) == 1:
                     entry = group[0]
                     self.resolver.resolve(entry, tiers=self.tiers,
+                                          fresh=self.fresh,
                                           should_cancel=self.should_cancel,
                                           on_tier=lambda name, done_, total_, e=entry:
                                           self.signals.entry_progress.emit(
@@ -207,11 +236,12 @@ class ResolveWorker(CancellableWorker):
                         done, total, f'Identified {entry.value("title") or name}')
                 else:
                     self.resolver.resolve_folder(group, tiers=self.tiers,
+                                                 fresh=self.fresh,
                                                  should_cancel=self.should_cancel,
-                                                 on_tier=lambda name, done_, total_:
-                                                 [self.signals.entry_progress.emit(
+                                                 on_tier=lambda name, done_, total_, e:
+                                                 self.signals.entry_progress.emit(
                                                      e, done_ / total_ if total_ else 0.0,
-                                                     name) for e in group])
+                                                     name))
                     for entry in group:
                         self.signals.entry_done.emit(entry)
                         done += 1
@@ -233,8 +263,10 @@ class ApplyWorker(CancellableWorker):
         self.file_ops = file_ops
         self.entries = list(entries)
         self.preview = preview
-        self.label = (f'{"Preview" if preview else "Write"} {len(self.entries)} '
-                      f'book{"" if len(self.entries) == 1 else "s"}')
+        # Rejected books ride along to be reported as skipped; they are not written.
+        count = sum(1 for entry in self.entries if entry.status != 'rejected')
+        self.label = (f'{"Preview" if preview else "Write"} {count} '
+                      f'book{"" if count == 1 else "s"}')
 
     def work(self) -> Dict:
         self.file_ops.reset_batch()
@@ -311,6 +343,8 @@ class WorkerManager:
         # Called with (queued_count) whenever anything about the queue changes, so the
         # window can say "2 jobs waiting" without polling.
         self.on_queue_change: Optional[Callable[[int], None]] = None
+        # Called once whenever the queue has drained - the end of a run.
+        self.on_idle: Optional[Callable[[], None]] = None
         # A progress bar for the *whole* queue needs a denominator that survives jobs
         # finishing, so the run is counted rather than the list measured: `accepted` is
         # every job taken on since the queue was last empty, `completed` how many of
@@ -346,6 +380,8 @@ class WorkerManager:
         else:
             self._reset_counters()
         self._notify()
+        if self.current is None and self.on_idle is not None:
+            self.on_idle()
 
     def _reset_counters(self) -> None:
         self.accepted = 0
@@ -370,8 +406,17 @@ class WorkerManager:
         cancelling a two-minute encode also silently threw away the four identifications
         lined up behind it.
         """
-        if self.current is not None:
-            self.current.cancel()
+        worker = self.current
+        if worker is None or worker.done:
+            return
+        # Cooperative cancellation only lands when the job next checks, which can be
+        # the far side of a slow web or model request. So the job is let go now: it is
+        # marked over, reported cancelled, and silenced, and the queue moves on while
+        # its thread winds down in the background.
+        worker.cancel()
+        worker.done = True
+        worker.signals.cancelled.emit()
+        worker.signals.blockSignals(True)
 
     def status(self) -> Dict:
         """Everything the queue view draws, in one snapshot."""
@@ -410,6 +455,38 @@ class WorkerManager:
             self._notify()
             return True
         return False
+
+    def waiting_entry_ids(self) -> set:
+        """Books in an identification job that has not reached them yet."""
+        workers = list(self.queue)
+        if self.current is not None and not self.current.done:
+            workers.insert(0, self.current)
+        waiting = set()
+        for worker in workers:
+            if getattr(worker, 'kind', '') == 'identify':
+                waiting |= worker.waiting_entry_ids()
+        return waiting
+
+    def remove_entries(self, entry_ids) -> int:
+        """Take books out of every identification job still waiting to reach them.
+
+        A queued job left with no books is dropped altogether. Returns how many
+        books were removed.
+        """
+        removed = 0
+        workers = list(self.queue)
+        if self.current is not None and not self.current.done:
+            workers.insert(0, self.current)
+        for worker in workers:
+            if getattr(worker, 'kind', '') != 'identify':
+                continue
+            removed += worker.remove_entries(entry_ids)
+            if not worker.entries and worker in self.queue:
+                self.queue.remove(worker)
+                self.accepted = max(self.completed, self.accepted - 1)
+        if removed:
+            self._notify()
+        return removed
 
     def clear_queue(self) -> None:
         """Drop everything waiting, leaving the running job alone."""

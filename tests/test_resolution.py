@@ -127,6 +127,24 @@ def test_user_edits_are_absolute():
     assert entry.value('title') == 'Typed By Hand'
 
 
+def test_model_answer_beats_a_catalogue_match():
+    entry = BookEntry()
+    entry.set_field('title', 'Red Company: Contact', 'audnexus', 0.98)
+    assert entry.set_field('title', 'Contact', 'llm', 0.85)
+    assert entry.value('title') == 'Contact'
+
+
+def test_later_tiers_cannot_replace_the_model_answer():
+    entry = BookEntry()
+    entry.set_field('title', 'Red Company: Contact', 'metadata')
+    entry.set_field('title', 'Contact', 'llm', 0.85)
+    assert not entry.set_field('title', 'Red Company: Contact', 'audnexus', 0.98)
+    assert entry.value('title') == 'Contact'
+    entry.series = Field(source='llm', confidence=0.85)
+    assert not entry.set_field('series', 'Red Company', 'googlebooks', 0.9)
+    assert entry.set_field('title', 'Typed', 'user')
+
+
 def test_confidence_ignores_series_when_standalone():
     entry = BookEntry()
     entry.set_field('author', 'A', 'metadata')
@@ -318,7 +336,7 @@ def test_punctuation_left_by_the_filters_is_tidied():
         # Removing a bracket wedged between two words leaves the word boundary.
         assert clean_value('title', 'Title(Unabridged)Sub') == 'Title Sub'
         # Punctuation that belongs to the name is not touched.
-        assert clean_value('title', 'Spider-Man: No Way Home') == 'Spider-Man: No Way Home'
+        assert clean_value('title', 'Spider-Man: No Way Home') == 'Spider-Man - No Way Home'
         assert clean_value('author', 'Neil Gaiman & Terry Pratchett') == \
             'Neil Gaiman & Terry Pratchett'
 
@@ -480,6 +498,28 @@ def _write(path, payload, size=200_000):
     path.write_bytes(body)
 
 
+@pytest.mark.parametrize('different_field', [None, 'author', 'series', 'series_index', 'title'])
+def test_matching_book_identity_is_a_warning(different_field):
+    first = BookEntry(entry_id='a')
+    second = BookEntry(entry_id='b')
+    for entry in (first, second):
+        for name, value in [('author', 'Author'), ('series', 'Series'),
+                            ('series_index', '1'), ('title', 'Title')]:
+            entry.set_field(name, value, 'user')
+    if different_field:
+        setattr(second, different_field, Field('2' if different_field == 'series_index'
+                                             else 'Other', 'user', 1.0))
+    for entry in (first, second):
+        duplicates = [f for f in inspect_entry(entry, [first, second])
+                      if f.kind == 'duplicate_identity']
+        assert bool(duplicates) == (different_field is None)
+
+
+def test_empty_identities_are_not_duplicate_warnings():
+    entries = [BookEntry(entry_id='a'), BookEntry(entry_id='b')]
+    assert not inspect_entry(entries[0], entries)
+
+
 def test_identical_copies_are_duplicates(tmp_path):
     """The same audio in two places, filed under different names, is one duplicate."""
     for folder in ('library/final empire', 'downloads/BS - Mistborn 1'):
@@ -584,7 +624,8 @@ def test_stale_duplicate_flag_is_cleared(tmp_path):
 def test_normal_title_numbers_are_not_suspicious():
     assert not inspect_value('title', 'A Story - Part 1')
     assert not inspect_value('title', 'A Story, Volume Two')
-    assert not inspect_value('title', 'The Sheriff 2')
+    assert [f.kind for f in inspect_value('title', 'The Sheriff 2')] == ['trailing_number']
+    assert not inspect_value('title', 'The Sheriff 02')
     assert not inspect_value('title', 'Books 1-3')
     assert not inspect_value('author', 'adastra339')
     assert any(finding.kind == 'file_segment'
@@ -613,3 +654,156 @@ def test_suggested_fix_removes_empty_brackets_after_file_details():
 
     assert suggest_fix(
         'title', 'Constitution (Unabridged)', 'file_words') == 'Constitution'
+
+
+def test_backup_and_change_log(tmp_path):
+    import json
+
+    from scripts.data_manager import DataManager
+
+    data = DataManager(tmp_path / 'book_entries.json', autosave_seconds=0)
+    entry = BookEntry(entry_id='x', folder=str(tmp_path), primary_audio='a.mp3')
+    entry.set_field('title', 'Red Company: Contact', 'metadata')
+    data.add(entry)
+    data.flush()
+    entry.set_field('title', 'Contact', 'llm', 0.85)
+    data.mark_dirty()
+    data.flush()
+
+    backup = data.backup('before-load')
+    assert backup is not None and backup.parent.name == 'backups'
+    assert json.loads(backup.read_text(encoding='utf-8'))['x']['title']['value'] == 'Contact'
+
+    entry.title = Field()
+    data.mark_dirty()
+    data.flush()
+    lines = [json.loads(line) for line in
+             data.change_log_path().read_text(encoding='utf-8').splitlines()]
+    titles = [(l['before'], l['after']) for l in lines if l.get('field') == 'title']
+    assert ('Red Company - Contact', 'Contact') in titles
+    assert ('Contact', '') in titles
+
+    assert data.restore(backup) == 1
+    assert data.get('x').value('title') == 'Contact'
+
+
+def test_identify_reuses_the_cache_and_run_again_skips_it(settings, tmp_path):
+    from scripts.resolver import Resolver
+
+    calls = []
+
+    class FakeApi:
+        sources = ['audnexus']
+        threshold = 0.7
+        last_sources = ['audnexus']
+
+        def search(self, hints, sources=None, force=False):
+            calls.append(('api', force))
+            return None
+
+    class FakeSearch:
+        last_results = []
+
+        def search(self, hints, force=False):
+            calls.append(('search', force))
+            return None
+
+    resolver = Resolver(settings, api_client=FakeApi(), search_client=FakeSearch())
+    entry = BookEntry(entry_id='x', folder=str(tmp_path), primary_audio='a.mp3')
+    entry.set_field('title', 'Contact', 'metadata')
+
+    resolver.resolve(entry, tiers=['api', 'search'])
+    assert calls == [('api', False), ('search', False)], 'Identify reads the cache'
+    calls.clear()
+    resolver.resolve(entry, tiers=['api', 'search'], fresh=True)
+    assert calls == [('api', True), ('search', True)], 'Run again goes to the network'
+
+
+def test_every_llm_exchange_is_logged(tmp_path, monkeypatch):
+    import json
+
+    from scripts import llm_query
+
+    log = tmp_path / 'logs' / 'llm.jsonl'
+    monkeypatch.setattr(llm_query, 'llm_log_path', lambda: log)
+    client = llm_query.LLMQueryClient.__new__(llm_query.LLMQueryClient)
+    client.logger = llm_query.logging.getLogger('test')
+    client.log_limit = 1024 * 1024
+    client.model, client.temperature, client.max_tokens = 'm', 0.1, 100
+    client.last_exchange = {}
+
+    class Provider:
+        name = 'fake'
+
+    class Engine:
+        def call_api(self, payload, model=None):
+            return '{"title": "Contact", "author": "B.V. Larson"}'
+
+    client.provider, client.api_engine = Provider(), Engine()
+    result = client.query_book({'title': 'Red Company: Contact', 'path': 'RC/03.m4b'})
+    assert result['title'] == 'Contact'
+
+    record = json.loads(log.read_text(encoding='utf-8').splitlines()[0])
+    assert record['subject'] == 'RC/03.m4b'
+    assert 'Red Company: Contact' in record['prompt']
+    assert '"Contact"' in record['response']
+    assert record['model'] == 'm' and record['provider'] == 'fake'
+
+
+@pytest.mark.parametrize('entry_count, folder_reasoning', [(1, True), (2, True),
+                                                          (2, False)])
+def test_folder_model_receives_search_series_before_answering(
+        settings, tmp_path, monkeypatch, entry_count, folder_reasoning):
+    from scripts.llm_query import LLMQueryClient
+    from scripts.resolver import Resolver
+
+    settings.set('AO_FOLDER_REASONING', str(folder_reasoning).lower())
+    books = [BookEntry(entry_id=str(i), folder=str(tmp_path),
+                       primary_audio=str(tmp_path / f'Chapter {i + 1}.m4a'),
+                       audio_files=[f'Chapter {i + 1}.m4a']) for i in range(entry_count)]
+    calls = []
+    identity = {'title': "Don't Go to Sleep!", 'author': 'R.L. Stine',
+                'series': 'Goosebumps', 'series_index': '54'}
+    snippet = {'title': "Don't Go to Sleep! (Goosebumps, #54) by R.L. Stine",
+               'body': 'Goosebumps book 54 by R.L. Stine.'}
+
+    class Search:
+        last_results = [snippet]
+
+        def search(self, hints, force=False):
+            calls.append('search')
+            return dict(identity)
+
+    client = LLMQueryClient.__new__(LLMQueryClient)
+
+    def answer(prompt, subject=''):
+        calls.append('llm')
+        assert calls.count('search') == entry_count
+        assert snippet['title'] in prompt
+        assert 'Rejected catalogue match' in prompt
+        assert 'Goosebumps' in prompt and '54' in prompt
+        if entry_count > 1 and folder_reasoning:
+            return {'series': 'Goosebumps', 'author': 'R.L. Stine',
+                    'books': [{'file': entry.audio_files[0], **identity,
+                               'identified': True, 'confidence': 0.85} for entry in books]}
+        return {**identity, 'identified': True, 'confidence': 0.85}
+
+    monkeypatch.setattr(client, '_call', answer)
+    resolver = Resolver(settings, search_client=Search(), llm_client=client)
+
+    def api(entry, **_kwargs):
+        calls.append('api')
+        entry.evidence['api'] = [{'title': 'Rejected catalogue match',
+                                  'author': 'R.L. Stine', 'series': 'Goosebumps',
+                                  'series_index': '54'}]
+
+    monkeypatch.setattr(resolver, '_tier_api', api)
+    resolver.resolve_folder(books, tiers=['api', 'search', 'llm'])
+    assert calls[:entry_count * 2] == ['api', 'search'] * entry_count
+    assert calls[entry_count * 2:] == ['llm'] * (
+        1 if entry_count > 1 and folder_reasoning else entry_count)
+    for entry in books:
+        assert entry.value('series') == 'Goosebumps'
+        assert entry.value('series_index') == '54'
+        assert entry.resolved
+        assert [step['tier'] for step in entry.trace] == ['search', 'llm']
