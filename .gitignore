@@ -1,104 +1,50 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
+# User files: settings (.env), book list, cache, logs, backups
+/user/
 
-# Distribution / packaging
-.Python
-build/
-dist/
-downloads/
-eggs/
-.eggs/
-sdist/
-wheels/
-*.egg-info/
-*.egg
-.installed.cfg
-MANIFEST
+# Disposable: build intermediates, bytecode, scratch files
+/src/junk/
 
-# PyInstaller
-*.manifest
-*.spec
-!AudiobookOrganizer.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.cache
-.coverage
-.coverage.*
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
-
-# Type checkers and linters
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.pyre/
-.pytype/
-.ruff_cache/
-
-# Environments
-# .env.* as well as .env: the Settings page writes .env.tmp while saving, and a
-# hand-made .env.backup or .env.local holds exactly the same real keys the plain
-# name does. Only the committed template is exempt.
-.env
-.env.*
-!.env.example
-.venv
-env/
-venv/
-ENV/
-
-# Logs
-*.log
-
-# IDE / editor
-.idea/
-.vscode/
-.spyderproject
-.spyproject
-.ropeproject
-
-# OS
-.DS_Store
-Thumbs.db
-
-
-# --- Project-specific ---
-
-# Build output
+# Built executable
 /AudiobookOrganizer.exe
-*.ico
 
-# Virtual environment helpers
+# Tests (kept locally, never committed)
+tests/
+
+# Internal documentation
+/docs/
+
+# Virtual environment
+venv/
+.venv/
 venv_activate.bat
 venv_update.bat
 
-# Application data directories
-/input/
-/input2/
-/output/
-/temp/
+# Python leftovers, if anything runs outside launch.bat / build.bat
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
-# Runtime state
-book_entries.json
+# Safety net: anything user-like that ends up outside user/
+.env
+.env.*
+*.log
+*.log.*
 *.sqlite3
-apply_journal.jsonl
-api_cache.json
+book_entries*.json
+apply_journal*.jsonl
 
-# Internal documentation
-docs/
+# Leftovers from the old layout
+/build/
+/dist/
+/temp/
+/logs/
+/backups/
+/input/
+/output/
 
-# List backups and the change log, written next to book_entries.json
-backups/
-logs/
+# IDE / OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db

@@ -20,7 +20,10 @@ if exist "venv\Scripts\python.exe" (
     set "PY=python"
 )
 
-"%PY%" main.py %*
+REM  Bytecode goes into src\junk\, not next to the sources.
+set "PYTHONPYCACHEPREFIX=%~dp0src\junk\pycache"
+
+"%PY%" src\main.py %*
 set "CODE=%ERRORLEVEL%"
 
 REM  The window is usually started by double-clicking, where it would close before

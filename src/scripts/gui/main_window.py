@@ -1,0 +1,5794 @@
+"""Main window: the review table and everything around it.
+
+Layout, deliberately:
+
+* The window is one horizontal split, running the full height - table on the left,
+  the explanation panel on the right. The panel starts at the very top because it
+  describes the selected row, and nothing should sit above it pushing it down.
+* Filters live above the table, on the left, because that is what they filter.
+* Every action lives on one toolbar along the bottom, icon-only, next to the keys
+  that trigger them. The review loop is look -> identify (F4) -> approve (F5) /
+  reject (F6), and all three should be under the same hand.
+* Progress is a strip in the status bar, not a full-width row - it is a background
+  detail, and it only appears while something is running.
+
+Anything that is a bulk operation on the selection lives in the right-click menu
+rather than on the toolbar, so the toolbar stays short enough to read at a glance.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+
+from PyQt6.QtCore import (QEvent, QItemSelection, QItemSelectionModel, QObject,
+                         QFile, QPointF, QSignalBlocker, QSize, Qt, QTimer, QUrl, pyqtSignal)
+from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence,
+                         QPainter, QPixmap, QPolygonF, QShortcut)
+from PyQt6.QtWidgets import (
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QGridLayout,
+    QHBoxLayout, QHeaderView,
+    QInputDialog,
+    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+    QProgressBar,
+    QPushButton, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
+    QTextEdit, QToolBar, QToolButton, QToolTip, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget, QWidgetAction,
+)
+
+from ..paths import display_index
+from ..models import (IDENTITY_FIELDS, STATUS_APPLIED, STATUS_APPROVED, STATUS_PENDING,
+                      STATUS_REJECTED, STATUS_RISKY, BookEntry, pretty_status,
+                      stage_status)
+from .table import ColumnTable
+from .delegates import (KIND_CONFIDENCE, KIND_COVER, KIND_FILES, KIND_STATUS,
+                        ROLE_CONFIDENCE, ROLE_DUPLICATE_IDENTITY, ROLE_ENTRY_ID, ROLE_FLASH, ROLE_KIND,
+                        ROLE_SIZE,
+                        ROLE_PROGRESS, ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
+                        ROLE_WARNING, ROLE_WARNING_IGNORED,
+                        ReviewDelegate)
+from .cover_loader import CoverLoader, read_cover
+from .cover_viewer import CoverViewer
+from .icons import badged_icon
+from .item_list import short_list
+from .load_dialog import _under as _is_under
+from .icons import icon as make_icon
+from .queue_dialog import plural
+from .theme import (ACCENT, ACCENT_DARK, BG_RAISED, CONFIDENCE_HUES, ROW_HEIGHTS,
+                    STATUS_TEXT, TEXT, TEXT_DIM, TEXT_FAINT, source_color)
+from .toolbar import ITEMS_BY_KEY, SEPARATOR, parse_layout, shortcut_for
+from .why_panel import WhyPanel
+
+# The local tiers: what the Identify button runs, as "Initial Scan", until every
+# listed book has had them.
+INITIAL_SCAN_TIERS = ('metadata', 'regex')
+INITIAL_SCAN_LABEL = 'Initial Scan'
+
+logger = logging.getLogger(__name__)
+
+COLUMNS = ['', 'FILES', 'AUTHOR', 'SERIES', '#', 'TITLE', 'CONFIDENCE', 'STATUS']
+# How many books the confirm-apply dialog previews.
+PREVIEW_SAMPLE = 5
+
+COL_COVER, COL_FILES, COL_AUTHOR, COL_SERIES, COL_INDEX, COL_TITLE, COL_CONF, COL_STATUS = range(8)
+
+# Which table column maps to which model field, for inline editing.
+EDITABLE = {COL_AUTHOR: 'author', COL_SERIES: 'series',
+            COL_INDEX: 'series_index', COL_TITLE: 'title'}
+
+# What to call each field in a menu entry, so "Rename cell" can say what it renames.
+FIELD_LABELS = {'author': 'Author', 'series': 'Series',
+                'series_index': 'Number', 'title': 'Title'}
+
+# Plurals for the same fields, so "Clear" can name what it is about to blank.
+# "Series" is its own plural, which is why this is a table and not an "s".
+FIELD_PLURALS = {'author': 'authors', 'series': 'series entries',
+                 'series_index': 'numbers', 'title': 'titles'}
+
+# Everything that puts something on the clipboard. There are five of them, and five
+# near-identical "Copy ..." lines in a row is most of what made the right-click menu
+# unreadable - so they collapse into one "Copy..." submenu plus however many
+# most-recently-used entries AO_UI_COPY_RECENTS asks for.
+# Each entry is (id, label, method name, tooltip).
+COPY_ACTIONS = [
+    ('files', 'Copy files', '_copy_files',
+     'Put the audio files themselves on the clipboard, ready to paste into a file '
+     'manager. A book that is alone in its folder copies the folder.'),
+    ('file_path', 'Copy file path', '_copy_file_paths',
+     'Copy the full path of every audio file in the selection, one per line'),
+    ('file_name', 'Copy file name', '_copy_file_names',
+     'Copy the name of every audio file in the selection, one per line'),
+    ('folder_path', 'Copy folder path', '_copy_paths',
+     'Copy the folder path of every selected row, one per line'),
+    ('table', 'Copy as table', '_copy_rows',
+     'Copy the selected rows as a Markdown table'),
+]
+COPY_BY_ID = {action[0]: action for action in COPY_ACTIONS}
+
+# Starting column widths, sized to hold a real author/series/title without clipping.
+# They are also sized to *fit*: much wider than this and Status falls off the right
+# edge at the default window size, which is worse than a slightly narrower Title.
+# Drag any of them - the widths are remembered.
+DEFAULT_WIDTHS = [56, 420, 230, 200, 52, 300, 124, 136]
+
+# Relative share of the leftover width. Files needs the most - it now shows the
+# whole path from the library root - and Title about half of that. Author and
+# Series keep their starting width and only grow a little.
+STRETCH = {1: 1.0, 2: 0.15, 3: 0.15, 5: 0.5}
+
+# The extra filter drop-down: things that are true of the *files*, not of the
+# identification. Each entry is (label, predicate). The first is the "off" position,
+# which every filter combo in this window uses as index 0.
+SHAPE_FILTERS = [
+    ('Any shape', lambda e: True),
+    ('Multi-file', lambda e: len(e.audio_files) > 1),
+    ('Single file', lambda e: len(e.audio_files) == 1),
+    ('Already one .m4b', lambda e: len(e.audio_files) == 1
+     and e.audio_files[0].lower().endswith(('.m4b', '.m4a'))),
+    ('Shares its folder', lambda e: bool(e.is_multi_book_folder)),
+    ('Has companion files', lambda e: bool(e.image_files)),
+    ('Written to disk', lambda e: bool(e.applied_path)),
+    # What Save is about to act on: values you typed yourself that have not been
+    # written out yet. "Am I about to save what I think I am" is a question you ask
+    # right before pressing Apply, and until now the only way to answer it was to
+    # read the whole table.
+    ('Unsaved changes', lambda e: not e.applied_path and any(
+        getattr(e, name).source == 'user' for name in IDENTITY_FIELDS)),
+    ('Has Warnings', lambda e: bool(getattr(e, 'warnings', None))),
+]
+
+# The identification sources the user can switch on and off per run. The key is the
+# resolver tier name; the settings key is only used to seed the initial state.
+MODES = [
+    ('metadata', 'Tags', 'AO_ENABLE_METADATA',
+     'Read author/title/series from tags embedded in the audio files'),
+    ('regex', 'Filename', 'AO_ENABLE_REGEX',
+     'Parse author/series/title out of the file and folder names'),
+    ('api', 'Book Databases', 'AO_ENABLE_API',
+     'Look the book up in Audnexus / Apple Books / Google Books / Open Library / '
+     'LibriVox'),
+    ('search', 'Web search', 'AO_ENABLE_SEARCH',
+     'Fall back to a web search and scrape the results'),
+    ('llm', 'LLM', 'AO_ENABLE_LLM',
+     'Ask the configured language model to fill whatever is still missing'),
+]
+
+# The approve/reject/reset block in the right-click menu. Turned off to keep the
+# menu short - the same three actions are on the toolbar and on F5/F6/F8. The code
+# below stays in place so flipping this back on restores it exactly.
+SHOW_REVIEW_SECTION = False
+
+# How many books may be opened on Goodreads before we ask, and the range the
+# per-tab delay is drawn from. The delay is randomised because a burst of
+# identical-interval requests is what spam protection looks for.
+GOODREADS_ASK_ABOVE = 5
+GOODREADS_DELAY = (0.7, 1.9)
+
+# Frames for the "something is still happening" spinner in the toolbar status. Braille
+# dots, because they are the same width in every font and never reflow the sentence.
+SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+
+def _move_to_trash(path: Path) -> bool:
+    """Send one file or folder to the Recycle Bin. PyQt6 returns (ok, new path)."""
+    result = QFile.moveToTrash(str(path))
+    return bool(result[0] if isinstance(result, tuple) else result)
+
+
+class _NumericItem(QTableWidgetItem):
+    """Displays a formatted string, sorts on the number behind it."""
+
+    def __init__(self, text: str, value: float):
+        super().__init__(text)
+        self.value = value
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, _NumericItem):
+            return self.value < other.value
+        return super().__lt__(other)
+
+
+class _KeyedItem(QTableWidgetItem):
+    """Shows nothing (or a picture), sorts on a string you give it.
+
+    The cover column is the only one with no heading, which makes it the only one whose
+    sort is not already spoken for - so it sorts by the path from the library root.
+    Clicking it groups the table by folder, which is how a library is actually walked.
+    """
+
+    def __init__(self, key: str):
+        super().__init__('')
+        self.key = (key or '').lower()
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, _KeyedItem):
+            return self.key < other.key
+        return super().__lt__(other)
+
+
+class _FieldItem(QTableWidgetItem):
+    """An author, series, # or title cell that sorts on its row, not just itself.
+
+    Author sorts by author, then series, then #, then title; series by series, #,
+    title; # numerically. Only the first column follows the direction you clicked:
+    Z-A authors still list each author's books from book 1 up.
+    """
+
+    def __init__(self, text: str, sort_key: tuple):
+        super().__init__(text)
+        self.sort_key = sort_key
+
+    def __lt__(self, other) -> bool:
+        if not isinstance(other, _FieldItem):
+            return super().__lt__(other)
+        mine, theirs = self.sort_key, other.sort_key
+        if mine[0] != theirs[0]:
+            return mine[0] < theirs[0]
+        if mine[1:] == theirs[1:]:
+            return False
+        less = mine[1:] < theirs[1:]
+        # A descending sort asks "other < self" and reverses the whole comparison,
+        # so the tie-breakers are flipped back here to stay ascending.
+        view = self.tableWidget()
+        if (getattr(view, 'sort_order', None) == Qt.SortOrder.DescendingOrder):
+            return not less
+        return less
+
+
+def _index_number(value: str) -> float:
+    """The book number to sort on: "3" -> 3, "1-3" -> 1, "2.5" -> 2.5, none last."""
+    text = str(value or '').strip().split('-')[0].replace(',', '.')
+    try:
+        return float(text)
+    except ValueError:
+        return float('inf')
+
+
+def _sort_key(entry: BookEntry, column: int) -> tuple:
+    author = entry.value('author').casefold()
+    series = entry.value('series').casefold()
+    number = _index_number(entry.value('series_index'))
+    title = entry.value('title').casefold()
+    return {COL_AUTHOR: (author, series, number, title),
+            COL_SERIES: (series, number, title),
+            COL_INDEX: (number, title),
+            COL_TITLE: (title,)}[column]
+
+
+ROLE_WARNING_SORT = int(Qt.ItemDataRole.UserRole) + 20
+ROLE_WARNING_VALUE = int(Qt.ItemDataRole.UserRole) + 21
+
+
+class _WarningItem(QTreeWidgetItem):
+    """Sort warning file cells by folder first and filename second."""
+
+    def __lt__(self, other) -> bool:
+        tree = self.treeWidget()
+        column = tree.sortColumn() if tree is not None else -1
+        if column == 0:
+            return tuple(self.data(0, ROLE_WARNING_SORT) or ()) < tuple(
+                other.data(0, ROLE_WARNING_SORT) or ())
+        if 1 <= column <= 6:
+            return str(self.data(column, ROLE_WARNING_VALUE) or '').casefold() < str(
+                other.data(column, ROLE_WARNING_VALUE) or '').casefold()
+        return super().__lt__(other)
+
+
+class _ElidingLineEdit(QLineEdit):
+    """Left-aligned editor that elides long inactive text instead of centering it."""
+
+    def paintEvent(self, event) -> None:
+        if self.hasFocus():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        text_rect = self.rect().adjusted(5, 0, -5, 0)
+        text = self.fontMetrics().elidedText(
+            self.text(), Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            text)
+
+
+class _WarningTree(QTreeWidget):
+    """Keep warning columns proportional to the main table after Qt polishes them."""
+
+    ACTION_WIDTH = 16
+    BASE_WIDTHS = (DEFAULT_WIDTHS[COL_FILES], DEFAULT_WIDTHS[COL_AUTHOR],
+                   DEFAULT_WIDTHS[COL_SERIES], DEFAULT_WIDTHS[COL_INDEX],
+                   DEFAULT_WIDTHS[COL_TITLE], 178, ACTION_WIDTH, ACTION_WIDTH)
+    SHARES = (STRETCH[COL_FILES], STRETCH[COL_AUTHOR], STRETCH[COL_SERIES],
+              0.0, STRETCH[COL_TITLE], STRETCH[COL_TITLE], 0.0, 0.0)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fitting_columns = False
+        self.header().sectionResized.connect(self._column_resized)
+
+    def _fit_columns(self, fixed_column: Optional[int] = None) -> None:
+        available = self.viewport().width()
+        if available <= 0 or self._fitting_columns:
+            return
+        widths = [self.columnWidth(column) for column in range(self.columnCount())]
+        spare = available - sum(widths) - 2
+        flexible = [column for column, share in enumerate(self.SHARES)
+                    if share > 0 and column != fixed_column]
+        total_share = sum(self.SHARES[column] for column in flexible)
+        if not flexible or total_share <= 0 or abs(spare) < 1:
+            return
+        self._fitting_columns = True
+        try:
+            remaining = spare
+            for column in flexible[:-1]:
+                change = round(spare * self.SHARES[column] / total_share)
+                self.setColumnWidth(column, max(44, widths[column] + change))
+                remaining -= self.columnWidth(column) - widths[column]
+            column = flexible[-1]
+            self.setColumnWidth(column, max(44, widths[column] + remaining))
+        finally:
+            self._fitting_columns = False
+
+    def _column_resized(self, column: int, _old_size: int, _new_size: int) -> None:
+        if not self._fitting_columns and self.isVisible():
+            self._fit_columns(column)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._fit_columns)
+
+    def resizeEvent(self, event) -> None:
+        self._window_resize_pending = True
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._fit_columns)
+
+
+class _RightClickFilter(QObject):
+    """Turns a right-click on one widget into a call, whatever Qt calls the event."""
+
+    def __init__(self, parent, handler: Callable[[], None],
+                 middle_handler: Optional[Callable[[], None]] = None):
+        super().__init__(parent)
+        self._handler = handler
+        self._middle_handler = middle_handler
+
+    def eventFilter(self, watched, event) -> bool:
+        kind = event.type()
+        if kind == QEvent.Type.ContextMenu:
+            self._handler()
+            return True
+        if (kind == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.RightButton):
+            self._handler()
+            return True
+        if (self._middle_handler is not None
+                and kind == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.MiddleButton):
+            self._middle_handler()
+            return True
+        # The release is swallowed too, or the button sees an unmatched release and
+        # repaints itself as still pressed.
+        if (kind == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.RightButton):
+            return True
+        if (self._middle_handler is not None
+                and kind == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.MiddleButton):
+            return True
+        return super().eventFilter(watched, event)
+
+
+class _WarningBadgeFilter(QObject):
+    """Give the painted confidence warning badge its own mouse interactions."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self._hovering = False
+
+    def eventFilter(self, watched, event) -> bool:
+        kind = event.type()
+        if kind == QEvent.Type.MouseMove:
+            position = event.position().toPoint()
+            index = self.window.table.indexAt(position)
+            badge = self.window._warning_badge_hit(index, position)
+            if badge:
+                QToolTip.showText(event.globalPosition().toPoint(),
+                                  index.data(Qt.ItemDataRole.ToolTipRole), watched)
+                self._hovering = True
+            elif self._hovering:
+                QToolTip.hideText()
+                self._hovering = False
+            # The cover and the warning badge open something on a click, so say so.
+            if badge or (index.isValid() and index.column() == COL_COVER):
+                watched.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                watched.unsetCursor()
+        if kind == QEvent.Type.ToolTip:
+            position = event.pos()
+            index = self.window.table.indexAt(position)
+            if self.window._warning_badge_hit(index, position):
+                QToolTip.showText(event.globalPos(), index.data(Qt.ItemDataRole.ToolTipRole),
+                                  watched)
+                return True
+        elif kind == QEvent.Type.MouseButtonRelease:
+            position = event.position().toPoint()
+            index = self.window.table.indexAt(position)
+            if (event.button() == Qt.MouseButton.LeftButton
+                    and self.window._warning_badge_hit(index, position)):
+                self.window._show_warning_menu(
+                    index, event.globalPosition().toPoint())
+                return True
+        elif kind == QEvent.Type.ContextMenu:
+            position = event.pos()
+            index = self.window.table.indexAt(position)
+            if self.window._warning_badge_hit(index, position):
+                self.window._show_warning_menu(index, event.globalPos())
+                return True
+        return super().eventFilter(watched, event)
+
+
+class _DeselectFilter(QObject):
+    """A left-click on empty chrome clears the table selection.
+
+    There was nowhere to click to select nothing. Every row stayed selected until
+    another was clicked, which matters more here than in most tables because half the
+    toolbar acts on the selection - so "act on everything" and "act on the one row I
+    left selected an hour ago" were a click apart with nothing to tell them apart.
+
+    Installed on the widgets that have genuinely dead space: the toolbar around its
+    buttons, the filter row, and the table's own viewport below the last row. The
+    press is observed and passed on, never swallowed - a click on a button in the
+    toolbar still presses the button, and it clears the selection first only when it
+    landed on the background.
+    """
+
+    def __init__(self, window: 'MainWindow'):
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, watched, event) -> bool:
+        if (event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton):
+            table = self._window.table
+            if watched is table.viewport():
+                # Below the last row, or right of the last column.
+                if not table.indexAt(event.position().toPoint()).isValid():
+                    table.clearSelection()
+            else:
+                # The filter is on the container itself, so an event that reaches it
+                # at all did not land on a child control.
+                table.clearSelection()
+        return super().eventFilter(watched, event)
+
+
+class _CellKeysFilter(QObject):
+    """Delete, Ctrl+C and Ctrl+V on the table, spreadsheet-style.
+
+    An event filter on the table rather than window-wide QShortcuts, and that is the
+    point: while a cell is being edited the keystrokes go to the editor widget, which
+    is a different object, so Delete still deletes a character and Ctrl+C still copies
+    the selected text inside the field. A QShortcut would have taken all three away
+    from the editor.
+    """
+
+    def __init__(self, window: 'MainWindow'):
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(watched, event)
+
+        key = event.key()
+        control = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if key == Qt.Key.Key_Delete and not control:
+            self._window._delete_key()
+            return True
+        if control and key == Qt.Key.Key_C:
+            self._window._copy_selected_cells()
+            return True
+        if control and key == Qt.Key.Key_V:
+            self._window._paste_into_selection()
+            return True
+        return super().eventFilter(watched, event)
+
+
+def open_in_os(path: Path) -> bool:
+    """Open ``path`` the way the OS opens it when double-clicked."""
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
+EDGE_ARROW_SIZE = (12, 22)
+
+
+def _edge_arrow_pixmap(colour: str, ratio: float) -> QPixmap:
+    """A filled ">" in ``colour``, EDGE_ARROW_SIZE logical pixels."""
+    width, height = EDGE_ARROW_SIZE
+    pixmap = QPixmap(round(width * ratio), round(height * ratio))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(colour))
+    painter.drawPolygon(QPolygonF([QPointF(0, 0), QPointF(width, height / 2),
+                                   QPointF(0, height)]))
+    painter.end()
+    return pixmap
+
+
+def _edge_arrow(button: QWidget) -> QLabel:
+    """A label pinned to the middle of a button's right edge, to hold the arrow.
+
+    A plain QLabel placed by a layout on the button: no Python subclass or event
+    filter for Qt to call back into while the window is torn down.
+    """
+    arrow = QLabel(button)
+    arrow.setFixedSize(*EDGE_ARROW_SIZE)
+    arrow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    layout = QHBoxLayout(button)
+    layout.setContentsMargins(0, 0, 2, 0)
+    layout.addStretch(1)
+    layout.addWidget(arrow, 0, Qt.AlignmentFlag.AlignVCenter)
+    return arrow
+
+
+class MainWindow(QMainWindow):
+    """The review UI. All heavy work is delegated to the controller via signals."""
+
+    # Emitted for the controller (main.py) to act on.
+    # entries to load (None = the whole input folder), and a KeepOptions saying what
+    # survives. There is one load action, and this is it.
+    load_requested = pyqtSignal(object, object, bool)
+    clear_requested = pyqtSignal()
+    purge_requested = pyqtSignal(list)             # entry ids with no files left on disk
+    remove_entries_requested = pyqtSignal(list, str)  # entry ids, status message
+    restore_requested = pyqtSignal()               # replace the list with a backup
+    # Compare the list with the input folder again - sent when the window regains
+    # focus, which is when a folder deleted or dropped in from Explorer turns up.
+    freshness_check_requested = pyqtSignal()
+    resolve_requested = pyqtSignal(list, list)     # entries, tier names
+    refresh_requested = pyqtSignal(list, list)     # the same, skipping the lookup cache
+    # Identify: the same, passing over tiers a book already finished on an earlier run
+    continue_requested = pyqtSignal(list, list)
+    apply_requested = pyqtSignal(list, bool)       # entries, preview
+    undo_requested = pyqtSignal(int)               # index into the pending journal
+    revert_requested = pyqtSignal(dict)            # pending index -> move indices/None
+    merge_requested = pyqtSignal(object)           # entry
+    combine_requested = pyqtSignal(list, dict)    # entries and chosen identity fields
+    settings_requested = pyqtSignal()
+    settings_requested_on_tab = pyqtSignal(str)    # open Settings on a tab
+    cancel_requested = pyqtSignal()                # cancel everything (Esc, toolbar)
+    cancel_current_requested = pyqtSignal()        # cancel only the running job
+    settings_changed = pyqtSignal()                # a setting was edited in the window
+    queue_remove_requested = pyqtSignal(int)       # index into the pending queue
+    queue_clear_requested = pyqtSignal()
+    dequeue_entries_requested = pyqtSignal(list)   # entry ids to take out of the queue
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.preview_provider = None
+        self.entries: Dict[str, BookEntry] = {}
+        self._identity_keys = {}
+        self._identity_groups = {}
+        self.row_ids: List[str] = []
+        # Covers are read on a background thread and dropped into these items as
+        # they arrive; see cover_loader.
+        self._cover_items: Dict[str, QTableWidgetItem] = {}
+        self._covers = CoverLoader(self)
+        self._covers.loaded.connect(self._cover_loaded)
+        self._updating = False
+        self._columns_fitted = False
+        self._has_saved_widths = False
+        self.mode_actions: Dict[str, QAction] = {}
+        self.tool_actions: Dict[str, QAction] = {}
+        self._busy = False
+        # The toolbar width labelled buttons last asked for - see _fit_toolbar.
+        self._labelled_toolbar_width = 0
+        self._queue_labels: List[str] = []
+        self._status_text = 'Ready'
+        # A long encode reports the same sentence for a minute at a time, which reads
+        # as a hung program. The spinner is the cheapest possible proof that something
+        # is still turning over, and it costs one timer.
+        self._spin = 0
+        self._spinner = QTimer(self)
+        self._spinner.setInterval(110)
+        self._spinner.timeout.connect(self._tick_spinner)
+        self._custom_confidence = 0.8
+        self._folder_filter: Optional[Path] = None
+        # Set by the controller: returns the undoable transactions, newest last.
+        self.history_provider: Callable[[], List[str]] = lambda: []
+        # Set by the controller: every Finalize transaction, for the Finalize log.
+        self.finalize_log_provider: Callable[[], List[dict]] = lambda: []
+        self._finalize_log_dialog = None
+        # Source key -> what went wrong with it in finished runs, and which books it
+        # failed or skipped. Drawn by the floating run-issues notice and the row menu;
+        # a book leaves it when it is identified again with that source.
+        self._run_failures: Dict[str, dict] = {}
+        self._run_issues_panel = None
+        # Undo history for edits made in the table - typing, clearing, filling down,
+        # the grid editor. Applies live in the controller's journal instead; the two
+        # are interleaved by comparing journal lengths, see _undo_last.
+        self._edit_undo: List[dict] = []
+        # Steps that have been undone and can be put back, oldest-undone first - so
+        # the *last* element is the next thing a redo would do. Emptied by any new
+        # edit, which is what "the future is gone once you do something new" means.
+        self._edit_redo: List[dict] = []
+        # Opened by right-clicking Undo, and by the queue button. Kept on self so a
+        # second click raises the existing window instead of stacking another one.
+        self._history_dialog = None
+        self._queue_dialog = None
+        # Opened by clicking a cover thumbnail; reused so stepping through books with
+        # the arrow keys does not leave a trail of windows behind.
+        self._cover_viewer = None
+        # Event filters for the right-clickable toolbar buttons. Rebuilt with the
+        # toolbar, and held here because a filter nobody references stops filtering.
+        self._right_click_filters: List[QObject] = []
+        # Panel width to restore once the window is its final size - see _restore_split.
+        self._wanted_split: Optional[int] = None
+        # Set by the controller: a WorkerManager.status() snapshot on demand.
+        self.queue_provider: Callable[[], dict] = dict
+        # Entry ids still waiting in an identification job, for "Remove from queue".
+        self.waiting_entries_provider: Callable[[], set] = set
+        # What compare_to_entries last reported, or None when the table is in step with
+        # the input folder. Drives the "!" on Inputs - see set_scan_stale.
+        self._scan_drift: Optional[dict] = None
+        # Set when the input folder setting itself changed: the list now describes a
+        # folder nobody is pointing at any more, which no file comparison can detect.
+        self._folder_changed_from: Optional[str] = None
+        # key -> (button, toolbar action) for the buttons beside Inputs that only show
+        # when there is something to do: finished books, missing books, new books.
+        self._input_buttons: Dict[str, tuple] = {}
+        self._freshness_timer = QTimer(self)
+        self._freshness_timer.setSingleShot(True)
+        self._freshness_timer.setInterval(400)
+        self._freshness_timer.timeout.connect(self.freshness_check_requested.emit)
+        self._last_freshness_check = 0.0
+        # entry_id -> 0..1, the fading highlight on rows carrying unsaved work.
+        self._flash: Dict[str, float] = {}
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(120)
+        self._flash_timer.timeout.connect(self._tick_flash)
+        self._flash_left = 0.0
+        self._last_progress = (0, 0, '')
+        # entry_id -> (fraction 0..1, short label), for the bar drawn across a row
+        # while a long job - a chapter merge - is working on that one book.
+        self._row_progress: Dict[str, tuple] = {}
+        self._row_progress_animations: Dict[str, tuple] = {}
+
+        self.setWindowTitle('Audiobook Organizer')
+        # Wide enough that every column fits beside the explanation panel.
+        self.resize(1780, 960)
+        self._build()
+        self._install_shortcuts()
+
+    # ------------------------------------------------------------------ build
+
+    def _build(self) -> None:
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 4)
+        outer.setSpacing(0)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        self.paths_banner = self._build_paths_banner()
+        left_layout.addWidget(self.paths_banner)
+
+        self.filter_bar = QWidget()
+        self.filter_bar.setLayout(self._build_filter_row())
+        left_layout.addWidget(self.filter_bar)
+        left_layout.addWidget(self._build_table(), stretch=1)
+        splitter.addWidget(left)
+
+        self.why_panel = WhyPanel()
+        self.why_panel.run_requested.connect(self._run_one_source)
+        self.panel_container = QWidget()
+        panel_layout = QVBoxLayout(self.panel_container)
+        panel_layout.setContentsMargins(8, 0, 0, 0)
+        panel_layout.addWidget(self.why_panel)
+        splitter.addWidget(self.panel_container)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([1360, 400])
+        self.splitter = splitter
+        # Dragging the splitter resizes the table without resizing the window, so the
+        # window's resizeEvent never fires and the columns used to just sit there.
+        splitter.splitterMoved.connect(self._splitter_moved)
+        outer.addWidget(splitter, stretch=1)
+        self.setCentralWidget(central)
+
+        self._build_toolbar()
+        self._restore_window_state()
+        self.apply_ui_settings()
+        self._apply_column_widths()
+
+        # Somewhere to click that means "nothing" - see _DeselectFilter.
+        self._deselect_filter = _DeselectFilter(self)
+        for widget in (self.toolbar, self.filter_bar, self.table.viewport()):
+            widget.installEventFilter(self._deselect_filter)
+        self._warning_badge_filter = _WarningBadgeFilter(self)
+        self.table.viewport().installEventFilter(self._warning_badge_filter)
+        # On the table itself, not the viewport: key presses go to the widget.
+        self._cell_keys_filter = _CellKeysFilter(self)
+        self.table.installEventFilter(self._cell_keys_filter)
+
+        # Now the table exists, so the toolbar can finally say what is available.
+        self.refresh_action_states()
+        self._refresh_identify_badge()
+
+    def _build_paths_banner(self) -> QWidget:
+        """Says which folders are not set yet, and opens the page that sets them.
+
+        Neither path has a default any more, because a default sent a fresh install
+        at a folder inside the program directory and then never mentioned it again.
+        An empty table with no explanation is the same failure with extra steps, so
+        this sits above the table until both folders have been chosen.
+        """
+        banner = QWidget()
+        banner.setStyleSheet(
+            f'background: {BG_RAISED}; border: 1px solid {ACCENT_DARK}; '
+            f'border-radius: 6px;')
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(12, 9, 12, 9)
+        row.setSpacing(10)
+
+        self.paths_banner_label = QLabel('')
+        self.paths_banner_label.setWordWrap(True)
+        self.paths_banner_label.setStyleSheet(
+            f'color: {TEXT}; border: none; background: transparent;')
+        row.addWidget(self.paths_banner_label, stretch=1)
+
+        button = QPushButton('Set them in Settings')
+        button.setProperty('accent', True)
+        button.setToolTip('Open the General tab, where the input and output folders '
+                          'are chosen')
+        button.clicked.connect(
+            lambda: self.settings_requested_on_tab.emit('General'))
+        row.addWidget(button)
+        return banner
+
+    def refresh_paths_banner(self) -> None:
+        """Show or hide the banner for whatever the settings currently say."""
+        missing = [name for key, name in (('AO_INPUT_DIR', 'input'),
+                                          ('AO_OUTPUT_DIR', 'output'))
+                   if not self.settings.is_set(key)]
+        self.paths_banner.setVisible(bool(missing))
+        if not missing:
+            return
+        which = ' and '.join(missing)
+        self.paths_banner_label.setText(
+            f'<b>No {which} folder is set.</b>  '
+            + ('Nothing can be loaded or saved until both are chosen.'
+               if len(missing) == 2 else
+               'Inputs has nothing to read.' if missing == ['input'] else
+               'Saving has nowhere to write.'))
+
+    def _build_filter_row(self) -> QHBoxLayout:
+        """Filters on the left and the matching-row count centred."""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setContentsMargins(0, 0, 0, 0)
+
+        self.status_filter = self._filter_combo(
+            ['All statuses', 'Pending', 'Unsure', 'Approved', 'Rejected',
+             'Finalized', 'Duplicate', 'Has Warning'],
+            'Show only rows with this review status')
+        for index, key in enumerate(
+                ('pending', 'risky', 'approved', 'rejected', 'applied', 'duplicate'),
+                start=1):
+            self.status_filter.setItemData(
+                index, QColor(STATUS_TEXT[key]), Qt.ItemDataRole.ForegroundRole)
+        self.status_filter.setItemData(
+            7, QColor(STATUS_TEXT['risky']), Qt.ItemDataRole.ForegroundRole)
+        row.addWidget(self.status_filter)
+
+        self.missing_filter = self._filter_combo(
+            ['Any completeness', 'Missing any field', 'Missing author',
+             'Missing series', 'Missing index', 'Missing title', 'Missing cover',
+             'Has cover', 'Complete only'],
+            'Show only rows that are missing a given field or cover image',
+            minimum_extra=20)
+        row.addWidget(self.missing_filter)
+
+        confident_percent = round(self.settings.get_float(
+            'AO_UI_CONFIDENT_THRESHOLD', 0.80) * 100)
+        doubtful_percent = round(self.settings.get_float(
+            'AO_UI_DOUBTFUL_THRESHOLD', 0.50) * 100)
+        self.confidence_filter = self._filter_combo(
+            ['Any confidence', f'{confident_percent}% and above',
+             f'{doubtful_percent}% to {confident_percent - 1}%',
+             f'Below {doubtful_percent}%', '...'],
+            'Filter by confidence threshold. "..." asks for a custom minimum.')
+        for index, colour in ((1, CONFIDENCE_HUES[0][1]),
+                              (2, CONFIDENCE_HUES[1][1]),
+                              (3, CONFIDENCE_HUES[2][1])):
+            self.confidence_filter.setItemData(
+                index, QColor(colour), Qt.ItemDataRole.ForegroundRole)
+        self.confidence_filter.activated.connect(self._confidence_filter_chosen)
+        row.addWidget(self.confidence_filter)
+
+        # Everything that is a property of the *files* rather than of the
+        # identification. Multi-file is the one you actually go looking for, because it
+        # is the set of books "Merge chapters into one .m4b" can act on.
+        self.shape_filter = self._filter_combo(
+            [name for name, _test in SHAPE_FILTERS],
+            'Filter on what the entry is on disk rather than on how it was identified')
+        row.addWidget(self.shape_filter)
+
+        self.search_box = QLineEdit()
+        self.search_box.setProperty('search', True)
+        self.search_box.setPlaceholderText('Search author, series, title or folder...')
+        self.search_box.setToolTip(
+            'Free-text filter across author, series, title and folder name  '
+            '(F3 or Ctrl+F)')
+        self.search_box.setClearButtonEnabled(True)
+        # Twice the width it had: this is the control that gets used most, and 180px
+        # showed about three words of a query. It still yields before the panel beside
+        # it, being Expanding rather than fixed.
+        self.search_box.setMinimumWidth(288)
+        self.search_box.setMaximumWidth(480)
+        self.search_box.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                      QSizePolicy.Policy.Fixed)
+        self.search_box.textChanged.connect(self._apply_filters)
+        row.addWidget(self.search_box)
+
+        self.unsaved_filter = QCheckBox('Unsaved')
+        self.unsaved_filter.setChecked(False)
+        self.unsaved_filter.setToolTip(
+            'Show only identified or processed books that still need an approve or '
+            'reject decision')
+        self.unsaved_filter.toggled.connect(self._apply_filters)
+        row.addWidget(self.unsaved_filter)
+
+        # Stretch, count, stretch: two equal springs centre the readout in the space
+        # left by the filters.
+        row.addStretch(1)
+        self.count_label = QLabel('')
+        self.count_label.setProperty('count', True)
+        self.count_label.setToolTip('How many rows pass the current filters')
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(self.count_label)
+        row.addStretch(1)
+
+        return row
+
+    def _filter_combo(self, items: List[str], tooltip: str,
+                      minimum_extra: int = 0) -> QComboBox:
+        """A filter drop-down that looks like one, and marks itself when it is on."""
+        combo = QComboBox()
+        combo.setProperty('filter', True)
+        combo.addItems(items)
+        combo.setToolTip(tooltip)
+        # A combo's minimum width is its widest entry unless it is told otherwise,
+        # and four of them side by side held the whole left-hand pane at 1590px -
+        # which meant the explanation panel could not be given the width it was
+        # saved at on anything narrower. The closed box elides; the popup does not.
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        widest = max(combo.fontMetrics().horizontalAdvance(text) for text in items)
+        combo.setMinimumWidth(widest + 34)
+        if minimum_extra:
+            combo.setMinimumWidth(max(combo.sizeHint().width() + minimum_extra,
+                                      widest + 40))
+        combo.view().setMinimumWidth(
+            max(combo.fontMetrics().horizontalAdvance(text) for text in items) + 40)
+        combo.currentIndexChanged.connect(
+            lambda index, c=combo: self._filter_changed(c, index))
+        return combo
+
+    def _filter_changed(self, combo: QComboBox, index: int) -> None:
+        # Index 0 of every filter is its "off" entry, so an active filter is visible
+        # at a glance rather than needing to be read.
+        combo.setProperty('active', index > 0)
+        combo.style().unpolish(combo)
+        combo.style().polish(combo)
+        self._apply_filters()
+
+    def _build_table(self) -> QTableWidget:
+        self.table = ColumnTable(0, len(COLUMNS))
+        self.table.setHorizontalHeaderLabels(COLUMNS)
+        # Everything is painted by the delegate, which needs hover state and draws
+        # its own row separators - so no zebra striping and no grid.
+        self.table.setAlternatingRowColors(False)
+        self.table.setShowGrid(False)
+        self.table.setMouseTracking(True)
+        self.delegate = ReviewDelegate(self.table)
+        self.delegate.move_after_edit.connect(self._step_edit)
+        self.table.setItemDelegate(self.delegate)
+        # Cells, not rows: clearing a column, or three cells in two rows, has to be
+        # expressible. Row-wide actions still work - they read the rows the selected
+        # cells belong to.
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Sorted on a header click, not by Qt's setSortingEnabled. That one re-sorts
+        # on every write, so changing a book's status moved its row mid-update and the
+        # rest of the update landed on whichever book took its place.
+        self.table.setSortingEnabled(False)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setDefaultSectionSize(58)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
+        # Moving the cursor with the arrow keys repaints only the two cells involved,
+        # and anything the delegate drew beyond a cell's own rect - the selection
+        # frame's rounded joins - was left behind as a ghost outline. Repainting the
+        # viewport on every move costs nothing at these row counts and cannot smear.
+        self.table.currentCellChanged.connect(
+            lambda *_: self.table.viewport().update())
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.itemChanged.connect(self._item_edited)
+        # The cover cell is not editable and has nothing to select, so a plain click
+        # on it is free to mean "show me this properly".
+        self.table.clicked.connect(self._cell_clicked)
+        self.table.setToolTip('Double-click author, series, # or title to edit it. '
+                              'Delete clears the selected name cells, or asks to '
+                              'remove the book when a whole row is selected. '
+                              'Ctrl+C and Ctrl+V '
+                              'copy and paste them. '
+                              'Right-click for everything you can do to the selection.')
+
+        header = self.table.horizontalHeader()
+        # Header clicks sort without Qt first selecting the entire column.
+        header.sectionPressed.disconnect(self.table.selectColumn)
+        # Nothing is sorted until the user asks for it, so no arrow parked on the
+        # cover column pretending the table is sorted by artwork. Qt turns the
+        # indicator back on every time sorting is re-enabled, hence the flag.
+        self._user_sorted = False
+        header.setSortIndicatorShown(False)
+        self._restore_sort()
+        self._sort_state = (header.sortIndicatorSection(), header.sortIndicatorOrder())
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._sorted_by_user)
+        header.setSectionResizeMode(COL_COVER, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(COL_FILES, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(COL_AUTHOR, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(COL_SERIES, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(COL_INDEX, QHeaderView.ResizeMode.Fixed)
+        # Files is the stretch column: it holds the longest strings and is the one
+        # you read when an identification looks wrong. Everything else is sized to
+        # hold a realistic value without clipping - author and series names are long.
+        header.setSectionResizeMode(COL_TITLE, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(COL_CONF, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Fixed)
+        # No stretch column at all: a stretch column eats whatever the others give
+        # back and squeezes the rest into ellipses. Generous fixed widths that the
+        # user can drag, with a horizontal scrollbar when the window is narrow.
+        # The widths themselves are applied later - see _apply_column_widths.
+        header.setSectionResizeMode(COL_FILES, QHeaderView.ResizeMode.Interactive)
+        header.setMinimumSectionSize(44)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft
+                                   | Qt.AlignmentFlag.AlignVCenter)
+        # "#" is the one centred heading: its values are centred numbers, and a
+        # left-aligned title over a centred two-character column reads as a stray
+        # label. Everything else - Confidence and Status included - reads from the
+        # left, in line with the column beside it.
+        #
+        # Every heading states its alignment rather than leaning on the header's
+        # default. A section left with no TextAlignmentRole is at the mercy of
+        # whatever draws it - and with a stylesheet on QHeaderView::section, that is
+        # not always the default alignment. Saying it per column costs one line and
+        # cannot be overridden by a repolish.
+        for column in range(len(COLUMNS)):
+            item = QTableWidgetItem(COLUMNS[column])
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignCenter if column == COL_INDEX
+                else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setHorizontalHeaderItem(column, item)
+        # The cover column has no heading of its own, so its sort is free: it sorts by
+        # the path from the library root, which groups the table by folder. That is the
+        # one ordering the other columns cannot give you, and it is what you want when
+        # you are working through a library directory by directory.
+        cover_header = QTableWidgetItem('')
+        cover_header.setTextAlignment(Qt.AlignmentFlag.AlignLeft
+                                      | Qt.AlignmentFlag.AlignVCenter)
+        cover_header.setToolTip('Click to sort by folder path, so books group by '
+                                'where they live on disk')
+        self.table.setHorizontalHeaderItem(COL_COVER, cover_header)
+
+        # Right-clicking the header is where people look to hide a column.
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_column_menu)
+        header.setToolTip('Click to sort. Right-click to choose which columns to show.')
+        return self.table
+
+    def _show_column_menu(self, position) -> None:
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        header = self.table.horizontalHeader()
+        for column in range(1, len(COLUMNS)):
+            action = menu.addAction(COLUMNS[column].title())
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(column))
+            action.setToolTip(f'Show or hide the {COLUMNS[column].lower()} column')
+            action.toggled.connect(
+                lambda shown, c=column: self._set_column_visible(c, shown))
+        menu.exec(header.mapToGlobal(position))
+
+    def _set_column_visible(self, column: int, shown: bool) -> None:
+        self._hide_column(column, not shown)
+        # Column 0 is the cover, which follows the density/covers settings rather
+        # than this list - and it has no name to store anyway.
+        hidden = [COLUMNS[c] for c in range(1, len(COLUMNS))
+                  if self.table.isColumnHidden(c)]
+        self.settings.set('AO_UI_HIDDEN_COLUMNS', ','.join(hidden))
+        self.settings.save()
+
+    # ------------------------------------------------------- interface options
+
+    def apply_ui_settings(self) -> None:
+        """Push every AO_UI_* preference into the widgets. Safe to call repeatedly."""
+        get_bool = self.settings.get_bool
+
+        self.delegate.show_stripe = get_bool('AO_UI_STATUS_STRIPE', True)
+        self.delegate.row_tint = get_bool('AO_UI_ROW_TINT', False)
+        self.delegate.show_covers = get_bool('AO_UI_SHOW_COVERS', True)
+        self.delegate.colour_confidence = get_bool('AO_UI_CONFIDENCE_COLOR', True)
+        self.delegate.confident_threshold = self.settings.get_float(
+            'AO_UI_CONFIDENT_THRESHOLD', 0.80)
+        self.delegate.doubtful_threshold = self.settings.get_float(
+            'AO_UI_DOUBTFUL_THRESHOLD', 0.50)
+
+        density = self.settings.get('AO_UI_DENSITY') or 'normal'
+        height = ROW_HEIGHTS.get(density, ROW_HEIGHTS['normal'])
+        self.table.verticalHeader().setDefaultSectionSize(height)
+        for row in range(self.table.rowCount()):
+            self.table.setRowHeight(row, height)
+        # Covers need a row tall enough to hold one; in compact rows they are noise.
+        self._hide_column(COL_COVER, not self.delegate.show_covers
+                          or density == 'compact')
+
+        hidden = {name.strip().upper() for name
+                  in (self.settings.get('AO_UI_HIDDEN_COLUMNS') or '').split(',')
+                  if name.strip()}
+        for column in range(1, len(COLUMNS)):
+            self._hide_column(column, COLUMNS[column].upper() in hidden)
+
+        self.refresh_paths_banner()
+        self.filter_bar.setVisible(get_bool('AO_UI_SHOW_FILTERS', True))
+        self.panel_container.setVisible(get_bool('AO_UI_SHOW_PANEL', True))
+        # Button size and labels are toolbar-wide, so the toolbar is rebuilt rather
+        # than poked - that is also what re-renders the icons at the new size.
+        self.refresh_toolbar()
+        self.table.viewport().update()
+
+    def _apply_column_widths(self) -> None:
+        """Set the column widths, and do it *after* the window is fully built.
+
+        Applying a stylesheet re-polishes the header, and Qt resets every section to
+        the default 100px when that happens - so widths set while building are thrown
+        away. Setting them once the central widget is in place makes them stick.
+        """
+        saved = (self.settings.get('AO_UI_COLUMN_WIDTHS') or '').split(',')
+        self._has_saved_widths = len(saved) == len(COLUMNS)
+        metrics = self.table.horizontalHeader().fontMetrics()
+        for column in range(len(COLUMNS)):
+            width = DEFAULT_WIDTHS[column]
+            if self._has_saved_widths:
+                try:
+                    width = max(44, int(saved[column]))
+                except ValueError:
+                    pass
+            # A column narrower than its own heading renders as "NFIDEN". Saved
+            # widths predate a renamed column, so the floor is enforced on load
+            # rather than trusted to have been right when it was written.
+            if COLUMNS[column]:
+                width = max(width, metrics.horizontalAdvance(COLUMNS[column]) + 34)
+            # Fixed: sized for the (Status|Size) pill, never a remembered width.
+            if column == COL_STATUS:
+                width = DEFAULT_WIDTHS[COL_STATUS]
+            self.table.setColumnWidth(column, width)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # The viewport has no real width until the window is on screen, and on a
+        # scaled display it is not the width the numbers above assume. Fit once.
+        if not self._columns_fitted:
+            self._columns_fitted = True
+            QTimer.singleShot(0, self._restore_split)
+            QTimer.singleShot(0, self._fit_columns)
+            # Typing is the first thing anyone does here, so the caret starts in the
+            # search box. Set a turn late, or the table takes the focus back as it
+            # finishes building.
+            QTimer.singleShot(0, self.search_box.setFocus)
+
+    def _restore_split(self) -> None:
+        """Give the explanation panel back the exact width it was closed at.
+
+        Run from showEvent, one event loop turn late, which is the first moment the
+        splitter is the width it is actually going to be - including the jump to
+        maximised. Sizes are handed over as (everything else, the saved width) so
+        the number that is preserved is the one the user dragged.
+        """
+        wanted = getattr(self, '_wanted_split', None)
+        if not wanted or wanted <= 0:
+            return
+        total = self.splitter.width() - self.splitter.handleWidth()
+        if total <= 0:
+            return
+        # Never let a stale number swallow the table: the panel gets at most two
+        # thirds, which is far more than anyone drags it to.
+        right = min(int(wanted), int(total * 0.67))
+        self.splitter.setSizes([max(0, total - right), right])
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # QSplitter applies its stretch factors after the window resize. Re-apply
+        # the last explicit panel width afterward so the main table receives the
+        # window-size change instead of becoming narrower across launches.
+        QTimer.singleShot(0, self._finish_window_resize)
+        # Narrowing the window must shrink the columns, not push Status out of sight.
+        if self._columns_fitted:
+            QTimer.singleShot(0, self._fit_columns)
+        self._fit_toolbar()
+        self._place_run_issues()
+
+    def _finish_window_resize(self) -> None:
+        # The central layout and its splitter are updated in separate queued passes.
+        # Waiting for the second pass prevents Qt from stretching the panel after us.
+        QTimer.singleShot(0, self._restore_split_after_layout)
+
+    def _restore_split_after_layout(self) -> None:
+        self._restore_split()
+        self._window_resize_pending = False
+
+    def _splitter_moved(self, _position: int, _index: int) -> None:
+        sizes = self.splitter.sizes()
+        if (QApplication.mouseButtons() & Qt.MouseButton.LeftButton
+                and not getattr(self, '_window_resize_pending', False)
+                and len(sizes) > 1 and sizes[1] > 0):
+            self._wanted_split = sizes[1]
+        self._fit_columns()
+
+    def _fit_toolbar(self) -> None:
+        """Drop the toolbar labels before the toolbar drops the status cluster.
+
+        QToolBar answers not fitting by hiding items from the end and offering them
+        under a ">>" button - and the items at the end are the progress bar, Cancel and
+        the queue count. So in a window too narrow for labelled buttons, the only way to
+        stop a run was a menu you had to know was hiding behind a chevron.
+
+        Labels are worth less than a reachable Cancel, so they are what gives way. Once
+        collapsed the labelled width can no longer be measured, so it is remembered from
+        the moment it stopped fitting, and labels come back only 60px clear of it - a gap
+        that stops the two decisions fighting each other one pixel apart.
+        """
+        if not self.settings.get_bool('AO_UI_TOOLBAR_LABELS', False):
+            return                       # already icon-only; nothing to give up
+        labelled = self._tool_button_style()
+        icon_only = Qt.ToolButtonStyle.ToolButtonIconOnly
+        available = self.toolbar.width()
+        if available <= 0:
+            return
+        if self.toolbar.toolButtonStyle() != icon_only:
+            needed = self.toolbar.layout().sizeHint().width()
+            if needed > available:
+                self._labelled_toolbar_width = needed
+                self._set_toolbar_labels(icon_only)
+        elif available > self._labelled_toolbar_width + 60:
+            self._set_toolbar_labels(labelled)
+
+    def _set_toolbar_labels(self, style) -> None:
+        self.toolbar.setToolButtonStyle(style)
+        sources = getattr(self, '_sources_button', None)
+        if sources is not None:
+            sources.setToolButtonStyle(style)
+
+    def _fit_columns(self) -> None:
+        """Scale the flexible columns so every column is visible without scrolling.
+
+        Only the text columns flex; the cover, number, confidence and status columns
+        are already the size of their contents and shrinking them gains nothing.
+        Skipped entirely once the user has dragged a column - their widths win.
+        """
+        flexible = [COL_FILES, COL_AUTHOR, COL_SERIES, COL_TITLE]
+        available = self.table.viewport().width()
+        visible = [c for c in range(len(COLUMNS)) if not self.table.isColumnHidden(c)]
+        current = {c: self.table.columnWidth(c) for c in visible}
+        total = sum(current.values())
+
+        # Saved widths are the user's, and are left alone - unless they no longer fit,
+        # which happens when the window or the panel split changed since they were
+        # saved. Columns falling off the right edge is never what was wanted.
+        # Saved widths are the user's, so they are kept - but only while they fill the
+        # viewport. Leaving hundreds of pixels of dead space after the splitter moved
+        # is not "respecting the user's widths", it is ignoring the resize.
+        if self._has_saved_widths and available - 24 <= total <= available:
+            return
+
+        fixed = sum(current[c] for c in visible if c not in flexible)
+        base = current if self._has_saved_widths else {
+            c: DEFAULT_WIDTHS[c] for c in range(len(COLUMNS))}
+        wanted = sum(base[c] for c in flexible if c in current)
+        room = available - fixed - 2
+        if wanted <= 0 or room <= 0:
+            return
+
+        # Share the leftover width by STRETCH, so dragging the splitter right actually
+        # widens the columns instead of leaving a blank gutter on the right.
+        total_share = sum(STRETCH.get(c, 0.0) for c in flexible if c in current)
+        if total_share <= 0:
+            return
+        spare = room - sum(base[c] for c in flexible if c in current)
+        for column in flexible:
+            if column not in current:
+                continue
+            share = STRETCH.get(column, 0.0) / total_share
+            width = base[column] + spare * share
+            self.table.setColumnWidth(column, max(90, int(width)))
+
+    def _save_column_widths(self) -> None:
+        widths = [self.table.columnWidth(c) or DEFAULT_WIDTHS[c]
+                  for c in range(len(COLUMNS))]
+        self.settings.set('AO_UI_COLUMN_WIDTHS', ','.join(str(w) for w in widths))
+
+    def _hide_column(self, column: int, hidden: bool) -> None:
+        """Hide/show a column without disturbing its width.
+
+        Qt resets a section to the default width when it is *shown*, even if it was
+        never hidden - so re-applying the visibility of every column on each settings
+        change would silently flatten all the column widths back to 100px.
+        """
+        if self.table.isColumnHidden(column) == hidden:
+            return
+        width = self.table.columnWidth(column)
+        self.table.setColumnHidden(column, hidden)
+        if not hidden and width > 0:
+            self.table.setColumnWidth(column, width)
+
+    def _sort_table(self) -> None:
+        """Put the rows in the order the header says, keeping the selection."""
+        header = self.table.horizontalHeader()
+        column = header.sortIndicatorSection()
+        if not 0 <= column < len(COLUMNS):
+            return
+        selected = [(entry.entry_id, index.column())
+                    for index in self.table.selectedIndexes()
+                    if (entry := self._entry_at(index.row())) is not None]
+        current = self.table.currentIndex()
+        entry = self._entry_at(current.row()) if current.isValid() else None
+        current_id = entry.entry_id if entry else None
+        model = self.table.selectionModel()
+        with QSignalBlocker(self.table), QSignalBlocker(model):
+            self.table.sortItems(column, header.sortIndicatorOrder())
+            rows = {entry.entry_id: row for row in range(self.table.rowCount())
+                    if (entry := self._entry_at(row)) is not None}
+            selection = QItemSelection()
+            for entry_id, selected_column in selected:
+                if entry_id in rows:
+                    index = self.table.model().index(rows[entry_id], selected_column)
+                    selection.select(index, index)
+            model.select(selection, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            if current_id in rows:
+                model.setCurrentIndex(
+                    self.table.model().index(rows[current_id], current.column()),
+                    QItemSelectionModel.SelectionFlag.NoUpdate)
+        self._selection_changed()
+        self.table.viewport().update()
+
+    def _sorted_by_user(self, column: int) -> None:
+        header = self.table.horizontalHeader()
+        shown = (header.sortIndicatorSection(), header.sortIndicatorOrder())
+        if shown[0] == column and shown != self._sort_state:
+            # The header already flipped its own arrow for this click.
+            order = shown[1]
+        else:
+            # Same column again flips the order; a new column starts ascending.
+            order = (Qt.SortOrder.DescendingOrder
+                     if self._sort_state == (column, Qt.SortOrder.AscendingOrder)
+                     else Qt.SortOrder.AscendingOrder)
+        self._user_sorted = True
+        self._sort_state = (column, order)
+        header.setSortIndicator(column, order)
+        header.setSortIndicatorShown(True)
+        self._sort_table()
+        # Remembered at once, not on close: the sort is a choice you made, and a
+        # crash or a killed process should not quietly forget it.
+        order = ('desc' if header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+                 else 'asc')
+        self.settings.set('AO_UI_SORT', f'{header.sortIndicatorSection()},{order}')
+        try:
+            self.settings.save()
+        except OSError as exc:
+            logger.warning('Could not save the table sort: %s', exc)
+
+    def _restore_sort(self) -> None:
+        """Sort the table the way it was sorted when the program last ran."""
+        column, _, order = (self.settings.get('AO_UI_SORT') or '').partition(',')
+        try:
+            column = int(column)
+        except ValueError:
+            return
+        if not 0 <= column < len(COLUMNS):
+            return
+        self._user_sorted = True
+        header = self.table.horizontalHeader()
+        header.setSortIndicator(column, Qt.SortOrder.DescendingOrder
+                                if order.strip() == 'desc'
+                                else Qt.SortOrder.AscendingOrder)
+        header.setSortIndicatorShown(True)
+
+    # ---------------------------------------------------------------- toolbar
+
+    def _build_toolbar(self) -> None:
+        """One icon-only toolbar along the bottom, laid out per ``AO_TOOLBAR``."""
+        self.toolbar = QToolBar('Actions')
+        self.toolbar.setObjectName('actions')
+        self.toolbar.setToolButtonStyle(self._tool_button_style())
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.toolbar.customContextMenuRequested.connect(self._show_toolbar_menu)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+        self.refresh_toolbar()
+
+    def refresh_toolbar(self) -> None:
+        """Rebuild from settings - called again when the Settings page saves."""
+        self.toolbar.clear()
+        self.tool_actions.clear()
+        # The buttons those filters were watching have just been destroyed with the
+        # toolbar; keeping the filters would leak one set per rebuild.
+        self._right_click_filters.clear()
+        # Re-read on every rebuild, not once at construction. Setting it only in
+        # _build_toolbar is why "Toolbar Labels" appeared to do nothing until a
+        # restart: the Sources button sets its own style, so it was the only one that
+        # ever followed the setting.
+        self.toolbar.setToolButtonStyle(self._tool_button_style())
+
+        handlers = {
+            'scan': lambda: self._request_load(),
+            'identify': lambda: self._request_resolve(),
+            'warnings': self._show_warnings_dialog,
+            'approve': lambda: self._set_status_selected(STATUS_APPROVED),
+            'reject': lambda: self._set_status_selected(STATUS_REJECTED),
+            'reset': lambda: self._set_status_selected(STATUS_PENDING),
+            'preview': lambda: self._request_apply(preview=True),
+            'apply': lambda: self._request_apply(preview=False),
+            'undo': self._undo_last,
+            # Bare methods would receive QAction's `checked` bool as their first
+            # argument, so anything taking a parameter is wrapped.
+            'goodreads': lambda: self._search_goodreads(),
+            'settings': self.settings_requested.emit,
+        }
+        # Nothing on this toolbar is accent-coloured. The accent means "selected" in
+        # the table, and having it also mean "this button is important" is why the
+        # colour scheme stopped carrying information.
+        accented = set()
+        tinted = {'approve': STATUS_TEXT['approved'], 'reject': STATUS_TEXT['rejected'],
+                  'goodreads': '#f08a24'}
+
+        icon = self._icon_size()
+        self.toolbar.setIconSize(QSize(icon, icon))
+
+        for key in parse_layout(self.settings.get('AO_TOOLBAR')):
+            if key == SEPARATOR:
+                self.toolbar.addSeparator()
+                continue
+            item = ITEMS_BY_KEY[key]
+            if key == 'sources':
+                self.toolbar.addWidget(self._build_sources_button(item, icon))
+                continue
+
+            colour = tinted.get(key, ACCENT if key in accented else TEXT)
+            action = QAction(make_icon(key, colour, icon), item.label, self)
+            if key in ('approve', 'reject'):
+                action.setToolTip(self._review_button_tooltip(key))
+            else:
+                action.setToolTip(self._tool_tooltip(key, item.tooltip))
+            action.triggered.connect(handlers[key])
+            self.toolbar.addAction(action)
+            self.tool_actions[key] = action
+
+            if key == 'undo':
+                # Right-clicking undo opens the whole history - edits and applies.
+                # This used to rely on customContextMenuRequested and did not fire:
+                # the toolbar is the widget with a context-menu policy, and the
+                # button is a child that Qt is entitled to let it answer for. An
+                # event filter watching the right-button press on the button itself
+                # is not answerable to any of that, so it always fires.
+                self._watch_right_click(action, self._show_history_dialog)
+            if key == 'apply':
+                # Right-clicking Finalize opens the log of what it moved, to revert.
+                self._watch_right_click(action, self.show_finalize_log)
+            if key == 'identify':
+                # The badge is painted onto this button's icon, so it has to be
+                # findable again when the queue changes.
+                self._watch_right_click(action, self.show_queue_window)
+            if key == 'scan':
+                # Same one action, scoped - plus the way to change which folder it
+                # reads. Left click is still the whole thing, so nothing moved.
+                self._watch_right_click(action, self._show_load_menu)
+            if key in ('approve', 'reject'):
+                self._watch_review_clicks(action, key)
+
+        self._add_input_buttons(icon)
+        self._add_toolbar_status()
+        self.refresh_action_states()
+        self._refresh_identify_badge()
+        self._refresh_scan_badge()
+        self._tighten_toolbar(icon)
+        self.toolbar.setVisible(True)
+        # The rebuild made fresh actions; re-apply whatever the running job implies.
+        # set_busy covers Cancel; the queue count and the progress bar have to be put
+        # back by hand, or reordering the toolbar mid-run loses them until the next job.
+        self._queue_action.setVisible(bool(self._queue_labels))
+        self.set_busy(self._busy)
+        if self._busy:
+            done, total, message = self._last_progress
+            self.show_progress(done, total, message)
+        # A rebuild changes what the toolbar needs, so re-decide whether labels fit.
+        self._labelled_toolbar_width = 0
+        QTimer.singleShot(0, self._fit_toolbar)
+
+    def _show_cancel_menu(self, anchor=None) -> None:
+        """Right-clicking Cancel: the destructive one, named, behind a second click.
+
+        "Cancel all" is not on the left button because binning a queue of forty
+        identifications is not something to do by mis-aiming at a small red icon.
+
+        `anchor` is the widget the menu drops from - the Cancel button, or the queue
+        count, which offers the same two choices because that is the other place you
+        look when you want the run to stop.
+        """
+        menu = QMenu(self)
+        queued = len(self._queue_labels)
+        current = menu.addAction('Cancel the job running now')
+        current.setEnabled(self._busy)
+        current.triggered.connect(self.cancel_current_requested.emit)
+        every = menu.addAction(
+            f'Cancel all  -  the running job and {plural(queued, "queued job")}'
+            if queued else 'Cancel all')
+        every.setEnabled(self._busy or bool(queued))
+        every.triggered.connect(self.cancel_requested.emit)
+        menu.addSeparator()
+        menu.addAction('Open the queue...', self.show_queue_window)
+        anchor = anchor if anchor is not None else self.cancel_button
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+
+    def can_undo(self) -> bool:
+        """True when there is actually something to reverse - an edit or an apply."""
+        try:
+            applies = len(self.history_provider() or [])
+        except Exception:              # a controller that is not wired up yet
+            applies = 0
+        return bool(self._edit_undo) or applies > 0
+
+    def refresh_action_states(self) -> None:
+        """Grey out the buttons that would do nothing if you pressed them.
+
+        A button that is enabled is a promise that it does something. Undo with an
+        empty history answered a click with "Nothing to undo" in the status strip -
+        which is a button teaching you, once per click, that it was never going to
+        work. The buttons that need a selection say so the same way, by being
+        unavailable until there is one.
+
+        Inputs, Sources and Settings are never disabled: they are how you get
+        out of
+        the state where everything else is.
+        """
+        table = getattr(self, 'table', None)
+        if not self.tool_actions or table is None:
+            # The toolbar is built before the table is; there is nothing to reflect yet.
+            return
+        selected = bool(table.selectionModel()
+                        and table.selectionModel().hasSelection())
+        anything = bool(self.entries)
+        approved = any(e.status == STATUS_APPROVED for e in self.entries.values())
+        self._refresh_input_buttons()
+
+        available = {
+            # Identify needs entries, not a selection - with none it identifies the
+            # lot, like Inputs and Preview.
+            'identify': anything,
+            'warnings': any(e.warnings and not e.warnings_silenced
+                            for e in self.entries.values()),
+            'approve': anything,
+            'reject': anything,
+            'reset': selected,
+            'goodreads': selected,
+            # Preview needs no selection - with none it previews the lot - but it does
+            # need something to preview.
+            'preview': anything,
+            'apply': approved,
+            'undo': self.can_undo(),
+        }
+        reasons = {
+            'identify': 'Nothing is loaded yet - press Ctrl+R',
+            'warnings': 'No warnings to review',
+            'approve': 'Nothing is loaded yet',
+            'reject': 'Nothing is loaded yet',
+            'reset': 'Select some rows first',
+            'goodreads': 'Select some rows first',
+            'preview': 'Nothing is loaded yet - press Ctrl+R',
+            'apply': 'Nothing is approved yet - approve some rows first (F5)',
+            'undo': 'Nothing to undo yet',
+        }
+        for key, action in self.tool_actions.items():
+            if key not in available:
+                continue
+            enabled = available[key]
+            action.setEnabled(enabled)
+            if key == 'identify':
+                # Its tooltip carries the queue badge too, so it is written in one
+                # place - _refresh_identify_badge.
+                self._refresh_identify_badge()
+                continue
+            item = ITEMS_BY_KEY[key]
+            if enabled and key in ('approve', 'reject'):
+                action.setToolTip(self._review_button_tooltip(key))
+            else:
+                action.setToolTip(self._tool_tooltip(
+                    key, item.tooltip if enabled else reasons[key]))
+
+    def _watch_right_click(self, target, handler: Callable[[], None]) -> None:
+        """Call `handler` when `target` is right-clicked.
+
+        `target` is either a QAction on the toolbar - in which case the button Qt built
+        for it is looked up - or a widget added to the toolbar directly, which has no
+        action to look up.
+
+        Both the press and the context-menu event are watched. Which of the two a
+        platform actually delivers to a QToolButton inside a styled QToolBar is not
+        something worth being at the mercy of - Windows sends the context-menu event
+        on release, X11 on press, and a toolbar with its own context-menu policy can
+        absorb either. Whichever arrives first wins, and the second is ignored
+        because the handler is idempotent: it raises the window it already opened.
+        """
+        button = (self.toolbar.widgetForAction(target)
+                  if isinstance(target, QAction) else target)
+        if button is None:
+            return
+        button.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        watcher = _RightClickFilter(button, handler)
+        button.installEventFilter(watcher)
+        # Kept alive by the window: an event filter that is garbage-collected stops
+        # filtering, silently, and the button goes back to doing nothing.
+        self._right_click_filters.append(watcher)
+
+    def _watch_review_clicks(self, action: QAction, key: str) -> None:
+        """Give a review button its middle-click run and right-click menu."""
+        button = self.toolbar.widgetForAction(action)
+        if button is None:
+            return
+        button.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        watcher = _RightClickFilter(
+            button,
+            lambda: self._show_review_threshold_menu(key, button),
+            lambda: self._run_configured_review_threshold(key))
+        button.installEventFilter(watcher)
+        self._right_click_filters.append(watcher)
+
+    def _review_threshold(self, key: str) -> Optional[int]:
+        setting = ('AO_REVIEW_APPROVE_THRESHOLD' if key == 'approve'
+                   else 'AO_REVIEW_REJECT_THRESHOLD')
+        raw = self.settings.get(setting).strip()
+        if not raw:
+            return None
+        try:
+            return min(100, max(0, int(round(float(raw) * 100))))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _tool_tooltip(key: str, body: str) -> str:
+        """A button's tooltip: its name, its key binding if it has one, then the body.
+
+        The key comes from toolbar.SHORTCUTS, which is also what installs it, so the
+        tooltip cannot drift out of step with what the key actually does.
+        """
+        label = ITEMS_BY_KEY[key].label
+        sequence = shortcut_for(key)
+        return f'{label}  ({sequence})\n{body}' if sequence else f'{label}\n{body}'
+
+    def _review_button_tooltip(self, key: str) -> str:
+        percent = self._review_threshold(key)
+        if key == 'approve':
+            return self._tool_tooltip('approve', 'LMB: Approve selected\n'
+                    + (f'MMB: Approve over {percent}%\n' if percent is not None
+                       else 'MMB: Disabled in Settings\n')
+                    + 'RMB: Choose approve threshold')
+        return self._tool_tooltip('reject', 'LMB: Reject selected\n'
+                + (f'MMB: Decline under {percent}%\n' if percent is not None
+                   else 'MMB: Disabled in Settings\n')
+                + 'RMB: Choose decline threshold')
+
+    def _show_review_threshold_menu(self, key: str, button: QWidget) -> None:
+        percent = self._review_threshold(key)
+        verb = 'Approve over' if key == 'approve' else 'Decline under'
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        configured = menu.addAction(
+            f'{verb} {percent}%' if percent is not None
+            else f'{verb} saved threshold  (disabled)',
+            lambda: self._run_configured_review_threshold(key))
+        configured.setEnabled(percent is not None)
+        configured.setToolTip('Run the threshold saved in Settings' if percent is not None
+                              else 'Set a threshold in Settings to enable this')
+        custom = menu.addAction(
+            f'{verb}...', lambda: self._ask_review_threshold(key))
+        custom.setToolTip('Enter a threshold for this run')
+        menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _run_configured_review_threshold(self, key: str) -> None:
+        percent = self._review_threshold(key)
+        if percent is None:
+            self.show_message('Set this review threshold in Settings first')
+            return
+        self._apply_review_threshold(key, percent)
+
+    def _ask_review_threshold(self, key: str) -> None:
+        setting = ('AO_UI_LAST_APPROVE_THRESHOLD' if key == 'approve'
+                   else 'AO_UI_LAST_REJECT_THRESHOLD')
+        configured = self._review_threshold(key)
+        fallback = 80 if key == 'approve' else 50
+        default = self.settings.get_int(
+            setting, configured if configured is not None else fallback)
+        verb = 'Approve over' if key == 'approve' else 'Decline under'
+        percent, accepted = QInputDialog.getInt(
+            self, f'{verb} threshold', f'{verb}:', default, 0, 100, 1)
+        if not accepted:
+            return
+        self.settings.set(setting, percent)
+        try:
+            self.settings.save()
+        except OSError as exc:
+            logger.warning('Could not save the last review threshold: %s', exc)
+        self._apply_review_threshold(key, percent)
+
+    def _apply_review_threshold(self, key: str, percent: int) -> None:
+        threshold = percent / 100.0
+        candidates = [entry for entry in self.entries.values()
+                      if entry.status in (STATUS_PENDING, STATUS_RISKY)]
+        if key == 'approve':
+            matches = [entry for entry in candidates
+                       if entry.is_complete() and entry.confidence() >= threshold
+                       and not self._is_unresolved_duplicate(entry)]
+            status = STATUS_APPROVED
+            description = f'at or above {percent}%'
+        else:
+            matches = [entry for entry in candidates
+                       if entry.confidence() < threshold]
+            status = STATUS_REJECTED
+            description = f'below {percent}%'
+        for entry in matches:
+            entry.status = status
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+        self._apply_filters()
+        self.refresh_stats()
+        self.show_message(
+            f'{len(matches)} entr{"y" if len(matches) == 1 else "ies"} '
+            f'{"approved" if key == "approve" else "rejected"} {description}')
+
+    def _first_input_folder(self, entry: BookEntry) -> tuple[str, Path]:
+        """First folder below the configured input root for this book."""
+        # Menu construction must not query slow or unavailable library drives.
+        folder = Path(os.path.abspath(entry.folder))
+        root = Path(os.path.abspath(self.settings.get_path('AO_INPUT_DIR')))
+        try:
+            relative = folder.relative_to(root)
+        except ValueError:
+            return folder.name, folder
+        if relative.parts:
+            target = root / relative.parts[0]
+            return relative.parts[0], target
+        return folder.name, folder
+
+    def _set_folder_filter(self, name: str, folder: Path) -> None:
+        self._folder_filter = folder.resolve()
+        self.shape_filter.blockSignals(True)
+        for item_index in range(self.shape_filter.count() - 1, -1, -1):
+            if self.shape_filter.itemText(item_index).startswith('Folder: '):
+                self.shape_filter.removeItem(item_index)
+        label = f'Folder: {name}'
+        self.shape_filter.addItem(label)
+        self.shape_filter.setCurrentText(label)
+        self.shape_filter.blockSignals(False)
+        self._filter_changed(self.shape_filter, self.shape_filter.currentIndex())
+
+    def _tighten_toolbar(self, _icon: int) -> None:
+        """Take the dead space out of the toolbar row.
+
+        Fusion reserves eight pixels above and below every toolbar button - the
+        style's ``PM_ToolBarFrameWidth``, which QToolBarLayout copies into its own
+        contents margins. It is a layout margin, not padding, so nothing in the
+        stylesheet reaches it, and sixteen pixels of nothing on a row of icons is a
+        lot of table to give away.
+
+        Setting the margins once at construction does not hold: the layout re-reads
+        the metric on every ``invalidate()``, and clearing the toolbar to rebuild it
+        invalidates. So it is re-applied here, at the end of every rebuild, which is
+        the only point where it is guaranteed to be the last word.
+        """
+        layout = self.toolbar.layout()
+        if layout is None:
+            return
+        margins = layout.contentsMargins()
+        # Horizontal margins are left alone - buttons do need room at the ends. The
+        # bottom margin is larger than the top when labels are on: the label sits at
+        # the very bottom edge of the button, so with nothing under it the filter row
+        # crops the descenders off "Identify" and "Settings".
+        # Eight was not enough: at the larger icon sizes the label sits right on the
+        # bottom edge of the button and the filter row underneath cropped the
+        # descenders off "Identify" and "Settings". This is the gap between the two
+        # rows, so it has to clear the text, not merely separate the widgets.
+        below = 16 if self.settings.get_bool('AO_UI_TOOLBAR_LABELS', True) else 4
+        layout.setContentsMargins(margins.left(), 1, margins.right(), below)
+        layout.setSpacing(2)
+        self.toolbar.updateGeometry()
+
+    def _icon_size(self) -> int:
+        return {'compact': 26, 'normal': 34, 'comfortable': 40, 'large': 60}.get(
+            self.settings.get('AO_UI_ICON_SIZE') or 'comfortable', 40)
+
+    def _tool_button_style(self):
+        """Icon only, or icon with its name underneath."""
+        if self.settings.get_bool('AO_UI_TOOLBAR_LABELS', False):
+            return Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+        return Qt.ToolButtonStyle.ToolButtonIconOnly
+
+    def _add_toolbar_status(self) -> None:
+        """The old status bar, living on the right-hand end of the toolbar.
+
+        Same information - what is running, how far in, what mode we are in - but in
+        the space that was already there instead of a second full-width strip.
+        """
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        # A widget with no layout has an *invalid* sizeHint, and QWidgetItem then falls
+        # back to the widget's own size - the default 640x480. The toolbar therefore
+        # believed it needed ~640px more than it did, decided it had overflowed, and
+        # swept the widgets after this one (progress, Cancel, the queue count) into the
+        # hidden ">>" extension. That is why Cancel was nowhere to be found while a job
+        # ran. An empty zero-margin layout gives the spacer the 0x0 hint it should have
+        # had, so it stretches without claiming any space of its own.
+        stretch = QHBoxLayout(spacer)
+        stretch.setContentsMargins(0, 0, 0, 0)
+        stretch.setSpacing(0)
+        # Transparent, or it reads as an empty input field sitting in the toolbar.
+        spacer.setStyleSheet('background: transparent;')
+        self.toolbar.addWidget(spacer)
+
+        self.status_label = QLabel('Ready')
+        self.status_label.setStyleSheet(f'color: {TEXT_DIM}; padding: 0 10px;')
+        self.status_label.setToolTip('What just happened')
+        # Capped so the sentence cannot spend the width the Cancel button needs. The
+        # whole message is on the tooltip - see _render_status.
+        self.status_label.setMaximumWidth(340)
+        # The queue count printed here is a link, not a caption. It was asked for on
+        # the Identify button and it is there too - but this is where the sentence
+        # "Queued behind 2 jobs" is actually printed, so this is where you go looking
+        # for a way to act on it.
+        self.status_label.setTextFormat(Qt.TextFormat.RichText)
+        self.status_label.setOpenExternalLinks(False)
+        self.status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status_label.linkActivated.connect(lambda _: self.show_queue_window())
+        self.toolbar.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setFixedWidth(150)
+        self.progress.setFixedHeight(14)
+        self.progress.setFormat('%v / %m')
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setToolTip('Progress of the running job')
+        # Visibility is toggled on the *action*, never on the widget. A widget hidden
+        # with widget.setVisible(False) is dropped from QToolBarLayout and showing it
+        # again never puts it back - it stays parked, unlaid-out, at 0,0 behind the
+        # first button. That is what hid the progress bar, Cancel and the queue count
+        # for the entire run. See _set_status_widget_visible.
+        self._progress_action = self.toolbar.addWidget(self.progress)
+        self._progress_action.setVisible(False)
+
+        # Left-click cancels the job that is running *now* and lets the queue carry on;
+        # right-click cancels the running job and everything waiting behind it. It used
+        # to be icon-only and wired straight to "cancel everything", so the only cancel
+        # within reach binned the whole queue - the one thing you cannot get back by
+        # pressing the button again. The label is spelled out because an unlabelled red
+        # circle beside a progress bar does not say which of the two it does.
+        self.cancel_button = QToolButton()
+        self.cancel_button.setIcon(make_icon('cancel', STATUS_TEXT['rejected'], 18))
+        self.cancel_button.setIconSize(QSize(18, 18))
+        self.cancel_button.setText('Cancel')
+        self.cancel_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.cancel_button.setToolTip(
+            'Cancel the job running now  (Esc)\n'
+            'The rest of the queue carries on.\n\n'
+            'Right-click to cancel everything, running and queued.')
+        self.cancel_button.clicked.connect(self.cancel_current_requested.emit)
+        self._watch_right_click(self.cancel_button, self._show_cancel_menu)
+        self._cancel_action = self.toolbar.addWidget(self.cancel_button)
+        self._cancel_action.setVisible(False)
+
+        # What is running and what is behind it. Clicking opens the queue window,
+        # because a count you cannot act on only tells you how long to wait.
+        self.queue_button = QToolButton()
+        self.queue_button.setText('')
+        self.queue_button.setToolTip('Jobs waiting to run - click to see and manage '
+                                     'the queue\n\n'
+                                     'Right-click to cancel the running job, or all of '
+                                     'them.')
+        self.queue_button.clicked.connect(lambda: self.show_queue_window())
+        # The same two cancels as the Cancel button. The queue count is the other thing
+        # you aim at when you want the run to stop, so it answers for it too.
+        self._watch_right_click(
+            self.queue_button, lambda: self._show_cancel_menu(self.queue_button))
+        self._queue_action = self.toolbar.addWidget(self.queue_button)
+        self._queue_action.setVisible(False)
+
+        for button in self.toolbar.findChildren(QToolButton):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+
+    def _build_sources_button(self, item, icon: int) -> QToolButton:
+        """A menu of tickable sources - five checkboxes collapsed into one button."""
+        button = QToolButton()
+        button.setIconSize(QSize(icon, icon))
+        button.setIcon(make_icon('sources', TEXT, icon))
+        button.setToolTip(self._tool_tooltip(item.key, item.tooltip))
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        # Sources is the one toolbar entry that is a widget rather than a QAction, so
+        # it never picked up the toolbar's text-under-icon style and sat there as the
+        # only unlabelled button whenever labels were switched on.
+        button.setText(item.label)
+        button.setToolButtonStyle(self._tool_button_style())
+        # Kept so _fit_toolbar can collapse it with the rest; being a widget, it does not
+        # follow the toolbar's own toolButtonStyle.
+        self._sources_button = button
+
+        menu = QMenu(button)
+        header = menu.addAction('Identify with...')
+        header.setEnabled(False)
+        menu.addSeparator()
+        for tier, title, key, tooltip in MODES:
+            action = menu.addAction(title)
+            action.setCheckable(True)
+            action.setToolTip(tooltip)
+            # Re-use the action across rebuilds so ticks survive a toolbar reorder.
+            previous = self.mode_actions.get(tier)
+            action.setChecked(previous.isChecked() if previous is not None
+                              else self.settings.get_bool(key, tier != 'search'))
+            action.toggled.connect(lambda _=False: self._sources_changed())
+            self.mode_actions[tier] = action
+        menu.setToolTipsVisible(True)
+
+        button.setMenu(menu)
+        return button
+
+    def _sources_changed(self) -> None:
+        chosen = [title for tier, title, _k, _t in MODES
+                  if self.mode_actions[tier].isChecked()]
+        self.show_message('Identifying with: ' + (', '.join(chosen) or 'nothing selected'))
+
+    def _show_toolbar_menu(self, position) -> None:
+        menu = QMenu(self)
+        menu.addAction('Customise toolbar...',
+                       lambda: self.settings_requested_on_tab.emit('Toolbar'))
+        menu.exec(self.toolbar.mapToGlobal(position))
+
+    def _install_shortcuts(self) -> None:
+        """F-keys, as requested - no single-letter bindings.
+
+        F2 is rename, as it is in every file manager: it edits the cell you are on.
+        F4-F9 are the review loop, ending where it actually ends: F8 writes the files
+        out. Settings sits out of the way on F12.
+
+        Every binding a toolbar button has is declared once, in toolbar.SHORTCUTS, and
+        read from there both here and by the tooltips - so a button can never advertise
+        a key that does nothing.
+        """
+        bindings = [
+            ('F2', self._edit_current_cell),
+            (shortcut_for('identify'), lambda: self._request_resolve()),
+            (shortcut_for('approve'),
+             lambda: self._set_status_selected(STATUS_APPROVED)),
+            (shortcut_for('reject'),
+             lambda: self._set_status_selected(STATUS_REJECTED)),
+            (shortcut_for('preview'), lambda: self._request_apply(preview=True)),
+            (shortcut_for('apply'), lambda: self._request_apply(preview=False)),
+            (shortcut_for('goodreads'), lambda: self._search_goodreads()),
+            (shortcut_for('settings'), self.settings_requested.emit),
+            (shortcut_for('scan'), lambda: self._request_load()),
+            (shortcut_for('undo'), self._undo_last),
+            ('Ctrl+Y', self._redo_last),
+            ('Ctrl+Shift+Z', self._redo_last),
+            ('Ctrl+H', self._show_history_dialog),
+            ('Ctrl+O', lambda: self._open_folders(self.selected_entries())),
+            ('Ctrl+A', self.table.selectAll),
+            ('Ctrl+F', self.search_box.setFocus),
+            # F3 is "find" everywhere else, and this is the only find there is here.
+            ('F3', self.search_box.setFocus),
+            # The running job only, matching the Cancel button beside the progress bar.
+            # Esc used to bin the whole queue, which is a lot to lose to a keypress
+            # people use to mean "stop this".
+            ('Escape', self.cancel_current_requested.emit),
+        ]
+        for sequence, slot in bindings:
+            QShortcut(QKeySequence(sequence), self, activated=slot)
+
+    # ------------------------------------------------------------------ modes
+
+    def selected_tiers(self) -> List[str]:
+        """The identification sources currently ticked, in resolver order."""
+        return [tier for tier, _title, _key, _tip in MODES
+                if self.mode_actions[tier].isChecked()]
+
+    # ------------------------------------------------------------- table data
+
+    def set_entries(self, entries: List[BookEntry]) -> None:
+        """Replace the whole table."""
+        self.entries = {entry.entry_id: entry for entry in entries}
+        from ..quality import identity_key
+        self._identity_keys = {entry.entry_id: identity_key(entry) for entry in entries}
+        self._identity_groups = {}
+        for entry_id, key in self._identity_keys.items():
+            if key is not None:
+                self._identity_groups.setdefault(key, set()).add(entry_id)
+        self._covers.clear()
+        self._rebuild_table()
+
+    def upsert_entry(self, entry: BookEntry) -> None:
+        """Add or refresh one entry without rebuilding everything."""
+        is_new = entry.entry_id not in self.entries
+        self.entries[entry.entry_id] = entry
+        if is_new:
+            # One new row, not a rebuild of every row: a load that reports its books
+            # one at a time rebuilt the whole table once per book, and three thousand
+            # books never finished arriving.
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.row_ids.append(entry.entry_id)
+            self._fill_row(row, entry)
+            self._sort_table()
+            self._apply_filters()
+            self.refresh_stats()
+        else:
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self._apply_filters()
+            self.refresh_stats()
+        if self.entry_is_selected(entry):
+            self.why_panel.show_entry(entry)
+
+    def entry_is_selected(self, entry: BookEntry) -> bool:
+        selected = self.selected_entries()
+        return bool(selected) and selected[0].entry_id == entry.entry_id
+
+    def refresh_stats(self) -> None:
+        """Library counts, in the toolbar, each in its own status colour."""
+        # The counts already live in the filter bar ("12 of 38") and in the status
+        # filter itself. Printing them a third time in the toolbar was noise.
+        self.why_panel.set_stats(self.entries.values())
+        # Approving a row is what makes Save available, so the counts and the buttons
+        # are refreshed together - every path that changes a status comes through here.
+        self.refresh_action_states()
+
+    def _rebuild_table(self) -> None:
+        self._updating = True
+        self.table.setRowCount(0)
+        self.row_ids = []
+        self._cover_items = {}
+
+        for entry in self.entries.values():
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.row_ids.append(entry.entry_id)
+            self._fill_row(row, entry)
+
+        self._sort_table()
+        self.table.horizontalHeader().setSortIndicatorShown(self._user_sorted)
+        self._updating = False
+        self._apply_filters()
+        self.refresh_stats()
+
+    def _fill_row(self, row: int, entry: BookEntry) -> None:
+        affected = self._sync_identity_group(entry)
+        self._validate_entry(entry)
+        previous = self._updating
+        self._updating = True
+        # Rows only move when you sort, load, or reopen - unless you ask for live
+        # re-sorting, and even then only once every cell of this row is written.
+        # A rebuild sorts once at the end rather than once per row.
+        resort = self.settings.get_bool('AO_UI_RESORT_LIVE', True) and not previous
+
+        filename, folder = self._files_summary(entry)
+
+        # Sorted on the folder path, so clicking this column groups the table by where
+        # the books live rather than by what they are called.
+        cover = _KeyedItem(f'{folder}/{filename}')
+        cached = getattr(entry, '_cover_pixmap', None)
+        if cached is None:
+            self._covers.request(entry)
+        elif not cached.isNull():
+            cover.setData(Qt.ItemDataRole.DecorationRole, cached)
+        self._cover_items[entry.entry_id] = cover
+        cover.setData(ROLE_KIND, KIND_COVER)
+        cover.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        cover.setToolTip('Cover art embedded in the file, or an image in its folder.\n'
+                         'Click to view it full size; arrow keys walk images and books.\n'
+                         'Click this column\'s header to sort the table by folder path.')
+        self.table.setItem(row, COL_COVER, cover)
+
+        files = QTableWidgetItem(filename)
+        files.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        files.setToolTip(f'{self.settings.display_path(entry.folder)}\n\n'
+                         + '\n'.join(entry.audio_files))
+        files.setData(ROLE_ENTRY_ID, entry.entry_id)
+        files.setData(ROLE_SECONDARY, folder)
+        files.setData(ROLE_KIND, KIND_FILES)
+        # A row can be repainted mid-job (a value arrives, a filter runs), so the
+        # progress a long job is reporting has to be re-attached rather than lost.
+        progress = self._row_progress.get(entry.entry_id)
+        if progress is not None:
+            files.setData(ROLE_PROGRESS, progress[0])
+            files.setData(ROLE_PROGRESS_TEXT, progress[1])
+        self.table.setItem(row, COL_FILES, files)
+
+        findings = self._entry_findings(entry)
+        duplicate_warning = (bool(self._duplicate_ids(entry))
+                             and not entry.warnings_silenced)
+        for column, name in EDITABLE.items():
+            field = entry.get_field(name)
+            item = _FieldItem(display_index(field.value) if name == 'series_index'
+                              else str(field.value), _sort_key(entry, column))
+            author_initial_warning = (
+                name == 'author'
+                and any(finding.kind == 'author_initials'
+                        for finding in findings))
+            item.setForeground(QColor(
+                STATUS_TEXT['rejected'] if author_initial_warning or duplicate_warning
+                else self._field_colour(entry, field)))
+            item.setToolTip(
+                f'{field.value or "(empty)"}\n'
+                f'source: {field.source or "none"}\n'
+                f'confidence: {field.confidence:.0%}'
+                + (f'\nconfirmed by: {", ".join(field.corroborated_by)}'
+                   if field.corroborated_by else '')
+                + '\n\nDouble-click to edit.')
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignCenter if column == COL_INDEX
+                else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, column, item)
+
+        confidence = entry.confidence()
+        # Shown as "83%", sorted as 0.83 - hence the custom item rather than an
+        # EditRole float, which would replace the text with a raw "0,83".
+        conf_item = _NumericItem(f'{confidence:.0%}', confidence)
+        conf_item.setData(ROLE_CONFIDENCE, confidence)
+        conf_item.setData(ROLE_KIND, KIND_CONFIDENCE)
+        warning = bool(entry.warnings and not entry.warnings_silenced)
+        conf_item.setData(ROLE_WARNING, warning)
+        conf_item.setData(ROLE_WARNING_IGNORED, False)
+        if warning:
+            warning_tip = ('Ignored Warning\n' if entry.warnings_silenced
+                           else 'Warning\n') + '\n'.join(entry.warnings)
+            warning_tip += ('\n\nLeft-click to view. Right-click for options.')
+            conf_item.setToolTip(warning_tip)
+        else:
+            conf_item.setToolTip('How sure the identification is, averaged over the fields')
+        conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        conf_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        self.table.setItem(row, COL_CONF, conf_item)
+
+        status_key, status_label = self._display_status(entry)
+        status = QTableWidgetItem(status_label)
+        status.setData(ROLE_KIND, KIND_STATUS)
+        status.setData(ROLE_WARNING, False)
+        status.setData(ROLE_SIZE, self._size_label(entry))
+        status.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        status.setToolTip(self._status_tooltip(entry, status_label))
+        self.table.setItem(row, COL_STATUS, status)
+
+        # The delegate paints the stripe and the pill from this, on every cell.
+        for column in range(len(COLUMNS)):
+            item = self.table.item(row, column)
+            if item is not None:
+                item.setData(ROLE_STATUS, status_key)
+                item.setData(ROLE_DUPLICATE_IDENTITY, duplicate_warning)
+
+        # Refresh both sides of a collision, including a book whose own fields did
+        # not change. Sorting waits until all affected rows have been written.
+        for entry_id in affected - {entry.entry_id}:
+            other_row = self._row_for(entry_id)
+            if other_row is not None:
+                self._fill_row(other_row, self.entries[entry_id])
+
+        if resort:
+            self._sort_table()
+
+        self._updating = previous
+
+    def _confidence_filter_chosen(self, _index: int) -> None:
+        """"Custom threshold..." asks for a number and becomes a real filter entry."""
+        if self.confidence_filter.currentText() != '...':
+            return
+
+        percent, ok = QInputDialog.getInt(
+            self, 'Confidence threshold',
+            'Show rows whose confidence is at least this percentage:',
+            int(self._custom_confidence * 100), 0, 100, 5)
+        if not ok:
+            self.confidence_filter.setCurrentIndex(0)
+            return
+
+        self._custom_confidence = percent / 100.0
+        label = f'At least {percent}%'
+        # Replace any previous custom entry so the list does not grow every time.
+        for index in range(self.confidence_filter.count()):
+            if self.confidence_filter.itemText(index).startswith('At least'):
+                self.confidence_filter.removeItem(index)
+                break
+        self.confidence_filter.insertItem(self.confidence_filter.count() - 1, label)
+        self.confidence_filter.setCurrentText(label)
+        self._apply_filters()
+
+    def _field_colour(self, entry: BookEntry, field) -> str:
+        """One row, one colour story.
+
+        A decided row is that decision, all the way across: approved is green,
+        rejected is red. Only undecided rows are free to say anything else, and even
+        then the per-source hues are opt-in - a row that was amber-for-regex, green
+        for its status and blue in one cell was three claims at once, none legible.
+        """
+        if not field.value:
+            return TEXT_FAINT
+        if entry.status == STATUS_APPROVED:
+            return STATUS_TEXT['approved']
+        if entry.status == STATUS_REJECTED:
+            return STATUS_TEXT['rejected']
+        if self.settings.get_bool('AO_UI_COLOR_BY_SOURCE', False):
+            return source_color(field.source)
+        return TEXT
+
+    def _display_status(self, entry: BookEntry) -> tuple[str, str]:
+        """Return the stored review status and the label the Status column shows.
+
+        While a book is being identified the label is the step it is on, and
+        afterwards where it ended: Done, or the step a source failed at.
+        """
+        progress = self._row_progress.get(entry.entry_id)
+        if progress is not None and progress[1] == 'Queued':
+            return entry.status, 'Queued'
+        return entry.status, stage_status(entry) or pretty_status(entry.status)
+
+    @staticmethod
+    def _size_label(entry: BookEntry) -> str:
+        """The book's audio on disk in MB, or '' when the scan recorded no sizes."""
+        sizes = [size for size in entry.audio_sizes if size and size > 0]
+        if not sizes:
+            return ''
+        megabytes = sum(sizes) / (1024 * 1024)
+        return '<1 MB' if megabytes < 1 else f'{megabytes:,.0f} MB'
+
+    def _status_tooltip(self, entry: BookEntry, label: str) -> str:
+        from ..models import STAGE_LABELS
+
+        lines = [f'Status: {label}']
+        if entry.identify_state == 'failed' and entry.identify_failed:
+            steps = ', '.join(STAGE_LABELS.get(t, t) for t in entry.identify_failed)
+            lines.append(f'Identification finished, but a source failed or was '
+                         f'switched off at: {steps}. Right-click > Re-queue failed '
+                         f'sources to run it again.')
+        elif entry.identify_state == 'stopped':
+            lines.append(f'Identification was stopped at the '
+                         f'{STAGE_LABELS.get(entry.identify_stage, entry.identify_stage)}'
+                         f' step. Identify again to carry on from there.')
+        if label != pretty_status(entry.status):
+            lines.append(f'Review status: {pretty_status(entry.status)}')
+        lines.append('The stripe down the left of the row and this pill use the '
+                     'same colour.')
+        return '\n'.join(lines)
+
+    def _refresh_status_cell(self, entry_id: str, row: Optional[int]) -> None:
+        entry = self.entries.get(entry_id)
+        if entry is None or row is None:
+            return
+        item = self.table.item(row, COL_STATUS)
+        if item is None:
+            return
+        label = self._display_status(entry)[1]
+        if item.text() == label:
+            return
+        previous, self._updating = self._updating, True
+        item.setText(label)
+        item.setToolTip(self._status_tooltip(entry, label))
+        self._updating = previous
+
+    def _files_summary(self, entry: BookEntry):
+        """(filename, path-from-root) - the delegate draws them as two lines.
+
+        The filename leads because it is what identifies the row at a glance. The
+        path sits underneath because it is context: the author, the series, or both
+        are very often only in the folders above the file.
+        """
+        count = len(entry.audio_files)
+        folder = self._relative_folder(entry)
+        if count == 0:
+            return 'no audio files', folder
+        if count == 1:
+            return entry.audio_files[0], folder
+        # Multi-file books are a different thing to review, so they say so plainly.
+        return (f'{entry.audio_files[0]}   (+{count - 1} more)', folder)
+
+    def _relative_folder(self, entry: BookEntry) -> str:
+        """The entry's folder as the *whole* path below the input root.
+
+        "Sci-Fi\\Kitasei, Yume\\The Deep Sky", not "The Deep Sky". The point of this
+        line is that the author and the series are very often only in the folders above
+        the file, and the deepest folder alone throws away exactly that. Every fallback
+        below therefore keeps as much of the path as it can, and the last resort is the
+        full absolute path rather than a single component.
+        """
+        root = None
+        try:
+            root = self.settings.get_path('AO_INPUT_DIR')
+        except (TypeError, OSError):
+            pass
+
+        # The scanner records the file's path relative to the library root, so its
+        # parent is the answer whenever it is there.
+        if entry.relative_path:
+            relative = Path(entry.relative_path)
+            # relative_path may name the file or the folder; a suffix means the file.
+            folder = relative.parent if relative.suffix else relative
+            text = str(folder).strip('\\/')
+            if text not in ('.', ''):
+                return text
+
+        folder = Path(entry.folder)
+        if root is not None:
+            try:
+                text = str(folder.relative_to(root)).strip('\\/')
+                if text not in ('.', ''):
+                    return text
+            except ValueError:
+                # Outside the configured input folder - which is a thing worth seeing,
+                # so show where it really is instead of pretending it is inside.
+                return str(folder)
+        return str(folder)
+
+    def _cover_pixmap(self, entry: BookEntry) -> Optional[QPixmap]:
+        """Embedded cover art, else a folder image, else nothing (#26)."""
+        cached = getattr(entry, '_cover_pixmap', None)
+        if cached is not None:
+            return cached if not cached.isNull() else None
+
+        pixmap = QPixmap.fromImage(read_cover(entry.primary_audio, entry.folder,
+                                              entry.image_files))
+        # Cache on the entry so scrolling doesn't re-decode every repaint.
+        object.__setattr__(entry, '_cover_pixmap', pixmap)
+        return pixmap if not pixmap.isNull() else None
+
+    def _cover_loaded(self, entry_id: str, image) -> None:
+        """A thumbnail from the background reader: cache it and show it."""
+        entry = self.entries.get(entry_id)
+        if entry is None:
+            return
+        pixmap = QPixmap.fromImage(image)
+        object.__setattr__(entry, '_cover_pixmap', pixmap)
+        item = self._cover_items.get(entry_id)
+        if item is None or pixmap.isNull():
+            return
+        try:
+            item.setData(Qt.ItemDataRole.DecorationRole, pixmap)
+        except RuntimeError:
+            self._cover_items.pop(entry_id, None)    # that row has been rebuilt since
+
+    # ----------------------------------------------------------- cover viewer
+
+    def _cell_clicked(self, index) -> None:
+        if index.column() == COL_COVER:
+            self._open_cover_viewer(index.row())
+
+    def _warning_badge_hit(self, index, position) -> bool:
+        if not index.isValid() or not index.data(ROLE_WARNING):
+            return False
+        if index.column() != COL_CONF:
+            return False
+        return self.delegate.warning_badge_rect(
+            self.table.visualRect(index)).contains(position)
+
+    def _open_warning(self, index) -> None:
+        entry = self._entry_at(index.row())
+        if entry is None:
+            return
+        self.table.clearSelection()
+        self.table.setCurrentCell(index.row(), COL_CONF)
+        self.table.item(index.row(), COL_CONF).setSelected(True)
+        self.why_panel.show_entry(entry)
+        self.why_panel.focus_warning()
+
+    def _show_warning_menu(self, index, global_position) -> None:
+        entry = self._entry_at(index.row())
+        if entry is None or not entry.warnings:
+            return
+        menu = QMenu(self)
+        menu.setMinimumWidth(460)
+
+        panel = QWidget(menu)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(8)
+        for reason in entry.warnings:
+            label = QLabel(reason)
+            label.setWordWrap(True)
+            label.setMinimumWidth(410)
+            label.setStyleSheet(f'color: {TEXT}; font-weight: 700;')
+            layout.addWidget(label)
+
+        information = QWidgetAction(menu)
+        information.setDefaultWidget(panel)
+        menu.addAction(information)
+        menu.addSeparator()
+        from ..quality import inspect_entry, suggest_fix
+        findings = inspect_entry(entry)
+        proposals = []
+        seen_proposals = set()
+        by_field = {}
+        for finding in findings:
+            current = by_field.get(finding.field, entry.value(finding.field))
+            proposed = suggest_fix(finding.field, current, finding.kind)
+            by_field[finding.field] = proposed
+            key = (finding.field, proposed)
+            if key not in seen_proposals:
+                proposals.append((finding, proposed))
+                seen_proposals.add(key)
+        fix_all = menu.addAction('Fix All')
+        fix_all.triggered.connect(
+            lambda: self._apply_warning_fixes(entry, list(by_field.items()), 'all warnings'))
+        selected = self.selected_entries()
+        warned = [candidate for candidate in selected if candidate.warnings]
+        warning_count = sum(len(candidate.warnings) for candidate in warned)
+        if len(warned) > 1:
+            fix_selected = menu.addAction(f'Fix all {warning_count} warnings')
+            fix_selected.triggered.connect(
+                lambda: self._apply_all_warning_fixes(warned))
+        menu.addSeparator()
+        for finding, proposed in proposals:
+            field_label = finding.field.replace('_', ' ').title()
+            fix = menu.addAction(f'{field_label}: {proposed}')
+            fix.triggered.connect(
+                lambda _=False, f=finding.field, value=proposed:
+                self._apply_warning_fixes(entry, [(f, value)], f))
+        if entry.warnings:
+            menu.addSeparator()
+        action = menu.addAction('Ignore')
+        action.triggered.connect(lambda: self._silence_warning(entry))
+        menu.exec(global_position)
+
+    def _suggested_warning_fixes(self, entry: BookEntry):
+        from ..quality import inspect_entry, suggest_fix
+
+        by_field = {}
+        for finding in inspect_entry(entry):
+            current = by_field.get(finding.field, entry.value(finding.field))
+            by_field[finding.field] = suggest_fix(
+                finding.field, current, finding.kind)
+        return list(by_field.items())
+
+    def _apply_all_warning_fixes(self, entries: List[BookEntry]) -> None:
+        for entry in entries:
+            self._apply_warning_fixes(
+                entry, self._suggested_warning_fixes(entry), 'all warnings')
+        self._apply_filters()
+        self.refresh_stats()
+
+    def _show_warnings_dialog(self) -> None:
+        self._validate_entries()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Warnings')
+        dialog.resize(1860, 680)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        summary = QLabel()
+        layout.addWidget(summary)
+
+        tree = _WarningTree()
+        tree.setColumnCount(8)
+        tree.setHeaderLabels(
+            ['File', 'Author', 'Series', '#', 'Title', 'Fixed', 'Fix', 'Ignore'])
+        tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        tree.setAlternatingRowColors(True)
+        tree.setUniformRowHeights(False)
+        tree.setRootIsDecorated(False)
+        tree.setIndentation(0)
+        tree.setItemDelegate(ReviewDelegate(tree))
+        header = tree.header()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(tree.ACTION_WIDTH)
+        for column in range(6):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        for column in (6, 7):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        for column, width in enumerate(tree.BASE_WIDTHS):
+            tree.setColumnWidth(column, width)
+        tree.setToolTip(
+            'Red text is the warned value. Edit the Fixed value, then use its Fix '
+            'button to apply it. Use Ignore to dismiss the warning without changing '
+            'the value. Right-click a finding to apply or ignore it. '
+            'Click a heading to sort. '
+            'Ctrl-click or Shift-click to select multiple warnings.')
+        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree.setSortingEnabled(True)
+        layout.addWidget(tree, stretch=1)
+
+        buttons = QGridLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+
+        left_buttons = QWidget(dialog)
+        left_layout = QHBoxLayout(left_buttons)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        select_all = QPushButton('Select all')
+        select_all.setToolTip('Select every finding')
+        clear_selection = QPushButton('Clear selection')
+        clear_selection.setToolTip('Clear the current selection')
+        left_layout.addWidget(select_all)
+        left_layout.addWidget(clear_selection)
+
+        filter_buttons = QWidget(dialog)
+        filter_layout = QHBoxLayout(filter_buttons)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_label = QLabel('Filter:')
+        filter_label.setToolTip('Choose which warning field to show')
+        filter_label.setStyleSheet('background: transparent;')
+        filter_layout.addWidget(filter_label)
+        warning_filter = None
+        warning_filter_buttons = {}
+        for field, label in (('author', 'Author'), ('series', 'Series'),
+                             ('title', 'Title')):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setToolTip(f'Show only {label.lower()} warnings')
+            button.clicked.connect(
+                lambda _checked=False, name=field: toggle_warning_filter(name))
+            warning_filter_buttons[field] = button
+            filter_layout.addWidget(button)
+
+        right_buttons = QWidget(dialog)
+        right_layout = QHBoxLayout(right_buttons)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        fix = QPushButton('Fix selected')
+        fix.setToolTip('Apply each selected proposed solution')
+        ignore = QPushButton('Ignore selected')
+        ignore.setToolTip('Sign off the selected findings without changing values')
+        close = QPushButton('Close')
+        close.setToolTip('Close this review list')
+        for button in (fix, ignore):
+            right_layout.addWidget(button)
+        right_layout.addWidget(close)
+
+        side_width = max(left_buttons.sizeHint().width(),
+                         right_buttons.sizeHint().width())
+        buttons.setColumnMinimumWidth(0, side_width)
+        buttons.setColumnMinimumWidth(2, side_width)
+        buttons.setColumnStretch(0, 1)
+        buttons.setColumnStretch(2, 1)
+        buttons.addWidget(left_buttons, 0, 0, Qt.AlignmentFlag.AlignLeft)
+        buttons.addWidget(filter_buttons, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        buttons.addWidget(right_buttons, 0, 2, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(buttons)
+
+        def selected_findings():
+            return [item for item in tree.selectedItems()
+                    if item.data(0, Qt.ItemDataRole.UserRole) is not None]
+
+        def selected_entries():
+            ids = {item.data(0, Qt.ItemDataRole.UserRole)
+                   for item in selected_findings()}
+            return [self.entries[entry_id] for entry_id in ids
+                    if entry_id in self.entries]
+
+        def update_selection():
+            findings = selected_findings()
+            count = len(findings)
+            enabled = count > 0
+            fixable = sum(item.data(0, int(Qt.ItemDataRole.UserRole) + 2)
+                          is not None for item in findings)
+            fix.setText(
+                f'Fix selected ({fixable})' if fixable else 'Fix selected')
+            ignore.setText(
+                f'Ignore selected ({count})' if enabled else 'Ignore selected')
+            fix.setEnabled(fixable > 0)
+            ignore.setEnabled(enabled)
+
+        def toggle_warning_filter(field):
+            nonlocal warning_filter
+            warning_filter = None if warning_filter == field else field
+            for name, button in warning_filter_buttons.items():
+                active = name == warning_filter
+                button.setChecked(active)
+                button.setProperty('accent', active)
+                button.style().unpolish(button)
+                button.style().polish(button)
+                button.update()
+            refill()
+
+        def refill():
+            from ..quality import suggest_fix
+
+            tree.setSortingEnabled(False)
+            tree.clear()
+            finding_count = 0
+            book_count = 0
+            for candidate in self.entries.values():
+                if candidate.warnings_silenced:
+                    continue
+                findings = self._entry_findings(candidate)
+                if warning_filter is not None:
+                    findings = [finding for finding in findings
+                                if finding.field == warning_filter]
+                if not findings:
+                    continue
+                book_count += 1
+                proposed_by_field = {}
+                for finding in findings:
+                    current = proposed_by_field.get(
+                        finding.field, candidate.value(finding.field))
+                    proposed = suggest_fix(finding.field, current, finding.kind)
+                    proposed_by_field[finding.field] = proposed
+                    filename, folder = self._files_summary(candidate)
+                    values = [filename, candidate.value('author'),
+                              candidate.value('series'),
+                              candidate.value('series_index'),
+                              candidate.value('title'),
+                              proposed if proposed != current else '', '', '']
+                    columns = {'file': 0, 'author': 1, 'series': 2,
+                               'series_index': 3, 'title': 4}
+                    warned_column = columns.get(finding.field, 0)
+                    values[warned_column] = current
+                    item = _WarningItem([filename, '', '', '', '', '', '', ''])
+                    for column in range(1, 6):
+                        item.setData(column, ROLE_WARNING_VALUE, values[column])
+                    item.setData(0, Qt.ItemDataRole.UserRole, candidate.entry_id)
+                    item.setData(
+                        0, int(Qt.ItemDataRole.UserRole) + 1, finding.field)
+                    item.setData(
+                        0, int(Qt.ItemDataRole.UserRole) + 2,
+                        proposed if proposed != current else None)
+                    item.setData(
+                        0, ROLE_WARNING_SORT,
+                        (folder.casefold(), filename.casefold()))
+                    item.setData(0, ROLE_KIND, KIND_FILES)
+                    item.setData(0, ROLE_SECONDARY, folder)
+                    item.setSizeHint(0, QSize(0, 58))
+                    item.setForeground(
+                        warned_column, QColor(STATUS_TEXT['rejected']))
+                    item.setForeground(
+                        5, QColor(STATUS_TEXT['approved']
+                                  if proposed != current else TEXT_DIM))
+                    item.setToolTip(
+                        0, f'{self.settings.display_path(candidate.folder)}\n\n'
+                        + '\n'.join(candidate.audio_files))
+                    item.setToolTip(warned_column, finding.message)
+                    item.setToolTip(
+                        5, f'Suggested fix for: {finding.message}'
+                        if proposed != current
+                        else 'No suggested fix available')
+                    tree.addTopLevelItem(item)
+
+                    identity_columns = {
+                        1: 'author', 2: 'series', 3: 'series_index', 4: 'title'}
+                    for column, field_name in identity_columns.items():
+                        field_editor = _ElidingLineEdit(values[column], tree)
+                        field_editor.setFrame(False)
+                        field_editor.setAlignment(
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                        field_editor.setToolTip(
+                            finding.message if column == warned_column
+                            else f'Edit {FIELD_LABELS[field_name]}')
+                        colour = (STATUS_TEXT['rejected']
+                                  if column == warned_column else TEXT)
+                        field_editor.setStyleSheet(
+                            f'QLineEdit {{ color: {colour}; background: transparent; '
+                            'border: none; border-radius: 0; padding: 0 5px; '
+                            'min-height: 0; } QLineEdit:focus { border: none; }')
+                        tree.setItemWidget(item, column, field_editor)
+                        field_editor.textChanged.connect(
+                            lambda text, row=item, target_column=column:
+                            row.setData(target_column, ROLE_WARNING_VALUE, text))
+                        field_editor.editingFinished.connect(
+                            lambda row=item, name=field_name, field=field_editor:
+                            save_identity_value(row, name, field.text()))
+                        field_editor.setContextMenuPolicy(
+                            Qt.ContextMenuPolicy.CustomContextMenu)
+                        field_editor.customContextMenuRequested.connect(
+                            lambda position, row=item, field=field_editor:
+                            show_finding_menu(
+                                row, field.mapToGlobal(position),
+                                field.createStandardContextMenu()))
+
+                    editor = _ElidingLineEdit(values[5], tree)
+                    editor.setFrame(False)
+                    editor.setAlignment(
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    editor.setToolTip(item.toolTip(5))
+                    editor.setStyleSheet(
+                        f'QLineEdit {{ color: {STATUS_TEXT["approved"]}; '
+                        'background: transparent; border: none; border-radius: 0; '
+                        'padding: 0 5px; min-height: 0; } '
+                        'QLineEdit:focus { border: none; }')
+                    tree.setItemWidget(item, 5, editor)
+
+                    approval = QToolButton(tree)
+                    approval.setAutoRaise(True)
+                    approval.setIconSize(QSize(44, 44))
+                    approval.setSizePolicy(
+                        QSizePolicy.Policy.Expanding,
+                        QSizePolicy.Policy.Expanding)
+                    approval.setToolTip('Apply the value in Fixed for this warning')
+                    tree.setItemWidget(item, 6, approval)
+
+                    ignore_button = QToolButton(tree)
+                    ignore_button.setAutoRaise(True)
+                    ignore_button.setIcon(make_icon(
+                        'reject', STATUS_TEXT['rejected'], 44))
+                    ignore_button.setIconSize(QSize(44, 44))
+                    ignore_button.setSizePolicy(
+                        QSizePolicy.Policy.Expanding,
+                        QSizePolicy.Policy.Expanding)
+                    ignore_button.setToolTip('Ignore this warning')
+                    tree.setItemWidget(item, 7, ignore_button)
+
+                    def update_fixed_value(text, row=item, original=current,
+                                           button=approval):
+                        fixed_value = text.strip()
+                        usable = bool(fixed_value and fixed_value != original)
+                        row.setData(5, ROLE_WARNING_VALUE, text)
+                        row.setData(
+                            0, int(Qt.ItemDataRole.UserRole) + 2,
+                            fixed_value if usable else None)
+                        # Fixable rows sort first on the initial ascending click.
+                        row.setData(6, ROLE_WARNING_VALUE, '0' if usable else '1')
+                        button.setIcon(
+                            make_icon('checkmark', STATUS_TEXT['approved'], 44)
+                            if usable else QIcon())
+                        button.setEnabled(usable)
+
+                    editor.textChanged.connect(update_fixed_value)
+                    editor.setContextMenuPolicy(
+                        Qt.ContextMenuPolicy.CustomContextMenu)
+                    editor.customContextMenuRequested.connect(
+                        lambda position, row=item, field=editor:
+                        show_finding_menu(
+                            row, field.mapToGlobal(position),
+                            field.createStandardContextMenu()))
+                    approval.clicked.connect(
+                        lambda _checked=False, row=item: apply_finding(row))
+                    ignore_button.clicked.connect(
+                        lambda _checked=False, row=item: ignore_finding(row))
+                    update_fixed_value(editor.text())
+                    finding_count += 1
+            tree.setSortingEnabled(True)
+            tree.sortItems(tree.sortColumn(), header.sortIndicatorOrder())
+            summary.setText(
+                f'<b>{finding_count}</b> finding'
+                f'{"" if finding_count == 1 else "s"} in '
+                f'<b>{book_count}</b> book{"" if book_count == 1 else "s"}')
+            update_selection()
+            self.refresh_action_states()
+
+        def fix_selected():
+            fixes = {}
+            for item in selected_findings():
+                entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+                field = item.data(0, int(Qt.ItemDataRole.UserRole) + 1)
+                proposed = item.data(0, int(Qt.ItemDataRole.UserRole) + 2)
+                if proposed is None:
+                    continue
+                fixes.setdefault(entry_id, {})[field] = proposed
+            for entry_id, fields in fixes.items():
+                if entry_id in self.entries:
+                    self._apply_warning_fixes(
+                        self.entries[entry_id], list(fields.items()), 'selected warnings')
+            self._apply_filters()
+            self.refresh_stats()
+            refill()
+
+        def apply_finding(item):
+            entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+            field = item.data(0, int(Qt.ItemDataRole.UserRole) + 1)
+            proposed = item.data(0, int(Qt.ItemDataRole.UserRole) + 2)
+            if entry_id not in self.entries or proposed is None:
+                return
+            self._apply_warning_fixes(
+                self.entries[entry_id], [(field, proposed)], field)
+            self._apply_filters()
+            self.refresh_stats()
+            refill()
+
+        def save_identity_value(item, field, value):
+            entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if entry_id not in self.entries:
+                return
+            if self._edit_warning_field(self.entries[entry_id], field, value):
+                self._apply_filters()
+                self.refresh_stats()
+                refill()
+
+        def ignore_finding(item):
+            entry_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if entry_id not in self.entries:
+                return
+            self._silence_warning(self.entries[entry_id])
+            refill()
+
+        def show_finding_menu(item, global_position, menu=None):
+            if item is None:
+                return
+            menu = menu or QMenu(tree)
+            if menu.actions():
+                menu.addSeparator()
+            apply_fix = menu.addAction('Apply fix')
+            apply_fix.setEnabled(
+                item.data(0, int(Qt.ItemDataRole.UserRole) + 2) is not None)
+            apply_fix.triggered.connect(
+                lambda _checked=False, row=item: apply_finding(row))
+            ignore_fix = menu.addAction('Ignore fix')
+            ignore_fix.triggered.connect(
+                lambda _checked=False, row=item: ignore_finding(row))
+            menu.exec(global_position)
+
+        def show_tree_menu(position):
+            item = tree.itemAt(position)
+            show_finding_menu(
+                item, tree.viewport().mapToGlobal(position))
+
+        def ignore_selected():
+            for candidate in selected_entries():
+                self._silence_warning(candidate)
+            refill()
+
+        tree.itemSelectionChanged.connect(update_selection)
+        tree.customContextMenuRequested.connect(show_tree_menu)
+        select_all.clicked.connect(tree.selectAll)
+        clear_selection.clicked.connect(tree.clearSelection)
+        fix.clicked.connect(fix_selected)
+        ignore.clicked.connect(ignore_selected)
+        close.clicked.connect(dialog.accept)
+        refill()
+        dialog.exec()
+        self.refresh_action_states()
+
+    def _apply_warning_fixes(self, entry: BookEntry, fixes, label: str) -> None:
+        from ..models import Field, clean_value
+
+        changed = [(field, clean_value(field, value.strip()))
+                   for field, value in fixes
+                   if clean_value(field, value.strip()) != entry.value(field)]
+        if not changed:
+            return
+        self._record_edit(f'fixed {label}',
+                          [(entry.entry_id, field, entry.get_field(field))
+                           for field, _value in changed])
+        for field, value in changed:
+            setattr(entry, field, Field(value=value, source='user', confidence=1.0))
+            entry.log('user', f'{field} fixed to "{value}"')
+        self._mark_warning_change_pending(entry)
+        self._validate_entry(entry, force=True)
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        self.why_panel.show_entry(entry)
+        self.show_message(f'Fixed {len(changed)} value'
+                          f'{"" if len(changed) == 1 else "s"}')
+
+    def _edit_warning_field(self, entry: BookEntry, field: str, value: str) -> bool:
+        from ..models import Field, clean_value
+
+        cleaned = clean_value(field, value.strip())
+        if cleaned == entry.value(field):
+            return False
+        self._record_edit(
+            f'{field} typed in warnings',
+            [(entry.entry_id, field, entry.get_field(field))])
+        setattr(entry, field, Field(value=cleaned, source='user', confidence=1.0))
+        entry.log('user', f'{field} set to "{cleaned}" in warnings')
+        self._mark_warning_change_pending(entry)
+        self._validate_entry(entry, force=True)
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        self.why_panel.show_entry(entry)
+        self.show_message(f'Updated {FIELD_LABELS[field]}')
+        return True
+
+    @staticmethod
+    def _mark_warning_change_pending(entry: BookEntry) -> None:
+        """A warning edit is new work and always needs a fresh review decision."""
+        entry.explicit_work_pending = True
+        entry.status = STATUS_PENDING
+
+    def _silence_warning(self, entry: BookEntry) -> None:
+        entry.warnings_silenced = True
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        if self.entry_is_selected(entry):
+            self.why_panel.show_entry(entry)
+        self.show_message('Content warning silenced')
+        self.refresh_action_states()
+
+    def _unignore_warning(self, entry: BookEntry) -> None:
+        entry.warnings_silenced = False
+        row = self._row_for(entry.entry_id)
+        if row is not None:
+            self._fill_row(row, entry)
+        self.entry_changed(entry)
+        if self.entry_is_selected(entry):
+            self.why_panel.show_entry(entry)
+        self.show_message('Content warning restored')
+
+    def _unignore_warnings(self, entries: List[BookEntry]) -> None:
+        restored = [entry for entry in entries
+                    if entry.warnings and entry.warnings_silenced]
+        for entry in restored:
+            entry.warnings_silenced = False
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+        if restored:
+            self.why_panel.show_entry(restored[0], extra_selected=len(restored) - 1)
+        self.show_message(f'Restored {len(restored)} content warning'
+                          f'{"" if len(restored) == 1 else "s"}')
+
+    def _validate_entry(self, entry: BookEntry, force: bool = False) -> None:
+        from ..quality import author_initial_style
+
+        # Two rows naming the same book would be written to the same place, so
+        # neither stays approved while the duplicate warning stands.
+        if entry.status == STATUS_APPROVED and self._is_unresolved_duplicate(entry):
+            entry.status = STATUS_PENDING
+            entry.log('user', 'approval withdrawn: duplicate of another row')
+        current = {name: entry.value(name) for name in IDENTITY_FIELDS}
+        current['_author_initial_style'] = author_initial_style()
+        current['_duplicate_ids'] = '\n'.join(sorted(self._duplicate_ids(entry)))
+        if not force and current == entry.warnings_checked_values:
+            return
+        warnings = [finding.message
+                    for finding in self._entry_findings(entry)]
+        if warnings != entry.warnings:
+            entry.warnings = warnings
+            entry.warnings_silenced = False
+        entry.warnings_checked_values = current
+        if (any(finding.kind != 'duplicate_identity'
+                for finding in self._entry_findings(entry))
+                and entry.status == STATUS_PENDING):
+            entry.status = STATUS_RISKY
+
+    def _is_unresolved_duplicate(self, entry: BookEntry) -> bool:
+        """Shares its identity with another row, and the warning is not ignored."""
+        return bool(self._duplicate_ids(entry)) and not entry.warnings_silenced
+
+    def _duplicate_ids(self, entry: BookEntry) -> set:
+        key = self._identity_keys.get(entry.entry_id)
+        return self._identity_groups.get(key, set()) - {entry.entry_id}
+
+    def _entry_findings(self, entry: BookEntry):
+        from ..quality import inspect_entry
+        return inspect_entry(entry, duplicate_ids=self._duplicate_ids(entry))
+
+    def _sync_identity_group(self, entry: BookEntry) -> set:
+        from ..quality import identity_key
+        key = identity_key(entry)
+        old = self._identity_keys.get(entry.entry_id)
+        if old == key:
+            return set()
+        affected = set(self._identity_groups.get(old, ()))
+        if old is not None:
+            self._identity_groups[old].discard(entry.entry_id)
+            if not self._identity_groups[old]:
+                del self._identity_groups[old]
+        self._identity_keys[entry.entry_id] = key
+        if key is not None:
+            group = self._identity_groups.setdefault(key, set())
+            group.add(entry.entry_id)
+            affected.update(group)
+        return affected
+
+    def _validate_entries(self) -> None:
+        for entry in self.entries.values():
+            self._validate_entry(entry, force=True)
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+        self._apply_filters()
+        self.refresh_stats()
+        self.refresh_action_states()
+        self.show_message(f'Validated {len(self.entries)} book'
+                          f'{"" if len(self.entries) == 1 else "s"}')
+
+    def _cover_sources(self, entry: BookEntry) -> List:
+        """Every image this book has, embedded art first, then the folder's files.
+
+        The embedded cover is what the player shows, so it leads; the loose files
+        follow in the order the scanner found them, which is sorted by name.
+        """
+        sources = []
+        try:
+            from ..metadata_extractor import MetadataExtractor
+            data = MetadataExtractor().extract_cover(entry.primary_audio)
+            if data:
+                sources.append(('Embedded cover', data))
+        except Exception as exc:
+            logger.debug('No embedded cover for %s: %s', entry.entry_id, exc)
+
+        folder = Path(entry.folder)
+        for name in entry.image_files:
+            sources.append((name, folder / name))
+        return sources
+
+    def _open_cover_viewer(self, row: int) -> None:
+        entry = self._entry_at(row)
+        if entry is None:
+            return
+        if self._cover_viewer is None:
+            self._cover_viewer = CoverViewer(self)
+            self._cover_viewer.step_book.connect(self._step_cover_book)
+            self._cover_viewer.image_deleted.connect(self._cover_image_deleted)
+            self._cover_viewer.finished.connect(
+                lambda _: setattr(self, '_cover_viewer', None))
+        self._cover_viewer.set_book(
+            self._cover_title(entry), self._cover_sources(entry),
+            has_prev=self._adjacent_row(row, -1) is not None,
+            has_next=self._adjacent_row(row, 1) is not None)
+        self._cover_viewer.show()
+        self._cover_viewer.raise_()
+        self._cover_viewer.activateWindow()
+
+    @staticmethod
+    def _cover_title(entry: BookEntry) -> str:
+        """What to call this book in the viewer - the title if we have one.
+
+        Early in a run most rows have no identity yet, and "Untitled" three times in a
+        row tells you nothing about which book you are looking at; the folder name is
+        at least the thing you would have read off the disk yourself.
+        """
+        title = entry.title.value.strip()
+        author = entry.author.value.strip()
+        if title:
+            return f'{author} - {title}' if author else title
+        return Path(entry.folder).name or entry.entry_id
+
+    def _adjacent_row(self, row: int, delta: int) -> Optional[int]:
+        """The next row in ``delta``'s direction that the filters have left visible."""
+        target = row + delta
+        while 0 <= target < self.table.rowCount():
+            if not self.table.isRowHidden(target):
+                return target
+            target += delta
+        return None
+
+    def _cover_image_deleted(self, path: Path) -> None:
+        """The viewer deleted a folder image: drop it from its book and redraw the row."""
+        row = self.table.currentRow()
+        entry = self._entry_at(row)
+        if entry is None:
+            return
+        folder = Path(entry.folder)
+        entry.image_files = [name for name in entry.image_files
+                             if folder / name != path]
+        # The thumbnail may have been that image; read it again.
+        object.__setattr__(entry, '_cover_pixmap', None)
+        self._fill_row(row, entry)
+        self.entry_changed(entry)
+
+    def _step_cover_book(self, delta: int) -> None:
+        """Move the viewer - and the table's cursor - to the next visible row."""
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        target = self._adjacent_row(row, delta)
+        if target is not None:
+            self.table.setCurrentCell(target, COL_COVER)
+            self._open_cover_viewer(target)
+
+    # --------------------------------------------------------------- filtering
+
+    def _apply_filters(self) -> None:
+        text = self.search_box.text().strip().lower()
+        status = self.status_filter.currentText()
+        missing = self.missing_filter.currentText()
+        confidence = self.confidence_filter.currentText()
+        shape = dict(SHAPE_FILTERS).get(self.shape_filter.currentText())
+        folder_filter = (self._folder_filter
+                         if self.shape_filter.currentText().startswith('Folder: ')
+                         else None)
+        from ..load_options import unsaved_entries
+        unsaved_ids = ({entry.entry_id for entry in unsaved_entries(self.entries.values())}
+                       if self.unsaved_filter.isChecked() else set())
+        visible = 0
+
+        for row in range(self.table.rowCount()):
+            entry = self._entry_at(row)
+            if entry is None:
+                continue
+            show = True
+
+            if text:
+                haystack = ' '.join([entry.value('author'), entry.value('series'),
+                                     entry.value('title'), entry.entry_id]).lower()
+                show = text in haystack
+            if show and status != 'All statuses':
+                show = (bool(entry.warnings) if status == 'Has Warning'
+                        else pretty_status(entry.status) == status)
+            if show and missing != 'Any completeness':
+                gaps = entry.missing_fields()
+                if missing == 'Missing any field':
+                    show = bool(gaps)
+                elif missing == 'Complete only':
+                    show = not gaps
+                elif missing in ('Missing cover', 'Has cover'):
+                    has_cover = self._cover_pixmap(entry) is not None
+                    show = has_cover if missing == 'Has cover' else not has_cover
+                else:
+                    show = missing.replace('Missing ', '').replace('index', 'series_index') in gaps
+            if show and confidence != 'Any confidence':
+                value = entry.confidence()
+                confident = self.settings.get_float(
+                    'AO_UI_CONFIDENT_THRESHOLD', 0.80)
+                doubtful = self.settings.get_float(
+                    'AO_UI_DOUBTFUL_THRESHOLD', 0.50)
+                if confidence == f'{round(confident * 100)}% and above':
+                    show = value >= confident
+                elif confidence == (f'{round(doubtful * 100)}% to '
+                                    f'{round(confident * 100) - 1}%'):
+                    show = doubtful <= value < confident
+                elif confidence == f'Below {round(doubtful * 100)}%':
+                    show = value < doubtful
+                elif confidence.startswith('At least'):
+                    show = value >= self._custom_confidence
+            if show and shape is not None:
+                show = bool(shape(entry))
+            if show and folder_filter is not None:
+                try:
+                    entry_folder = Path(entry.folder).resolve()
+                    show = (entry_folder == folder_filter
+                            or folder_filter in entry_folder.parents)
+                except OSError:
+                    show = False
+            if show and self.unsaved_filter.isChecked():
+                show = entry.entry_id in unsaved_ids
+
+            self.table.setRowHidden(row, not show)
+            visible += show
+
+        total = self.table.rowCount()
+        self.count_label.setText(f'{visible} of {total}')
+
+    # ----------------------------------------------------------------- events
+
+    def _selection_changed(self) -> None:
+        entries = self.selected_entries()
+        self.why_panel.show_entry(entries[0] if entries else None,
+                                  extra_selected=max(0, len(entries) - 1))
+        # Half the toolbar acts on the selection, so it follows the selection.
+        self.refresh_action_states()
+
+    def _item_edited(self, item: QTableWidgetItem) -> None:
+        """A manually typed value is authoritative - source 'user', confidence 1.0."""
+        if self._updating:
+            return
+        field = EDITABLE.get(item.column())
+        if field is None:
+            return
+        entry = self._entry_at(item.row())
+        if entry is None:
+            return
+
+        value = item.text().strip()
+        current = entry.get_field(field)
+        if value == str(current.value):
+            return
+
+        from ..models import Field, clean_value
+        # The Number column shows "02" for a stored "2"; committing it unchanged is
+        # not an edit.
+        if field == 'series_index' and clean_value(field, value) == str(current.value):
+            return
+        cleaned = clean_value(field, value)
+        self._record_edit(f'{field} typed on "{self._label_for(entry)}"',
+                          [(entry.entry_id, field, current)])
+        setattr(entry, field, Field(value=cleaned, source='user', confidence=1.0))
+        entry.log('user', f'{field} set manually to "{cleaned}"')
+        self._fill_row(item.row(), entry)
+        self.why_panel.show_entry(entry)
+        self.entry_changed(entry)
+
+    def entry_changed(self, entry: BookEntry) -> None:
+        """Hook the controller overrides to persist changes."""
+
+    # ----------------------------------------------------------- context menu
+
+    def _show_context_menu(self, position) -> None:
+        """Everything here acts on the *whole* selection, never on just the first row."""
+        index = self.table.indexAt(position)
+        entries = self.selected_entries()
+        if not entries:
+            return
+
+        count = len(entries)
+        # One way of saying "this many". Every entry that acts on the whole selection
+        # gets the same bare "(5)" - "Copy files (5)" and "Set series (5)" are the
+        # same kind of statement, so they are not written two different ways.
+        suffix = '' if count == 1 else f' ({count})'
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+
+        pending_section = ['']
+
+        def section(title: str) -> None:
+            """Remember a heading. It is only drawn once something lands under it."""
+            pending_section[0] = title
+
+        def add(text: str, slot, tooltip: str = '', enabled: bool = True):
+            """One menu entry, or nothing at all.
+
+            An entry that cannot be used is not shown. No greyed-out rows, no "-
+            select two or more rows" suffixes explaining why you may not have it: the
+            menu lists what you can do to this selection, right now, and nothing else.
+            A heading with nothing under it is not drawn either.
+            """
+            if not enabled:
+                return None
+            draw_section()
+            action = menu.addAction(text, slot)
+            if tooltip:
+                action.setToolTip(tooltip)
+            return action
+
+        def draw_section() -> None:
+            if pending_section[0]:
+                if menu.actions():
+                    menu.addSeparator()
+                heading = menu.addAction(pending_section[0])
+                heading.setEnabled(False)
+                font = QFont(menu.font())
+                font.setBold(True)
+                font.setPointSizeF(max(7.0, menu.font().pointSizeF() - 1.0))
+                font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
+                heading.setFont(font)
+                pending_section[0] = ''
+
+        multiple = count > 1
+        mergeable = [e for e in entries if len(e.audio_files) > 1]
+        applied = [e for e in entries if e.applied_path]
+        # Which column was actually right-clicked. Author- and series-specific
+        # actions only appear on their own column, because "set author" offered
+        # from the Title cell is an action you did not ask for on a field you were
+        # not looking at.
+        clicked = EDITABLE.get(self.table.columnAt(position.x()))
+
+        # Ordered the way the work goes: identify it, correct it, then act on the
+        # files. Destructive things last, where they are hard to hit.
+        section('IDENTIFY')
+        add(f'Identify{suffix}  (F4)', lambda: self._request_resolve(),
+            'Run the ticked sources over every selected row')
+        add(f'Load from disk{suffix}...',
+            lambda: self._request_load(selected_only=True),
+            'Read these books from disk again. You choose what to keep of what we '
+            'already worked out.')
+        clicked_entry = self._entry_at(index.row()) if index.isValid() else None
+        if clicked_entry is not None:
+            folder_name, folder_path = self._first_input_folder(clicked_entry)
+            add(f'Filter by {folder_name}',
+                lambda: self._set_folder_filter(folder_name, folder_path),
+                f'Show only books under the first input subfolder named {folder_name}')
+        # One source per entry rather than a dialog with a dropdown: picking a
+        # source is one click, not a click, a scroll and an OK.
+        sources = menu.addMenu('Identify with...')
+        sources.setToolTipsVisible(True)
+        for tier, title, _key, tooltip in MODES:
+            action = sources.addAction(
+                title, lambda _=False, t=tier: self.resolve_requested.emit(entries, [t]))
+            action.setToolTip(tooltip)
+            if tier == 'api':
+                # "Book Databases" is five separate databases, and running the tier ran
+                # whichever of them answered first. They are listed individually so
+                # one can be asked by name, and the tier entry above now means
+                # "every one of them".
+                self._add_database_menu(sources, entries)
+        waiting = self.waiting_entries_provider() or set()
+        queued_entries = [e for e in entries if e.entry_id in waiting]
+        add('Remove from queue' + (f' ({len(queued_entries)})'
+                                   if len(queued_entries) > 1 else ''),
+            lambda: self.dequeue_entries_requested.emit(
+                [e.entry_id for e in queued_entries]),
+            'Take the selected books out of the identification queue before '
+            'their turn comes',
+            enabled=bool(queued_entries))
+        self._add_run_issue_menu(menu, entries)
+        add(f'Preview{suffix}  (F7)',
+            lambda: self.apply_requested.emit(entries, True),
+            'Show where the selected rows would end up, without touching any files')
+        goodreads_field = clicked if clicked in ('author', 'title', 'series') else None
+        goodreads_target = FIELD_LABELS[goodreads_field] if goodreads_field else 'All fields'
+        # F9 is the all-fields search, so it is only advertised on the all-fields entry.
+        add(f'Search Goodreads for {goodreads_target}{suffix}'
+            + ('' if goodreads_field else '  (F9)'),
+            lambda: self._search_goodreads(entries, goodreads_field),
+            f'Open a Goodreads search using {goodreads_target.lower()}')
+
+        section('EDIT')
+        # "Rename cell" named the widget rather than the thing: you clicked Author,
+        # so the menu says Author. Falls back to the generic word only when the click
+        # landed somewhere with no field behind it.
+        field_label = FIELD_LABELS.get(clicked, 'cell')
+        add(f'Rename {field_label}  (F2)', self._edit_current_cell,
+            f'Edit the {field_label.lower()} of this row, exactly as '
+            'double-clicking it does',
+            enabled=not multiple)
+        add(f'Edit in a grid{suffix}...  (F2)', lambda: self._edit_grid(entries),
+            'Every field of every selected row, editable from the keyboard',
+            enabled=multiple)
+        # Writing one value across many rows only makes sense for fields books
+        # share, and only on the column you clicked.
+        if clicked in ('author', 'series') and multiple:
+            label = clicked
+            add(f'Set {label}{suffix}...',
+                lambda _=False, f=clicked: self._bulk_edit(f),
+                f'Type one {label} and write it to every selected row')
+            first = entries[0].value(clicked)
+            add(f'Set {label} to "{first}"{suffix}',
+                lambda _=False, f=clicked: self._fill_down(entries, f),
+                f'Write the {label} of the first selected row onto the other '
+                f'{count - 1}',
+                enabled=bool(first))
+        # Named after what it would actually blank: "Clear" alone gave no way to tell
+        # a three-cell selection from a three-column one until after you had done it.
+        add('Copy cells  (Ctrl+C)', self._copy_selected_cells,
+            'Copy the selected cells as tab-separated text - paste them back here, '
+            'or into a spreadsheet')
+        add('Paste cells  (Ctrl+V)', self._paste_into_selection,
+            'Write the clipboard into the selection. One value fills every selected '
+            'cell; a block of values is laid out from the top-left of the selection.')
+        targets = self._clear_targets()
+        # Del clears name cells, and asks to remove the book when the selection
+        # reaches any other column. The menu says the same thing the key does.
+        delete_removes = not all(i.column() in EDITABLE
+                                 for i in self.table.selectedIndexes())
+        add(self._clear_label(targets) + ('' if delete_removes else '  (Del)'),
+            self._clear_selected_cells,
+            'Blank the selected cells so they can be identified again. Select whole '
+            'columns or individual cells to choose what gets cleared.',
+            enabled=bool(targets))
+        if delete_removes:
+            add(f'Remove{suffix}...  (Del)', lambda: self._ask_remove(entries),
+                'Take the selected books off the list, or delete their files')
+
+        if SHOW_REVIEW_SECTION:
+            section('REVIEW')
+            add(f'Approve{suffix}  (F5)',
+                lambda: self._set_status_selected(STATUS_APPROVED),
+                'Mark every selected row approved, ready to be applied')
+            add(f'Reject{suffix}  (F6)',
+                lambda: self._set_status_selected(STATUS_REJECTED),
+                'Mark every selected row rejected - rejected rows are never applied')
+            add(f'Reset to pending{suffix}',
+                lambda: self._set_status_selected(STATUS_PENDING),
+                'Clear the decision on every selected row and return it to pending')
+
+        section('FILES')
+        cover_row = index.row() if index.isValid() else self.table.currentRow()
+        add('View artwork', lambda _=False, r=cover_row: self._open_cover_viewer(r),
+            "Show this book's cover and images at full size",
+            enabled=cover_row >= 0)
+        add(f'Open {"folders" if multiple else "folder"}{suffix}  (Ctrl+O)',
+            lambda: self._open_folders(entries),
+            'Open each selected book folder in the file manager')
+        self._add_copy_entries(menu, add, entries, suffix)
+        add('Merge chapters into one .m4b...'
+            + (f' ({len(mergeable)})' if len(mergeable) > 1 else ''),
+            lambda: self._merge_selected(mergeable),
+            'Join the chapter files of every selected multi-file book into one .m4b',
+            enabled=bool(mergeable))
+        same_folder = len({os.path.normcase(os.path.normpath(e.folder))
+                           for e in entries}) == 1
+        add(f'Combine into one book{suffix}...',
+            lambda: self._confirm_combine(entries),
+            'Join the selected entries into a single book with all their files. '
+            'Kept when the folder is loaded again.',
+            enabled=multiple and same_folder)
+        add(f'Open where it was written{suffix}',
+            lambda: self._open_folders(applied),
+            'Open the output folder these rows were written to',
+            enabled=bool(applied))
+
+        remove_menu = menu.addMenu(f'Remove{suffix}')
+        remove_menu.setToolTipsVisible(True)
+        action = remove_menu.addAction('Remove from list',
+                                       lambda: self._remove_from_list(entries))
+        action.setToolTip('Take the selected books off the list. Nothing on disk '
+                          'is touched.')
+        action = remove_menu.addAction('Delete from drive (Recycle Bin)...',
+                                       lambda: self._delete_from_drive(entries))
+        action.setToolTip("Move the selected books' audio and image files to the "
+                          'Recycle Bin, and take them off the list')
+
+        ignored_warnings = [entry for entry in entries
+                            if entry.warnings and entry.warnings_silenced]
+        if ignored_warnings:
+            section('WARNING')
+            unignore = add(
+                'Unignore warning' + (f' ({len(ignored_warnings)})'
+                                      if len(ignored_warnings) > 1 else ''),
+                lambda: self._unignore_warnings(ignored_warnings),
+                'Show the ignored warning badge again')
+            if unignore is not None:
+                unignore.setIcon(make_icon('warning', STATUS_TEXT['risky'], 18))
+
+        menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _add_database_menu(self, parent: QMenu, entries: List[BookEntry]) -> None:
+        """The individual book databases, under the "Book DBs" tier entry.
+
+        Running the tier queries every configured database; these run exactly one, by
+        name, and always go to the network - a source you asked for by name replaying a
+        cached miss is indistinguishable from that source being broken.
+        """
+        from ..api_query import AVAILABLE_SOURCES
+
+        configured = [s.lower() for s in self.settings.get_list('AO_API_SOURCES')]
+        submenu = parent.addMenu('Database...')
+        submenu.setToolTipsVisible(True)
+        for key, label, blurb in AVAILABLE_SOURCES:
+            action = submenu.addAction(
+                label + ('' if key in configured else '   (not enabled in Settings)'),
+                lambda _=False, k=key: self.resolve_requested.emit(
+                    entries, [f'api:{k}']))
+            action.setToolTip(f'{blurb}\nQueries only this database, ignoring the '
+                              f'cache.')
+
+    # ------------------------------------------------------------- copy actions
+
+    def _copy_recents(self) -> List[str]:
+        """The copy actions in most-recently-used order, unknown ones dropped."""
+        stored = [key.strip() for key
+                  in (self.settings.get('AO_UI_COPY_RECENT_LIST') or '').split(',')
+                  if key.strip() in COPY_BY_ID]
+        # Anything never used yet keeps its declaration order behind the used ones.
+        return stored + [key for key, *_ in COPY_ACTIONS if key not in stored]
+
+    def _copy_used(self, key: str) -> None:
+        """Remember that this copy action was the last one used."""
+        order = [key] + [other for other in self._copy_recents() if other != key]
+        self.settings.set('AO_UI_COPY_RECENT_LIST', ','.join(order))
+        try:
+            self.settings.save()
+        except OSError as exc:
+            logger.warning('Could not save the copy history: %s', exc)
+
+    def _run_copy(self, key: str, entries: List[BookEntry]) -> None:
+        action = COPY_BY_ID.get(key)
+        if action is None:
+            return
+        self._copy_used(key)
+        getattr(self, action[2])(entries)
+
+    def _add_copy_entries(self, menu: QMenu, add, entries: List[BookEntry],
+                          suffix: str) -> None:
+        """The recently-used copy actions, then a "Copy..." submenu with all of them.
+
+        How many get promoted out of the submenu is AO_UI_COPY_RECENTS. Ask for as many
+        as there are actions (or more) and they are all promoted and the submenu goes
+        away - at that point it would only be a second copy of the same list.
+        """
+        wanted = max(0, self.settings.get_int('AO_UI_COPY_RECENTS', 1))
+        recents = self._copy_recents()
+        promoted = recents[:min(wanted, len(COPY_ACTIONS))]
+
+        for key in promoted:
+            _key, label, _method, tooltip = COPY_BY_ID[key]
+            add(f'{label}{suffix}', lambda _=False, k=key: self._run_copy(k, entries),
+                tooltip)
+
+        if len(promoted) >= len(COPY_ACTIONS):
+            return
+
+        # `add` draws the pending section heading, so the submenu is attached through
+        # a placeholder that guarantees FILES is on screen before it appears.
+        submenu = QMenu('Copy...', menu)
+        submenu.setToolTipsVisible(True)
+        submenu.setToolTip('Everything that can be put on the clipboard for this '
+                           'selection')
+        for key, label, _method, tooltip in COPY_ACTIONS:
+            action = submenu.addAction(
+                f'{label}{suffix}', lambda _=False, k=key: self._run_copy(k, entries))
+            action.setToolTip(tooltip)
+        if promoted:
+            menu.addMenu(submenu)
+        else:
+            # Nothing was promoted, so this submenu is the first thing in the section
+            # and has to carry the heading itself.
+            placeholder = add('Copy...', lambda: None)
+            if placeholder is not None:
+                placeholder.setMenu(submenu)
+
+    def _preview_names(self, entries: List[BookEntry]) -> None:
+        """Render the current templates against the selection, as plain text.
+
+        No longer on the right-click menu: it and "Preview apply" answered the same
+        question, and the apply preview answers it better - it resolves against the
+        real output folder and shows collisions. Kept because it is the only view of
+        the templates alone, and cheap to put back on a menu.
+        """
+        from ..paths import build_destination, render_template
+
+        output = self.settings.get('AO_OUTPUT_DIR')
+        folder_template = self.settings.get('AO_OUTPUT_TEMPLATE')
+        file_template = self.settings.get('AO_FILE_TEMPLATE')
+        renaming = self.settings.get_bool('AO_RENAME_FILES', True)
+
+        lines = [f'Output folder: {output}',
+                 f'Folder template: {folder_template}',
+                 f'File template:   {file_template if renaming else "(renaming is off)"}',
+                 '']
+        for entry in entries:
+            values = {'author': entry.value('author'), 'series': entry.value('series'),
+                      'series_index': entry.value('series_index'),
+                      'title': entry.value('title')}
+            folder = render_template(folder_template, values)
+            lines.append(folder + '/')
+            width = max(2, len(str(len(entry.audio_files))))
+            for number, name in enumerate(entry.audio_files, start=1):
+                if renaming:
+                    suffix = Path(name).suffix.lower()
+                    rendered = render_template(file_template, dict(
+                        values,
+                        file_index=(f'{number:0{width}d}'
+                                    if len(entry.audio_files) > 1 else ''),
+                        extension=suffix.lstrip('.')))
+                    if not rendered.lower().endswith(suffix):
+                        rendered += suffix
+                else:
+                    rendered = name
+                lines.append(f'    {rendered}')
+            lines.append('')
+        self.show_report('Preview names', '\n'.join(lines))
+
+    def _run_one_source(self, tier: str) -> None:
+        """The Run button on a card in the explanation panel.
+
+        `tier` is either a tier name ("api") or one database within it ("api:itunes"),
+        which is what the Run button on a single database's card sends.
+        """
+        entries = self.selected_entries()
+        if not entries:
+            self.show_message('Select a row first')
+            return
+        name, _, source = tier.partition(':')
+        action = 'Queued' if self._busy else 'Asking'
+        self.show_message(f'{action} {source or name} for this book...')
+        # "Run again" on a card means "ask it now", so it skips the cache. Identify
+        # everywhere else reuses what was already looked up.
+        self.refresh_requested.emit(entries[:1], [tier])
+
+    def _label_for(self, entry: BookEntry) -> str:
+        """The shortest thing that names a book in a message: its title, else its file."""
+        return entry.value('title') or Path(entry.primary_audio).stem
+
+    def _fill_down(self, entries: List[BookEntry], field: str) -> None:
+        """The first row's value for one field, written onto every other selected row.
+
+        The menu entry names the value it is about to write, so this needs no
+        confirmation dialog - you already read what you were choosing, and Ctrl+Z
+        puts it back.
+        """
+        if len(entries) < 2:
+            return
+        value = entries[0].value(field)
+        if not value:
+            return
+        self._write_field(entries[1:], field, str(value))
+
+    def set_row_progress(self, entry_id: str, fraction: Optional[float],
+                         label: str = '', animate: bool = False) -> None:
+        """Show (or clear, with ``fraction=None``) a progress wash across one row."""
+        if fraction is None:
+            self._row_progress_animations.pop(entry_id, None)
+            self._row_progress.pop(entry_id, None)
+        else:
+            target = max(0.0, min(1.0, fraction))
+            current = self._row_progress.get(entry_id, (0.0, ''))[0]
+            if animate and target > current:
+                self._row_progress_animations[entry_id] = (
+                    current, target, time.monotonic(), label)
+                fraction = current
+            else:
+                self._row_progress_animations.pop(entry_id, None)
+                fraction = target
+            self._row_progress[entry_id] = (fraction, label)
+
+        row = self._row_for(entry_id)
+        if row is None:
+            return
+        self._refresh_status_cell(entry_id, row)
+        item = self.table.item(row, COL_FILES)
+        if item is None:
+            return
+        previous, self._updating = self._updating, True
+        item.setData(ROLE_PROGRESS, None if fraction is None else fraction)
+        item.setData(ROLE_PROGRESS_TEXT, label)
+        self._updating = previous
+        self.table.viewport().update()
+
+    def _advance_row_progress_animations(self) -> None:
+        """Move tier jumps to their reported position over two seconds."""
+        now = time.monotonic()
+        for entry_id, (start, target, started, label) in list(
+                self._row_progress_animations.items()):
+            elapsed = min(1.0, (now - started) / 2.0)
+            value = start + (target - start) * elapsed
+            self._row_progress[entry_id] = (value, label)
+            row = self._row_for(entry_id)
+            if row is not None:
+                item = self.table.item(row, COL_FILES)
+                if item is not None:
+                    item.setData(ROLE_PROGRESS, value)
+                    item.setData(ROLE_PROGRESS_TEXT, label)
+            if elapsed >= 1.0:
+                self._row_progress_animations.pop(entry_id, None)
+
+    def update_identification_progress(self, entry: BookEntry, fraction: float,
+                                       tier: str, label: str) -> None:
+        """Refresh both progress displays when an identification tier reports."""
+        self.set_row_progress(entry.entry_id, fraction, label, animate=True)
+        self.why_panel.set_running(entry, tier)
+
+    def finish_identification_entry(self, entry: BookEntry) -> None:
+        # The job is over (finished, cancelled or crashed): a step still marked as
+        # running never got to finish.
+        if entry.identify_state == 'running':
+            entry.identify_state = 'stopped'
+        self.set_row_progress(entry.entry_id, None)
+        self.why_panel.clear_running(entry)
+
+    def set_identification_queued(self, entry: BookEntry, tier: str) -> None:
+        self.why_panel.set_queued(entry, tier)
+
+    def clear_identification_queued(self, entry_id: str) -> None:
+        self.why_panel.clear_queued(entry_id)
+
+    def _merge_selected(self, entries: List[BookEntry]) -> None:
+        """Set the merges up in one dialog, then queue them like any other job."""
+        from .merge_dialog import MergeDialog
+
+        if not entries:
+            return
+        dialog = MergeDialog(entries, self.settings,
+                             self.settings.get_path('AO_OUTPUT_DIR'), parent=self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not accepted:
+            if dialog.wants_identify:
+                # They chose "identify these first" - so do that, rather than making
+                # them find the menu entry again.
+                self._request_resolve_on(entries)
+            return
+
+        plans = dialog.plans()
+        if not plans:
+            self.show_message('Nothing could be named, so nothing was merged')
+            return
+        for plan in plans:
+            self.merge_requested.emit(plan)
+        self.show_message(f'Queued {plural(len(plans), "merge")}')
+
+    def _confirm_combine(self, entries: List[BookEntry]) -> None:
+        entries = self.in_view_order(entries)
+        if len(entries) < 2:
+            return
+        conflicts = {}
+        for name in IDENTITY_FIELDS:
+            choices = {}
+            for entry in entries:
+                choices.setdefault(entry.value(name), entry.get_field(name))
+            if len(choices) > 1:
+                conflicts[name] = choices
+        fields = {}
+        if conflicts:
+            dialog = QDialog(self)
+            dialog.setWindowTitle('Combine entries')
+            layout = QVBoxLayout(dialog)
+            grid = QGridLayout()
+            layout.addLayout(grid)
+            combos = {}
+            for row, (name, choices) in enumerate(conflicts.items()):
+                label = QLabel(FIELD_LABELS[name])
+                combo = QComboBox()
+                combo.setToolTip(f'Choose the {FIELD_LABELS[name].lower()} to keep')
+                combo.addItem('Choose...', None)
+                for value, field in choices.items():
+                    combo.addItem(value or '(empty)', field)
+                label.setBuddy(combo)
+                grid.addWidget(label, row, 0)
+                grid.addWidget(combo, row, 1)
+                combos[name] = combo
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+            combine = buttons.addButton('Combine', QDialogButtonBox.ButtonRole.AcceptRole)
+            combine.setToolTip('Combine the selected entries')
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip('Cancel')
+            combine.setEnabled(False)
+            for combo in combos.values():
+                combo.currentIndexChanged.connect(
+                    lambda _index: combine.setEnabled(
+                        all(box.currentIndex() > 0 for box in combos.values())))
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            fields = {name: combo.currentData() for name, combo in combos.items()}
+            self.combine_requested.emit(entries, fields)
+            return
+        files = sum(len(entry.audio_files) for entry in entries)
+        if QMessageBox.question(
+                self, 'Combine entries',
+                f'Combine {len(entries)} entries into one book with {files} files?\n\n'
+                f'{entries[0].value("author")} - {entries[0].value("title")}'
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.combine_requested.emit(entries, fields)
+
+    def show_combined_entry(self, combined: BookEntry,
+                            entries: List[BookEntry]) -> None:
+        """Refresh the retained row without rebuilding or sorting the table."""
+        removed = {entry.entry_id for entry in entries
+                   if entry.entry_id != combined.entry_id}
+        scroll = self.table.verticalScrollBar().value()
+        affected = set()
+        previous = self._updating
+        self._updating = True
+        try:
+            with QSignalBlocker(self.table), QSignalBlocker(self.table.selectionModel()):
+                for entry_id in removed:
+                    key = self._identity_keys.pop(entry_id, None)
+                    group = self._identity_groups.get(key, set())
+                    group.discard(entry_id)
+                    affected.update(group)
+                    if not group:
+                        self._identity_groups.pop(key, None)
+                    self.entries.pop(entry_id, None)
+                    self._cover_items.pop(entry_id, None)
+                for row in range(self.table.rowCount() - 1, -1, -1):
+                    item = self.table.item(row, COL_FILES)
+                    if item.data(Qt.ItemDataRole.UserRole) in removed:
+                        self.table.removeRow(row)
+                self.entries[combined.entry_id] = combined
+                self.row_ids = [self._entry_at(row).entry_id
+                                for row in range(self.table.rowCount())]
+                for entry_id in affected | {combined.entry_id}:
+                    row = self._row_for(entry_id)
+                    if row is not None:
+                        self._fill_row(row, self.entries[entry_id])
+                row = self._row_for(combined.entry_id)
+                if row is not None:
+                    self.table.selectRow(row)
+        finally:
+            self._updating = previous
+        self._apply_filters()
+        self.refresh_stats()
+        self._selection_changed()
+        self.table.verticalScrollBar().setValue(scroll)
+
+    def _remove_from_list(self, entries: List[BookEntry]) -> None:
+        count = len(entries)
+        self.remove_entries_requested.emit(
+            [entry.entry_id for entry in entries],
+            f'Removed {count} book{"" if count == 1 else "s"} from the list')
+
+    def _book_paths(self, entry: BookEntry) -> List[Path]:
+        """The files on disk that belong to this book: its audio and its images."""
+        folder = Path(entry.folder)
+        names = list(entry.audio_files) + list(entry.image_files)
+        return [folder / name for name in dict.fromkeys(names)
+                if (folder / name).exists()]
+
+    def _delete_from_drive(self, entries: List[BookEntry]) -> None:
+        paths = [path for entry in entries for path in self._book_paths(entry)]
+        count = len(entries)
+        books = f'{count} book{"" if count == 1 else "s"}'
+        if QMessageBox.question(
+                self, 'Delete from drive',
+                f'Move {len(paths)} file{"" if len(paths) == 1 else "s"} of {books} '
+                f'to the Recycle Bin and remove {"it" if count == 1 else "them"} '
+                f'from the list?\n\n'
+                f'{entries[0].value("author")} - {entries[0].value("title")}'
+                + (f'\n... and {count - 1} more' if count > 1 else ''),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        failed: List[str] = []
+        removed: List[str] = []
+        for entry in entries:
+            ok = True
+            for path in self._book_paths(entry):
+                if not _move_to_trash(path):
+                    failed.append(str(path))
+                    ok = False
+            if ok:
+                folder = Path(entry.folder)
+                # The book's own folder, emptied by the above, goes with it.
+                try:
+                    if (not entry.is_multi_book_folder and folder.is_dir()
+                            and not any(folder.iterdir())):
+                        _move_to_trash(folder)
+                except OSError:
+                    pass
+                removed.append(entry.entry_id)
+        message = (f'Moved {len(removed)} book{"" if len(removed) == 1 else "s"} '
+                   f'to the Recycle Bin')
+        if removed:
+            self.remove_entries_requested.emit(removed, message)
+        if failed:
+            QMessageBox.warning(
+                self, 'Delete from drive',
+                f'Could not move {len(failed)} file{"" if len(failed) == 1 else "s"} '
+                f'to the Recycle Bin. Those books stay on the list.\n\n'
+                + '\n'.join(failed[:20])
+                + (f'\n... and {len(failed) - 20} more' if len(failed) > 20 else ''))
+
+    def _request_resolve_on(self, entries: List[BookEntry]) -> None:
+        tiers = self.selected_tiers()
+        if not tiers:
+            self.show_message('Tick at least one source in the Sources menu')
+            return
+        self.continue_requested.emit(entries, tiers)
+
+    def _open_folders(self, entries: List[BookEntry]) -> None:
+        """Open each book's folder on its own, with the OS's default folder handler."""
+        folders = {}
+        for entry in entries:
+            folder = Path(entry.applied_path or entry.folder).absolute()
+            folders.setdefault(os.path.normcase(os.path.normpath(str(folder))), folder)
+        count = len(folders)
+        if count > 10 and QMessageBox.question(
+                self, 'Open folders',
+                f'{count} folders will be opened. Are you sure?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for folder in folders.values():
+            if not open_in_os(folder):
+                self.show_message(f'Could not open {self.settings.display_path(folder)}')
+                return
+        if count:
+            self.show_message(f'Opened {count} folder(s)')
+
+    def _copy_paths(self, entries: List[BookEntry]) -> None:
+        text = '\n'.join(entry.applied_path or entry.folder for entry in entries)
+        self._to_clipboard(text, f'Copied {len(entries)} path(s)')
+
+    def _copy_rows(self, entries: List[BookEntry]) -> None:
+        """The selection as a Markdown table, with a header row and the path.
+
+        This used to emit only the four identity fields, so copying a row that was not
+        identified yet put three tab characters on the clipboard - indistinguishable
+        from having copied nothing. The path is always known, so there is always
+        something to paste.
+        """
+        header = ['Path', 'Author', 'Series', '#', 'Title', 'Confidence', 'Status']
+        rows = [[
+            self._relative_folder(entry),
+            entry.value('author'), entry.value('series'),
+            str(entry.value('series_index')), entry.value('title'),
+            f'{entry.confidence():.0%}', self._display_status(entry)[1],
+        ] for entry in entries]
+
+        # Pad the columns so the table is readable as plain text too - Markdown does
+        # not care about the alignment, but whoever pastes it somewhere else does.
+        widths = [max(len(header[i]), *(len(r[i]) for r in rows)) if rows
+                  else len(header[i]) for i in range(len(header))]
+
+        def line(cells):
+            return '| ' + ' | '.join(c.replace('|', r'\|').ljust(widths[i])
+                                     for i, c in enumerate(cells)) + ' |'
+
+        text = '\n'.join([line(header),
+                          '|-' + '-|-'.join('-' * w for w in widths) + '-|',
+                          *(line(r) for r in rows)])
+        self._to_clipboard(text,
+                           f'Copied {len(entries)} row(s) as a Markdown table')
+
+    def _audio_paths(self, entries: List[BookEntry]) -> List[Path]:
+        """Every audio file of every selected book, in selection order."""
+        return [Path(entry.applied_path or entry.folder) / name
+                for entry in entries for name in entry.audio_files]
+
+    def _copy_file_paths(self, entries: List[BookEntry]) -> None:
+        paths = self._audio_paths(entries)
+        if not paths:
+            self.show_message('The selection has no audio files')
+            return
+        self._to_clipboard('\n'.join(str(p) for p in paths),
+                           f'Copied {len(paths)} file path(s)')
+
+    def _copy_file_names(self, entries: List[BookEntry]) -> None:
+        names = [name for entry in entries for name in entry.audio_files]
+        if not names:
+            self.show_message('The selection has no audio files')
+            return
+        self._to_clipboard('\n'.join(names), f'Copied {len(names)} file name(s)')
+
+    def _copy_files(self, entries: List[BookEntry]) -> None:
+        """The files themselves on the clipboard, pasteable in a file manager.
+
+        A book that is the only one in its folder copies the folder instead: the
+        folder is the book in that case, and pasting the loose files would leave the
+        cover art and the sidecars behind.
+        """
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtCore import QMimeData
+        from PyQt6.QtWidgets import QApplication
+
+        # How many rows share each folder - across the whole table, not just the
+        # selection, so copying one row out of a three-book folder still copies files.
+        occupants: Dict[str, int] = {}
+        for entry in self.entries.values():
+            occupants[entry.folder] = occupants.get(entry.folder, 0) + 1
+
+        paths: List[Path] = []
+        folders = 0
+        for entry in entries:
+            folder = entry.applied_path or entry.folder
+            if occupants.get(entry.folder, 1) <= 1:
+                paths.append(Path(folder))
+                folders += 1
+            else:
+                paths.extend(Path(folder) / name for name in entry.audio_files)
+
+        paths = [p for p in paths if p.exists()]
+        if not paths:
+            self.show_message('Nothing on disk to copy for the selection')
+            return
+
+        data = QMimeData()
+        data.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+        data.setText('\n'.join(str(p) for p in paths))
+        QApplication.clipboard().setMimeData(data)
+        detail = (f'{folders} folder(s)' if folders == len(paths)
+                  else f'{len(paths)} item(s)')
+        self.show_message(f'Copied {detail} to the clipboard - paste in a file manager')
+
+    def _to_clipboard(self, text: str, message: str) -> None:
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(text)
+        self.show_message(message)
+
+    # ------------------------------------------------------------------ undo
+
+    def _record_edit(self, label: str, changes: List[tuple]) -> None:
+        """Remember the *before* state of an edit so Ctrl+Z can put it back.
+
+        `changes` is (entry_id, field name, the Field as it was). Every path that
+        writes a field from the UI calls this first - typing in a cell, clearing
+        cells, the grid editor, filling a value down, bulk edit. Whatever a source
+        writes during identification is not recorded: that already has its own undo
+        in the form of re-running or clearing the row.
+        """
+        if not changes:
+            return
+        self._edit_undo.append({
+            'label': label,
+            'changes': changes,
+            # Where the apply journal stood when this edit happened, so an apply made
+            # afterwards is undone before the edits that preceded it.
+            'history': len(self.history_provider()),
+        })
+        del self._edit_undo[:-100]
+        # A new action branches the history: whatever had been undone can no longer be
+        # put back, because it is no longer what comes next.
+        self._edit_redo.clear()
+        self._refresh_history_dialog()
+        self.refresh_action_states()
+
+    def _snapshot(self, entries, fields: List[str]) -> List[tuple]:
+        """The current value of `fields` on `entries`, in _record_edit's shape."""
+        return [(entry.entry_id, name, entry.get_field(name))
+                for entry in entries for name in fields]
+
+    def _undo_last(self) -> None:
+        """One undo for the whole window: the last thing you did, whatever it was.
+
+        Edits and applies are two separate histories, so they are ordered by the
+        journal length captured with each edit: if the journal has grown since the
+        newest edit, an apply happened after it and that comes off first.
+        """
+        history = self.history_provider()
+        if self._edit_undo and self._edit_undo[-1]['history'] >= len(history):
+            self._undo_last_edit()
+            return
+        if not history:
+            self.show_message('Nothing to undo')
+            return
+        self.undo_requested.emit(len(history) - 1)
+
+    def _undo_last_edit(self) -> None:
+        record = self._edit_undo.pop()
+        # Capture what the cells hold *now*, before restoring - that is exactly what a
+        # redo has to put back, and it is only knowable at this moment.
+        after = [(entry_id, name, self.entries[entry_id].get_field(name))
+                 for entry_id, name, _field in record['changes']
+                 if entry_id in self.entries]
+        self._restore(record['changes'], 'undo')
+        self._edit_redo.append({'label': record['label'], 'changes': after,
+                                'history': record.get('history', 0)})
+        del self._edit_redo[:-100]
+        self.show_message(f'Undid: {record["label"]}')
+        self._refresh_history_dialog()
+
+    def _redo_last_edit(self) -> bool:
+        """Put back the most recently undone edit. False when there is nothing to redo."""
+        if not self._edit_redo:
+            return False
+        record = self._edit_redo.pop()
+        before = [(entry_id, name, self.entries[entry_id].get_field(name))
+                  for entry_id, name, _field in record['changes']
+                  if entry_id in self.entries]
+        self._restore(record['changes'], 'redo')
+        # Straight back onto the undo stack, without going through _record_edit -
+        # that would clear the redo stack we are in the middle of walking.
+        self._edit_undo.append({'label': record['label'], 'changes': before,
+                                'history': record.get('history', 0)})
+        self.show_message(f'Redid: {record["label"]}')
+        self._refresh_history_dialog()
+        return True
+
+    def _restore(self, changes: List[tuple], verb: str) -> None:
+        """Write a set of (entry_id, field, Field) back onto the entries, and repaint."""
+        touched = set()
+        for entry_id, name, field in changes:
+            entry = self.entries.get(entry_id)
+            if entry is None:
+                continue
+            setattr(entry, name, field)
+            entry.log('user', f'{name} restored by {verb}')
+            touched.add(entry_id)
+
+        for entry_id in touched:
+            row = self._row_for(entry_id)
+            if row is not None:
+                self._fill_row(row, self.entries[entry_id])
+            self.entry_changed(self.entries[entry_id])
+        self._apply_filters()
+        self.refresh_stats()
+        entries = [self.entries[i] for i in touched if i in self.entries]
+        if entries:
+            self.why_panel.show_entry(entries[0], extra_selected=len(entries) - 1)
+
+    def _redo_last(self) -> None:
+        """Ctrl+Y / Ctrl+Shift+Z."""
+        if not self._redo_last_edit():
+            self.show_message('Nothing to redo')
+
+    def _combined_history(self) -> List[dict]:
+        """Edits and applies as one chronological list, oldest first.
+
+        Left-clicking undo already treats them as one history - it compares journal
+        lengths to decide which came last - so the menu shows the same single list
+        rather than only the applies. Each entry is
+        ``{'kind', 'label', 'index'}``; ``index`` is the journal index for an apply.
+        """
+        applies = self.history_provider()
+        items: List[tuple] = []
+        for position, record in enumerate(self._edit_undo):
+            # (when it happened, edits-before-applies at the same point, order)
+            items.append(((record['history'], 0, position),
+                          {'kind': 'edit', 'label': record['label'], 'index': position}))
+        for index in range(len(applies)):
+            items.append(((index + 1, 1, index),
+                          {'kind': 'apply', 'label': str(applies[index]),
+                           'index': index}))
+        items.sort(key=lambda pair: pair[0])
+        return [entry for _, entry in items]
+
+    def history_state(self) -> Dict[str, List[dict]]:
+        """What the History window draws: what has been done, and what can be redone.
+
+        The future only ever contains edits. An apply is a filesystem transaction, and
+        offering to "redo" one from a list would mean silently moving files again from
+        a window whose job is to describe history - so undoing an apply simply ends the
+        redo chain, and the window says so.
+        """
+        past = [{'kind': step['kind'], 'label': step['label']}
+                for step in self._combined_history()]
+        future = [{'kind': 'edit', 'label': record['label']}
+                  for record in reversed(self._edit_redo)]
+        return {'past': past, 'future': future}
+
+    def _show_history_dialog(self) -> None:
+        from .history_dialog import HistoryDialog
+
+        if self._history_dialog is None:
+            dialog = HistoryDialog(self.history_state, parent=self)
+            dialog.undo_to.connect(self._undo_to_position)
+            dialog.redo_to.connect(self._redo_to_position)
+            dialog.finished.connect(lambda _: setattr(self, '_history_dialog', None))
+            self._history_dialog = dialog
+        self._history_dialog.refresh()
+        self._history_dialog.show()
+        self._history_dialog.raise_()
+        self._history_dialog.activateWindow()
+
+    def _refresh_history_dialog(self) -> None:
+        if self._history_dialog is not None:
+            self._history_dialog.refresh()
+        if self._finalize_log_dialog is not None:
+            self._finalize_log_dialog.refresh()
+
+    # ------------------------------------------------------------ run issues
+
+    def show_run_issues(self, summary: List[dict]) -> None:
+        """The queue drained with source problems: record them and raise the notice."""
+        from .run_issues_panel import RunIssuesPanel
+
+        for row in summary:
+            record = self._run_failures.setdefault(
+                row['key'], {'failed': set(), 'skipped': set()})
+            record.update(label=row['label'], message=row['message'],
+                          disabled=row['disabled'], tiers=row['tiers'])
+            record['failed'].update(row['failed'])
+            record['skipped'].update(row['skipped'])
+            record['failed'] -= record['skipped']
+        if self._run_issues_panel is None:
+            panel = RunIssuesPanel(self._run_issue_rows, parent=self.centralWidget())
+            panel.select_requested.connect(self._select_run_issue)
+            panel.requeue_requested.connect(self._requeue_run_issue)
+            panel.select_ids_requested.connect(self._select_entry_ids)
+            panel.requeue_ids_requested.connect(
+                lambda key, ids: self._requeue_run_issue([key], only=set(ids)))
+            self._run_issues_panel = panel
+        self._run_issues_panel.refresh()
+        if self._run_issue_rows():
+            self._run_issues_panel.show()
+            self._run_issues_panel.raise_()
+            self._place_run_issues()
+
+    def _run_issue_rows(self) -> List[dict]:
+        rows = []
+        for key, record in sorted(self._run_failures.items()):
+            failed = [i for i in record['failed'] if i in self.entries]
+            skipped = [i for i in record['skipped'] if i in self.entries]
+            if failed or skipped:
+                rows.append(dict(record, key=key, failed=failed, skipped=skipped,
+                                 books=len(failed) + len(skipped),
+                                 **self._run_issue_outcome(failed + skipped)))
+        return rows
+
+    def _run_issue_outcome(self, ids: List[str]) -> dict:
+        """Where the books a source let down ended up, using the other sources.
+
+        missing: no author or title. doubtful: both, but below the confident
+        threshold. fine: confidently identified anyway.
+        """
+        threshold = self.settings.get_float('AO_UI_CONFIDENT_THRESHOLD', 0.80)
+        missing, doubtful, fine = [], [], []
+        for entry_id in ids:
+            entry = self.entries[entry_id]
+            if entry.author.is_empty() or entry.title.is_empty():
+                missing.append(entry_id)
+            elif entry.confidence() < threshold:
+                doubtful.append(entry_id)
+            else:
+                fine.append(entry_id)
+        return {'missing': missing, 'doubtful': doubtful, 'fine': fine,
+                'threshold': threshold}
+
+    def _run_issue_entries(self, key: str) -> List[BookEntry]:
+        record = self._run_failures.get(key) or {}
+        ids = set(record.get('failed', ())) | set(record.get('skipped', ()))
+        return [self.entries[i] for i in ids if i in self.entries]
+
+    def clear_run_failures(self, entry_id: str, tiers: List[str]) -> None:
+        """A book is being identified again: forget the failures that run covers."""
+        tiers = list(tiers or [])
+        for key in list(self._run_failures):
+            covered = (key in tiers
+                       or key.split(':', 1)[0] in tiers)
+            if covered:
+                record = self._run_failures[key]
+                record['failed'].discard(entry_id)
+                record['skipped'].discard(entry_id)
+                if not record['failed'] and not record['skipped']:
+                    del self._run_failures[key]
+        if self._run_issues_panel is not None and self._run_issues_panel.isVisible():
+            self._run_issues_panel.refresh()
+            self._place_run_issues()
+
+    def _select_run_issue(self, keys: List[str]) -> None:
+        self._select_entry_ids(
+            [entry.entry_id for key in keys for entry in self._run_issue_entries(key)])
+
+    def _select_entry_ids(self, ids: List[str]) -> None:
+        from PyQt6.QtCore import QItemSelectionModel
+
+        ids = set(ids)
+        model = self.table.selectionModel()
+        self.table.clearSelection()
+        first = None
+        for row in range(self.table.rowCount()):
+            entry = self._entry_at(row)
+            if entry is None or entry.entry_id not in ids or self.table.isRowHidden(row):
+                continue
+            model.select(self.table.model().index(row, 0),
+                         QItemSelectionModel.SelectionFlag.Select
+                         | QItemSelectionModel.SelectionFlag.Rows)
+            first = row if first is None else first
+        if first is None:
+            self.show_message('Those books are hidden by the current filter')
+            return
+        self.table.scrollToItem(self.table.item(first, COL_TITLE))
+        self.show_message(f'Selected {plural(len(ids), "book")}')
+
+    def _requeue_run_issue(self, keys: List[str], only: Optional[set] = None) -> None:
+        """One identify job per source, for the books it failed or skipped."""
+        for key in keys:
+            record = self._run_failures.get(key)
+            entries = [e for e in self._run_issue_entries(key)
+                       if only is None or e.entry_id in only]
+            if record and entries:
+                self.resolve_requested.emit(entries, list(record['tiers']))
+
+    def _place_run_issues(self) -> None:
+        panel = self._run_issues_panel
+        if panel is None or not panel.isVisible():
+            return
+        parent = panel.parentWidget()
+        panel.fit()
+        panel.move(max(0, parent.width() - panel.width() - 16),
+                   max(0, parent.height() - panel.height() - 16))
+        panel.raise_()
+
+    def _add_run_issue_menu(self, menu: QMenu, entries: List[BookEntry]) -> None:
+        """Right-click: re-queue the selected books with the sources they failed."""
+        ids = {entry.entry_id for entry in entries}
+        hits = []
+        for row in self._run_issue_rows():
+            affected = ids & (set(row['failed']) | set(row['skipped']))
+            if affected:
+                hits.append((row, affected))
+        if not hits:
+            return
+        submenu = menu.addMenu('Re-queue failed sources...')
+        submenu.setToolTipsVisible(True)
+        for row, affected in hits:
+            action = submenu.addAction(
+                f'{row["label"]}  ({len(affected)})',
+                lambda _=False, k=row['key'], a=affected:
+                self._requeue_run_issue([k], only=a))
+            action.setToolTip(f'{row["message"]}\nIdentify these again with '
+                              f'{row["label"]} only')
+        if len(hits) > 1:
+            submenu.addSeparator()
+            submenu.addAction(
+                'All of them', lambda: self._requeue_run_issue(
+                    [row['key'] for row, _ in hits], only=ids))
+        submenu.addSeparator()
+        submenu.addAction('Show the run summary', self._show_run_issues_panel)
+
+    def _show_run_issues_panel(self) -> None:
+        self.show_run_issues([])
+
+    def show_finalize_log(self) -> None:
+        from .finalize_log_dialog import FinalizeLogDialog
+
+        if self._finalize_log_dialog is None:
+            dialog = FinalizeLogDialog(self.finalize_log_provider, parent=self)
+            dialog.revert_requested.connect(self.revert_requested.emit)
+            dialog.finished.connect(
+                lambda _: setattr(self, '_finalize_log_dialog', None))
+            self._finalize_log_dialog = dialog
+        self._finalize_log_dialog.refresh()
+        self._finalize_log_dialog.show()
+        self._finalize_log_dialog.raise_()
+        self._finalize_log_dialog.activateWindow()
+
+    def _undo_to_position(self, keep: int) -> None:
+        """Undo back until only the first `keep` steps of the history remain."""
+        total = len(self._combined_history())
+        if keep >= total:
+            return
+        self._undo_through(keep)
+        self._refresh_history_dialog()
+
+    def _redo_to_position(self, index: int) -> None:
+        """Redo forward through the future list, up to and including `index`."""
+        for _ in range(index + 1):
+            if not self._redo_last_edit():
+                break
+        self._refresh_history_dialog()
+
+    def _undo_through(self, position: int) -> None:
+        """Undo everything from `position` in the combined history onwards.
+
+        The two histories are rolled back in their own terms: the edits are popped
+        newest-first off the local stack, and the applies are handed to the
+        controller as one request for the oldest of them, which already means
+        "roll back that apply and everything after it".
+        """
+        targets = self._combined_history()[position:]
+        applies = [entry['index'] for entry in targets if entry['kind'] == 'apply']
+        for _ in [entry for entry in targets if entry['kind'] == 'edit']:
+            if self._edit_undo:
+                self._undo_last_edit()
+        if applies:
+            # Files are about to move back on disk. That is not something this window
+            # will offer to replay from a history list, so the redo chain ends here.
+            self._edit_redo.clear()
+            self.undo_requested.emit(min(applies))
+
+    # ---------------------------------------------------------------- actions
+
+    def _set_status_selected(self, status: str) -> None:
+        entries = self.selected_entries()
+        if not entries:
+            self.show_message('Select some rows first')
+            return
+        self._set_entries_status(entries, status, advance=True)
+
+    def _set_entries_status(self, entries: List[BookEntry], status: str,
+                            advance: bool = False) -> None:
+        if not entries:
+            return
+        blocked = 0
+        if status == STATUS_APPROVED:
+            allowed = [e for e in entries if not self._is_unresolved_duplicate(e)]
+            blocked = len(entries) - len(allowed)
+            if not allowed:
+                self.show_message(
+                    f'Not approved: {"this row duplicates" if blocked == 1 else "these rows duplicate"} '
+                    f'another row. Change the names, or ignore the warning.')
+                return
+            entries = allowed
+        # The book to move on to is picked before anything moves: after a re-sort,
+        # "the row below" is whichever book landed there, not the next one you saw.
+        next_id = self._next_book_id(entries) if advance else None
+        # Every row is written first and the table re-sorted once at the end, so no
+        # row moves while it is still being written.
+        previous = self._updating
+        self._updating = True
+        try:
+            for entry in entries:
+                entry.status = status
+                row = self._row_for(entry.entry_id)
+                if row is not None:
+                    self._fill_row(row, entry)
+                self.entry_changed(entry)
+        finally:
+            self._updating = previous
+        resorted = self.settings.get_bool('AO_UI_RESORT_LIVE', True)
+        if resorted:
+            self._sort_table()
+        self._apply_filters()
+        self.refresh_stats()
+        # A row vanishing on approve is the status filter doing its job, but it looks
+        # exactly like the row being deleted. Say which it was.
+        hidden = sum(1 for e in entries
+                     if (row := self._row_for(e.entry_id)) is not None
+                     and self.table.isRowHidden(row))
+        message = (f'{len(entries)} entr{"y" if len(entries) == 1 else "ies"} '
+                   f'set to {pretty_status(status)}')
+        if blocked:
+            message += (f' - {blocked} duplicate{"" if blocked == 1 else "s"} '
+                        f'not approved')
+        if hidden:
+            message += (f' - {hidden} no longer match the "'
+                        f'{self.status_filter.currentText()}" filter and are hidden, '
+                        f'not lost')
+        self.show_message(message)
+        if advance and self.settings.get_bool('AO_UI_ADVANCE_AFTER_DECISION', True):
+            self._advance_selection(next_id)
+        elif resorted:
+            # The rows just moved; keep the one you are on in view.
+            current = self.table.currentItem()
+            if current is not None:
+                self.table.scrollToItem(current)
+
+    def _next_book_id(self, entries: List[BookEntry]) -> Optional[str]:
+        """The first visible book below the selection that is not being changed."""
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not rows:
+            return None
+        changing = {entry.entry_id for entry in entries}
+        for row in range(rows[-1] + 1, self.table.rowCount()):
+            entry = self._entry_at(row)
+            if (entry is not None and not self.table.isRowHidden(row)
+                    and entry.entry_id not in changing):
+                return entry.entry_id
+        return None
+
+    def _advance_selection(self, next_id: Optional[str]) -> None:
+        """After a decision, move to the next book - keeps review flowing."""
+        row = self._row_for(next_id) if next_id else None
+        if row is not None and not self.table.isRowHidden(row):
+            self.table.selectRow(row)
+            self.table.scrollToItem(self.table.item(row, COL_TITLE))
+
+    def _edit_current_cell(self) -> None:
+        """F2 = rename, exactly as double-clicking the cell does.
+
+        With several rows selected it opens the grid instead, because editing twelve
+        books one cell at a time through a single-cell editor is not editing them.
+        """
+        rows = {index.row() for index in self.table.selectedIndexes()}
+        if len(rows) > 1:
+            self._edit_grid(self.selected_entries())
+            return
+
+        item = self.table.currentItem()
+        # Landed on a row rather than a cell (or on something not editable): start at
+        # Author, which is the first field you would retype anyway.
+        if item is None or item.column() not in EDITABLE:
+            row = self.table.currentRow()
+            if row < 0:
+                self.show_message('Select a row first')
+                return
+            item = self.table.item(row, COL_AUTHOR)
+            if item is None:
+                return
+            self.table.setCurrentItem(item)
+        self.table.editItem(item)
+
+    def _step_edit(self, rows: int, columns: int) -> None:
+        """Move the edit cursor by (rows, columns) and open the editor there.
+
+        Hidden rows are stepped over: with a filter on, the next book is the next book
+        you can see, not the next one in the underlying table.
+        """
+        row, column = self.table.currentRow(), self.table.currentColumn()
+        if row < 0:
+            return
+
+        if columns:
+            editable = sorted(EDITABLE)
+            try:
+                position = editable.index(column) + columns
+            except ValueError:
+                position = 0
+            column = editable[max(0, min(len(editable) - 1, position))]
+
+        target = row
+        step = 1 if rows >= 0 else -1
+        for _ in range(abs(rows) or 0):
+            candidate = target + step
+            while 0 <= candidate < self.table.rowCount() and self.table.isRowHidden(
+                    candidate):
+                candidate += step
+            if not 0 <= candidate < self.table.rowCount():
+                break     # at the end of the list; stay put rather than wrapping
+            target = candidate
+
+        item = self.table.item(target, column)
+        if item is None:
+            return
+        self.table.setCurrentItem(item)
+        self.table.scrollToItem(item)
+        if column in EDITABLE:
+            self.table.editItem(item)
+
+    def _edit_grid(self, entries: List[BookEntry]) -> None:
+        """Open the selected books in a grid and write back whatever changed."""
+        from ..models import Field, clean_value
+        from .bulk_edit_dialog import BulkEditDialog
+
+        dialog = BulkEditDialog(entries, parent=self, settings=self.settings)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        changes = dialog.values()
+        self._record_edit(
+            f'grid edit of {len(changes)} row{"" if len(changes) == 1 else "s"}',
+            [(entry.entry_id, name, entry.get_field(name)) for entry in entries
+             for name in (changes.get(entry.entry_id) or {})])
+        for entry in entries:
+            fields = changes.get(entry.entry_id)
+            if not fields:
+                continue
+            for name, value in fields.items():
+                cleaned = clean_value(name, value)
+                setattr(entry, name,
+                        Field(value=cleaned, source='user', confidence=1.0))
+                entry.log('user', f'{name} set to "{cleaned}" in the grid editor')
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+
+        self._apply_filters()
+        self.refresh_stats()
+        self.show_message(f'Edited {len(changes)} of {len(entries)} rows'
+                          if changes else 'No changes were made')
+
+    def _bulk_edit(self, field: str) -> None:
+        entries = self.selected_entries()
+        if not entries:
+            self.show_message('Select some rows first')
+            return
+
+        current = entries[0].value(field)
+        label = field.replace('_', ' ')
+        value, ok = QInputDialog.getText(
+            self, f'Set {label}',
+            f'Set {label} for {len(entries)} selected '
+            f'entr{"y" if len(entries) == 1 else "ies"}:',
+            QLineEdit.EchoMode.Normal, str(current))
+        if not ok:
+            return
+        self._write_field(entries, field, value)
+
+    def review_overwrites(self, entries: List[BookEntry]) -> None:
+        """Put every proposed overwrite of a manual edit to the user, once per run."""
+        from .overwrite_dialog import OverwriteDialog, Proposal, book_label
+
+        proposals = []
+        for entry in entries:
+            for item in entry.pending_overwrites:
+                proposals.append(Proposal(
+                    entry_id=entry.entry_id, book=book_label(entry),
+                    field=item.get('field', ''), before=item.get('before', ''),
+                    after=item.get('after', ''), source=item.get('source', '')))
+        if not proposals:
+            return
+
+        dialog = OverwriteDialog(proposals, parent=self)
+        accepted = dialog.accepted_changes() if dialog.exec() == QDialog.DialogCode.Accepted else {}
+
+        applied = 0
+        for entry in entries:
+            allowed = accepted.get(entry.entry_id, [])
+            for item in list(entry.pending_overwrites):
+                if item.get('field') in allowed:
+                    entry.force_field(item['field'], item['after'], item['source'])
+                    entry.log('user', f'{item["field"]} overwritten with '
+                                      f'"{item["after"]}" from {item["source"]}, '
+                                      f'with your approval')
+                    applied += 1
+            entry.pending_overwrites = []
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+
+        self._apply_filters()
+        self.refresh_stats()
+        self.show_message(
+            f'Kept your edits; applied {applied} of {len(proposals)} proposed changes'
+            if applied else f'Kept all {len(proposals)} of your edits')
+
+    def _clear_targets(self) -> Dict[str, List[str]]:
+        """entry_id -> the fields a Clear would blank, given the current selection.
+
+        Selecting a column targets that field on every row in it; selecting a row
+        targets the whole row; selecting three cells targets three cells. There is no
+        "which field?" prompt because the selection already said which. Split out from
+        the action itself so the menu entry can *name* what it is about to do.
+        """
+        targets: Dict[str, List[str]] = {}
+        for index in self.table.selectedIndexes():
+            name = EDITABLE.get(index.column())
+            if name is None:
+                continue
+            entry = self._entry_at(index.row())
+            if entry is not None and entry.get_field(name).value:
+                targets.setdefault(entry.entry_id, []).append(name)
+
+        if not targets:
+            # A whole-row selection lands on non-editable cells too, so fall back to
+            # "everything on these rows" rather than doing nothing.
+            for entry in self.selected_entries():
+                fields = [n for n in EDITABLE.values() if entry.get_field(n).value]
+                if fields:
+                    targets[entry.entry_id] = fields
+        return targets
+
+    @staticmethod
+    def _clear_label(targets: Dict[str, List[str]]) -> str:
+        """"Clear 3 authors", or "Clear 7 entries" when the selection is mixed."""
+        names = {name for fields in targets.values() for name in fields}
+        count = sum(len(fields) for fields in targets.values())
+        if not count:
+            return 'Clear'
+        if len(names) == 1:
+            field = next(iter(names))
+            label = (FIELD_LABELS[field].lower() if count == 1
+                     else FIELD_PLURALS[field])
+            return f'Clear {count} {label}'
+        return f'Clear {count} entries'
+
+    def _delete_key(self) -> None:
+        """Delete clears name cells; anything else selected asks to remove the book.
+
+        A selection that reaches the files, confidence or status column (a whole row
+        does) is about the book, not its metadata, so it offers to take the book off
+        the list or delete its files instead of blanking the row.
+        """
+        indexes = self.table.selectedIndexes()
+        if not indexes:
+            return
+        if all(index.column() in EDITABLE for index in indexes):
+            self._clear_selected_cells()
+            return
+        entries = self.selected_entries()
+        if entries:
+            self._ask_remove(entries)
+
+    def _ask_remove(self, entries: List[BookEntry]) -> None:
+        count = len(entries)
+        books = f'{count} book{"" if count == 1 else "s"}'
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle('Remove')
+        box.setText(
+            f'Remove {"this book" if count == 1 else books}?\n\n'
+            f'{entries[0].value("author")} - {entries[0].value("title")}'
+            + (f'\n... and {count - 1} more' if count > 1 else ''))
+        from_list = box.addButton('Remove from list',
+                                  QMessageBox.ButtonRole.AcceptRole)
+        from_drive = box.addButton('Delete from drive...',
+                                   QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is from_list:
+            self._remove_from_list(entries)
+        elif clicked is from_drive:
+            self._delete_from_drive(entries)
+
+    def _clear_selected_cells(self) -> None:
+        """Blank exactly the cells that are selected."""
+        from ..models import Field
+
+        targets = self._clear_targets()
+        if not targets:
+            self.show_message('Nothing to clear in the selection')
+            return
+
+        visible_columns = {column for column in range(self.table.columnCount())
+                           if not self.table.isColumnHidden(column)}
+        selected_columns = {}
+        for index in self.table.selectedIndexes():
+            selected_columns.setdefault(index.row(), set()).add(index.column())
+        if any(visible_columns <= columns for columns in selected_columns.values()):
+            if QMessageBox.question(
+                    self, 'Clear metadata', 'Are you sure?',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+
+        cells = sum(len(names) for names in targets.values())
+        # A cleared row is no longer the book that was approved or rejected, so its
+        # decision goes back to pending - and comes back with Undo like the cells do.
+        decided = [entry_id for entry_id in targets if entry_id in self.entries
+                   and self.entries[entry_id].status != STATUS_PENDING]
+        self._record_edit(
+            f'cleared {cells} cell{"" if cells == 1 else "s"}',
+            [(entry_id, name, self.entries[entry_id].get_field(name))
+             for entry_id, names in targets.items() if entry_id in self.entries
+             for name in names]
+            + [(entry_id, 'status', self.entries[entry_id].status)
+               for entry_id in decided])
+        for entry_id, names in targets.items():
+            entry = self.entries.get(entry_id)
+            if entry is None:
+                continue
+            for name in names:
+                setattr(entry, name, Field())
+                entry.log('user', f'{name} cleared')
+            entry.status = STATUS_PENDING
+            row = self._row_for(entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+
+        self._apply_filters()
+        self.refresh_stats()
+        self.show_message(f'Cleared {cells} cell{"" if cells == 1 else "s"} '
+                          f'across {len(targets)} row{"" if len(targets) == 1 else "s"}')
+
+    # -------------------------------------------------------- cell clipboard
+
+    def _selection_block(self) -> List[List[int]]:
+        """The selected cells as a rectangle of (row, column), in the order shown.
+
+        A selection can be ragged - three cells in two rows - but a clipboard is not,
+        so the bounding box is what travels, with the cells you did not select left
+        blank inside it. That is what every spreadsheet does, and it is what makes a
+        copied block paste back into the same shape.
+        """
+        indexes = [index for index in self.table.selectedIndexes()
+                   if not self.table.isRowHidden(index.row())]
+        if not indexes:
+            return []
+        rows = sorted({index.row() for index in indexes},
+                      key=self.table.visualRow)
+        columns = sorted({index.column() for index in indexes},
+                         key=self.table.visualColumn)
+        return [rows, columns]
+
+    def _copy_selected_cells(self) -> None:
+        """The selected cells as tab-separated text, pasteable into a spreadsheet."""
+        block = self._selection_block()
+        if not block:
+            self.show_message('Select some cells first')
+            return
+        rows, columns = block
+        chosen = {(index.row(), index.column())
+                  for index in self.table.selectedIndexes()}
+
+        lines = []
+        for row in rows:
+            line = []
+            for column in columns:
+                item = self.table.item(row, column)
+                line.append(item.text() if item is not None
+                            and (row, column) in chosen else '')
+            lines.append('\t'.join(line))
+
+        cells = len(rows) * len(columns)
+        self._to_clipboard('\n'.join(lines),
+                           f'Copied {cells} cell{"" if cells == 1 else "s"}')
+
+    def _paste_into_selection(self) -> None:
+        """Write the clipboard into the selection, starting at the current cell.
+
+        One value fills the whole selection - "make these six all say this" is the
+        common case and needs no block to line up. A block of values is laid out from
+        the top-left of the selection, and anything landing on a column that is not
+        editable, or past the last row, is dropped rather than half-applied.
+        """
+        from PyQt6.QtWidgets import QApplication
+        from ..models import Field, clean_value
+
+        text = QApplication.clipboard().text()
+        if not text.strip():
+            self.show_message('Nothing on the clipboard to paste')
+            return
+
+        block = self._selection_block()
+        if not block:
+            self.show_message('Select where to paste first')
+            return
+        rows, columns = block
+
+        grid = [line.split('\t') for line in text.replace('\r\n', '\n').split('\n')]
+        single = len(grid) == 1 and len(grid[0]) == 1
+
+        # A block pastes from where the selection starts, spilling down and right over
+        # whatever follows it in the table - not only over what happens to be selected.
+        if not single:
+            start_row, start_column = rows[0], columns[0]
+            visible = [r for r in range(self.table.rowCount())
+                       if not self.table.isRowHidden(r)]
+            rows = visible[visible.index(start_row):][:len(grid)]
+            columns = [c for c in range(start_column, len(COLUMNS))][:max(
+                len(line) for line in grid)]
+
+        writes: List[tuple] = []
+        for row_offset, row in enumerate(rows):
+            entry = self._entry_at(row)
+            if entry is None:
+                continue
+            for column_offset, column in enumerate(columns):
+                name = EDITABLE.get(column)
+                if name is None:
+                    continue
+                if single:
+                    value = grid[0][0]
+                else:
+                    line = grid[row_offset]
+                    if column_offset >= len(line):
+                        continue
+                    value = line[column_offset]
+                cleaned = clean_value(name, value.strip())
+                if cleaned == entry.value(name):
+                    continue
+                writes.append((entry, name, cleaned))
+
+        if not writes:
+            self.show_message('Nothing to paste into the selected cells')
+            return
+
+        self._record_edit(
+            f'pasted {len(writes)} cell{"" if len(writes) == 1 else "s"}',
+            [(entry.entry_id, name, entry.get_field(name))
+             for entry, name, _value in writes])
+        touched = set()
+        for entry, name, value in writes:
+            setattr(entry, name, Field(value=value, source='user', confidence=1.0))
+            entry.log('user', f'{name} pasted as "{value}"')
+            touched.add(entry.entry_id)
+        for entry_id in touched:
+            entry = self.entries.get(entry_id)
+            row = self._row_for(entry_id)
+            if entry is not None and row is not None:
+                self._fill_row(row, entry)
+                self.entry_changed(entry)
+
+        self._apply_filters()
+        self.refresh_stats()
+        self.why_panel.show_entry(self.selected_entries()[0]
+                                  if self.selected_entries() else None)
+        self.show_message(f'Pasted {len(writes)} cell{"" if len(writes) == 1 else "s"} '
+                          f'across {len(touched)} row{"" if len(touched) == 1 else "s"}')
+
+    def _write_field(self, entries: List[BookEntry], field: str, value: str) -> None:
+        from ..models import Field, clean_value
+        cleaned = clean_value(field, value)
+        self._record_edit(f'{field} set on {len(entries)} row'
+                          f'{"" if len(entries) == 1 else "s"}',
+                          self._snapshot(entries, [field]))
+        for entry in entries:
+            setattr(entry, field, Field(value=cleaned, source='user', confidence=1.0))
+            entry.log('user', f'{field} set manually to "{cleaned}"')
+            row = self._row_for(entry.entry_id)
+            if row is not None:
+                self._fill_row(row, entry)
+            self.entry_changed(entry)
+        self._apply_filters()
+        self.why_panel.show_entry(entries[0], extra_selected=len(entries) - 1)
+        label = field.replace('_', ' ')
+        self.show_message(f'{"Cleared" if cleaned in ("", 0) else "Set"} {label} '
+                          f'on {len(entries)} entries')
+
+    def _request_load(self, selected_only: Optional[bool] = None) -> None:
+        """Load the input folder, through the dialog that picks folder, scan and keep.
+
+        There is one load action and it always means the same thing: read the books on
+        disk into the list. The dialog can instead clear the list.
+
+        ``selected_only`` preselects the scope for the right-click menu; None lets the
+        dialog decide (the whole folder, unless you pick otherwise).
+        """
+        from .load_dialog import LoadInputDialog
+
+        selected = self.selected_entries()
+        dialog = LoadInputDialog(list(self.entries.values()), selected,
+                                 self.settings, parent=self, drift=self._scan_drift,
+                                 folder_changed_from=self._folder_changed_from,
+                                 on_remove=self.purge_requested.emit)
+        if selected and selected_only is not None:
+            dialog.scope_selected.setChecked(bool(selected_only))
+            dialog.scope_all.setChecked(not selected_only)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self._take_fresh_drift(dialog)
+        if not accepted:
+            return
+        if dialog.clear_chosen:
+            self.clear_requested.emit()
+            return
+
+        dialog.remember()
+        if not self._confirm_load_loses_work(dialog):
+            return
+        self.load_requested.emit(dialog.scope(), dialog.keep_options(),
+                                 dialog.load_list_only())
+
+    def _take_fresh_drift(self, dialog) -> None:
+        """The dialog compared the list with the folder just now; the "!" follows it."""
+        drift = getattr(dialog, 'fresh_drift', None)
+        if drift is None:
+            return
+        try:
+            same = (dialog.folder_path() is not None and Path(dialog.folder_path())
+                    == Path(self.settings.get_path('AO_INPUT_DIR')))
+        except Exception:
+            same = False
+        if not same:
+            return
+        stale = any(drift.get(key) for key in ('added', 'missing', 'changed',
+                                               'unreadable', 'empty'))
+        self.set_scan_stale(drift if stale else None)
+
+    def _confirm_load_loses_work(self, dialog) -> bool:
+        """Ask before a load throws away work it cannot get back by reading the disk.
+
+        Values from the databases, the web or the model, values you typed, and your
+        approve/reject decisions exist nowhere else. Tags and file names are simply
+        read again, so losing those is not asked about.
+        """
+        from ..load_options import plan_load
+
+        scope = dialog.scope()
+        entries = list(self.entries.values()) if scope is None else scope
+        plan = plan_load(entries, dialog.keep_options())
+        if not plan.loses_work():
+            return True
+        lines = []
+        if plan.worked:
+            typed = (f', {plan.typed} of them typed by you' if plan.typed else '')
+            lines.append(f'{plan.worked} value{"" if plan.worked == 1 else "s"} found '
+                         f'by identification{typed}')
+        if plan.decisions:
+            lines.append(f'{plan.decisions} Approved / Rejected decision'
+                         f'{"" if plan.decisions == 1 else "s"}')
+        from .item_list import confirm_list
+
+        keep = dialog.keep_options()
+        books = []
+        for entry in entries:
+            one = plan_load([entry], keep)
+            if not one.loses_work():
+                continue
+            lost = [FIELD_LABELS.get(name, name) for name in IDENTITY_FIELDS
+                    if not keep.keeps(entry.get_field(name))
+                    and not entry.get_field(name).is_empty()]
+            if one.decisions:
+                lost.append(f'{entry.status} decision')
+            books.append(f'{self._label_for(entry)}   ({", ".join(lost)})')
+            books.append(f'    {entry.folder}')
+        return confirm_list(
+            self, 'Are you sure?',
+            'This load throws away work:\n\n    ' + '\n    '.join(lines)
+            + '\n\nThey are not read back from the files. The list is backed up first, '
+              'and can be restored from the Inputs right-click menu.',
+            [(f'Books that lose work ({len(books) // 2}):', books)],
+            yes='Load and throw it away', no='Cancel')
+
+    def _show_load_menu(self) -> None:
+        """Right-clicking Inputs: the same action, scoped, plus where to load from."""
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+
+        every = menu.addAction('Load the whole input folder')
+        every.setToolTip('Books that appeared are added, books that are gone are '
+                         'removed, and you choose what to keep of the rest.')
+        every.triggered.connect(lambda: self._request_load(selected_only=False))
+
+        selected = self.selected_entries()
+        if selected:
+            one = menu.addAction(f'Load only the {len(selected)} selected '
+                                 f'book{"" if len(selected) == 1 else "s"}')
+            one.setToolTip('Reads just those books from disk again. The rest of the '
+                           'list is left exactly as it is.')
+            one.triggered.connect(lambda: self._request_load(selected_only=True))
+
+        menu.addSeparator()
+        validate = menu.addAction('Scan for warnings')
+        validate.setToolTip('Check the current values for suspicious content')
+        validate.triggered.connect(self._validate_entries)
+
+        menu.addSeparator()
+        folder = menu.addAction('Choose input folder...')
+        folder.setToolTip('Open Settings and pick the folder to load from')
+        folder.triggered.connect(lambda: self.settings_requested_on_tab.emit('General'))
+
+        restore = menu.addAction('Restore a backup...')
+        restore.setToolTip('Put the list back as it was before an earlier load, clear '
+                           'or removal')
+        restore.triggered.connect(self.restore_requested.emit)
+
+        if self._scan_drift or self._folder_changed_from:
+            what = menu.addAction('What changed since the last load...')
+            what.triggered.connect(self._show_drift_report)
+
+        action = self.tool_actions.get('scan')
+        button = (self.toolbar.widgetForAction(action) if action is not None else None)
+        anchor = button if button is not None else self.toolbar
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+
+    def _show_drift_report(self) -> None:
+        """Why the "!" is lit, in words, with the button that clears it."""
+        drift = self._scan_drift or {}
+        parts = [f'{count} audio file{"" if count == 1 else "s"} {word}'
+                 for word, count in (('added', drift.get('added', 0)),
+                                     ('no longer there', drift.get('missing', 0)),
+                                     ('changed', drift.get('changed', 0))) if count]
+        lines = []
+        if self._folder_changed_from:
+            lines.append(f'The input folder was changed.\n\n'
+                         f'    was:  {self._folder_changed_from}\n'
+                         f'    now:  '
+                         f'{self.settings.display_path(self.settings.get_path("AO_INPUT_DIR"))}'
+                         f'\n\nThe list still holds the books from the old folder. They '
+                         f'stay editable and can still be saved; loading replaces them '
+                         f'with what is in the new folder.')
+        if parts:
+            lines.append('Since this list was written, the input folder has '
+                         + ', '.join(parts) + '.')
+        empty = drift.get('empty', 0)
+        if empty:
+            lines.append(f'{empty} book{"" if empty == 1 else "s"} in the list '
+                         f'{"has" if empty == 1 else "have"} no files on disk any more. '
+                         f'The Missing button beside Inputs removes them.')
+        if not lines:
+            lines.append('The list is in step with the input folder.')
+
+        from .item_list import list_dialog
+        if list_dialog(self, 'Since the last load', '\n\n'.join(lines),
+                       self._drift_sections(), ['Load now', 'Close'],
+                       default=0) == 'Load now':
+            self._request_load()
+
+    def _drift_sections(self) -> list:
+        """Every book and file behind the "!" on Inputs, by name."""
+        from .item_list import books_lines
+        drift = self._scan_drift or {}
+        files = drift.get('files', {})
+        sections = []
+        if self._folder_changed_from:
+            root = self.settings.get_path('AO_INPUT_DIR')
+            old = [entry for entry in self.entries.values()
+                   if not _is_under(entry.folder, root)]
+            sections.append((f'Books in the list from the old folder ({len(old)}):',
+                             books_lines(old, files=False)))
+        for key, heading in (('added', 'Audio files added'),
+                             ('missing', 'Audio files no longer there'),
+                             ('changed', 'Audio files that changed size')):
+            items = files.get(key) or []
+            sections.append((f'{heading} ({len(items)}):', list(items)))
+        empty = [self.entries[entry_id] for entry_id in files.get('empty') or ()
+                 if entry_id in self.entries]
+        sections.append((f'Books with no files on disk ({len(empty)}):',
+                         books_lines(empty)))
+        return sections
+
+    def _unscanned(self) -> List[BookEntry]:
+        """Books that are listed but have not had the local pass - tags and names."""
+        return [entry for entry in self.entries.values() if not entry.resolved]
+
+    def _request_resolve(self) -> None:
+        # Until every book has had the initial scan the button is "Initial Scan":
+        # the audio tags and the file and folder names, read locally, before any
+        # book database, web search or language model is asked anything. It does
+        # not depend on the Sources menu - it is always those two.
+        unscanned = self._unscanned()
+        if unscanned:
+            chosen = [entry for entry in self.selected_entries() if not entry.resolved]
+            self.resolve_requested.emit(chosen or unscanned, list(INITIAL_SCAN_TIERS))
+            return
+        tiers = self.selected_tiers()
+        if not tiers:
+            self.show_message('Tick at least one source in the Sources menu')
+            return
+        # No selection means the whole library, the same way Load and Preview read it.
+        # Refusing the click and telling you about Ctrl+A was making you do by hand the
+        # only thing an empty selection could have meant.
+        entries = self.selected_entries() or list(self.entries.values())
+        if not entries:
+            self.show_message('Nothing to identify - load the input folder first')
+            return
+        self.continue_requested.emit(entries, tiers)
+
+    def _request_apply(self, preview: bool) -> None:
+        if preview:
+            # Preview writes nothing, so it never refuses. Selected rows if you
+            # selected some - previewing one row you are unsure about is the point of
+            # the selection.
+            #
+            # With nothing selected it previews what Finalize would actually write:
+            # the approved rows, and nothing else. It used to preview the whole
+            # library, rejected books included, which read as "these are going to be
+            # written" about books that had been explicitly turned down. Only when
+            # nothing is approved yet does it fall back to the whole list, because
+            # then the question being asked is "where would these end up?".
+            entries = self.selected_entries()
+            scope = 'selected'
+            if not entries:
+                entries = [e for e in self.entries.values()
+                           if e.status == STATUS_APPROVED]
+                scope = 'approved'
+                # The rejected rows come along, shown as skipped in a group of their
+                # own, so the preview says what Finalize leaves out as well.
+                if entries:
+                    entries += [e for e in self.entries.values()
+                                if e.status == STATUS_REJECTED]
+            if not entries:
+                entries = list(self.entries.values())
+                scope = 'all'
+            if not entries:
+                self.show_message('Nothing to preview - load the input folder first')
+                return
+            if scope == 'approved':
+                approved = sum(1 for e in entries if e.status == STATUS_APPROVED)
+                rejected = len(entries) - approved
+                self.show_message(f'Previewing the {approved} approved '
+                                  f'row{"" if approved == 1 else "s"} - what '
+                                  f'Finalize would write'
+                                  + (f', and {rejected} rejected it skips'
+                                     if rejected else ''))
+            elif scope == 'all':
+                self.show_message('Nothing is approved yet - previewing every row')
+            self.apply_requested.emit(entries, True)
+            return
+
+        entries = [e for e in self.entries.values() if e.status == STATUS_APPROVED]
+        if not entries:
+            self.show_message('No approved entries. Approve some rows first (F5).')
+            return
+        # Sent along so the results report them as skipped; the write step refuses
+        # every rejected book, so none of them is touched.
+        rejected = [e for e in self.entries.values() if e.status == STATUS_REJECTED]
+
+        # Applying is the one action that touches the filesystem, so it is the one
+        # action worth a confirmation - and even that is optional.
+        if self.settings.get_bool('AO_UI_CONFIRM_APPLY', True):
+            # This is the only irreversible-looking step, so it gets a real dialog -
+            # one that lets you *change* copy-vs-move and the templates rather than
+            # only reciting them and sending you off to Settings to fix one.
+            from .apply_dialog import ApplyDialog
+
+            # A handful of books spread across the list, so the preview shows more
+            # than one series' naming before anything is written.
+            sample = entries if len(entries) <= PREVIEW_SAMPLE else [
+                entries[round(i * (len(entries) - 1) / (PREVIEW_SAMPLE - 1))]
+                for i in range(PREVIEW_SAMPLE)]
+            preview_results = ([self.preview_provider(entry) for entry in sample]
+                               if self.preview_provider is not None else None)
+            dialog = ApplyDialog(entries, self.settings, preview_results=preview_results,
+                                 parent=self, rejected=rejected)
+            dialog.settings_requested.connect(self.settings_requested_on_tab.emit)
+            dialog.preview_requested.connect(
+                lambda: self.apply_requested.emit(entries + rejected, True))
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            # The dialog writes straight to .env, so the controller has to rebuild
+            # FileOperations against the mode and templates just chosen.
+            self.settings_changed.emit()
+        self.apply_requested.emit(entries + rejected, False)
+
+    def _search_goodreads(self, entries: Optional[List[BookEntry]] = None,
+                          field: Optional[str] = None) -> None:
+        """Open Goodreads for every selected row, using whatever we currently know.
+
+        Goodreads has no usable public API any more, so this is the honest version of
+        "look it up there": it hands the query to your browser and gets out of the way.
+        Tabs open one at a time, spaced out by a randomised delay - a dozen identical
+        requests arriving in the same instant is what rate limiting is looking for.
+        """
+        if entries is None:
+            entries = self.selected_entries()
+        if not entries:
+            self.show_message('Select a row first')
+            return
+
+        if len(entries) > GOODREADS_ASK_ABOVE and QMessageBox.question(
+                self, 'Search Goodreads',
+                f'Open {len(entries)} Goodreads tabs, one per selected book?\n\n'
+                f'They open a second or two apart, so this takes about '
+                f'{int(len(entries) * sum(GOODREADS_DELAY) / 2)} seconds.'
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        import random
+        elapsed = 0.0
+        for entry in entries:
+            QTimer.singleShot(int(elapsed * 1000),
+                              lambda e=entry, f=field: self._open_goodreads(e, f))
+            elapsed += random.uniform(*GOODREADS_DELAY)
+        self.show_message(f'Opening Goodreads for {len(entries)} book'
+                          f'{"" if len(entries) == 1 else "s"}')
+
+    def _open_goodreads(self, entry: BookEntry, field: Optional[str] = None) -> None:
+        import webbrowser
+        from urllib.parse import quote_plus
+
+        query = (entry.value(field) if field else
+                 ' '.join(filter(None, [entry.value('title'), entry.value('author'),
+                                        entry.value('series')])))
+        if not query:
+            query = Path(entry.primary_audio).stem
+        webbrowser.open(
+            'https://www.goodreads.com/search?utf8=%E2%9C%93'
+            f'&q={quote_plus(query)}&search_type=books&search%5Bfield%5D=on')
+
+    # -------------------------------------------------------- window state
+
+    def _restore_window_state(self) -> None:
+        """Size, split, and whether the window was maximised.
+
+        Saved geometry is never trusted blindly: monitors get unplugged and
+        resolutions change, and a window restored onto a screen that no longer exists
+        opens off the edge of the desktop. Anything that does not fit the current
+        screen is re-centred on it instead.
+        """
+        if not self.settings.get_bool('AO_UI_REMEMBER_LAYOUT', True):
+            self._centre_on_screen()
+            return
+
+        parts = (self.settings.get('AO_UI_WINDOW') or '').split(',')
+        try:
+            width, height, split_left, split_right = [int(p) for p in parts[:4]]
+        except (AttributeError, ValueError):
+            self._centre_on_screen()
+            return
+        maximised = len(parts) > 4 and parts[4].strip() == 'max'
+
+        if width > 400 and height > 300:
+            self.resize(width, height)
+
+        # The panel width is remembered as a *width*, not as a share of the window,
+        # and it is applied last of all - see _restore_split. Handing sizes to a
+        # splitter that is not yet its final width is where this kept going wrong:
+        # Qt scales whatever you give it to the width it currently has, so a split
+        # saved from a maximised window came back squeezed, and then maximising
+        # again shared the new space out by stretch factor instead of restoring it.
+        self._wanted_split = split_right if split_right >= 0 else None
+
+        self._centre_on_screen()
+        if maximised:
+            self.showMaximized()
+
+    def reset_layout(self) -> None:
+        """Go back to the built-in window size, split and column widths, now.
+
+        The Settings page has already blanked the saved keys; this is the half that
+        makes the window look like it. Un-maximising first is deliberate - snapping
+        the columns back inside a maximised window shows you nothing about the size
+        that was just reset.
+        """
+        self._wanted_split = None
+        self._has_saved_widths = False
+        if self.isMaximized() or self.isFullScreen():
+            self.showNormal()
+        self.resize(1780, 960)
+        self._centre_on_screen()
+
+        for column in range(len(COLUMNS)):
+            self.table.setColumnHidden(column, False)
+            self.table.setColumnWidth(column, DEFAULT_WIDTHS[column])
+        # Covers and density still decide whether column 0 is shown at all.
+        self.apply_ui_settings()
+        # The splitter has not been told its new width yet - the resize above is a
+        # request, not a fact, until the layout runs. Same reason _restore_split is
+        # deferred; splitting on a stale width is how you get a 40-pixel panel.
+        QTimer.singleShot(0, self._default_split)
+        QTimer.singleShot(0, self._fit_columns)
+        self.show_message('Layout reset')
+
+    def _default_split(self) -> None:
+        """The built-in three-to-one split, against the width the splitter now has."""
+        total = self.splitter.width() - self.splitter.handleWidth()
+        if total > 0:
+            self.splitter.setSizes([int(total * 0.77), int(total * 0.23)])
+
+    def _centre_on_screen(self) -> None:
+        """Shrink to fit the available screen, then centre on it."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+
+        size = self.size()
+        self.resize(min(size.width(), available.width() - 40),
+                    min(size.height(), available.height() - 60))
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
+
+    def closeEvent(self, event) -> None:
+        if self.settings.get_bool('AO_UI_REMEMBER_LAYOUT', True):
+            self._save_column_widths()
+            sizes = self.splitter.sizes()
+            # Maximised windows report their *restored* size, which is the one to save:
+            # reopening maximised then un-maximising should give back a sane window.
+            geometry = self.normalGeometry()
+            self.settings.set(
+                'AO_UI_WINDOW',
+                f'{geometry.width()},{geometry.height()},'
+                f'{sizes[0]},{sizes[1] if len(sizes) > 1 else 0},'
+                f'{"max" if self.isMaximized() or self.isFullScreen() else "normal"}')
+            try:
+                self.settings.save()
+            except OSError as exc:
+                logger.warning('Could not save the window layout: %s', exc)
+        super().closeEvent(event)
+
+    # ---------------------------------------------------------------- helpers
+
+    def selected_entries(self) -> List[BookEntry]:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        entries = [self._entry_at(row) for row in rows]
+        return [entry for entry in entries if entry is not None]
+
+    def _entry_at(self, row: int) -> Optional[BookEntry]:
+        item = self.table.item(row, COL_FILES)
+        if item is None:
+            return None
+        return self.entries.get(item.data(Qt.ItemDataRole.UserRole))
+
+    def _row_for(self, entry_id: str) -> Optional[int]:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, COL_FILES)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == entry_id:
+                return row
+        return None
+
+    def in_view_order(self, entries: List[BookEntry]) -> List[BookEntry]:
+        """The entries in the order the table currently shows them, as sorted.
+
+        Books not in the table (filtered out, or not listed yet) keep their
+        relative order and go after the visible ones.
+        """
+        rows = {}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, COL_FILES)
+            if item is not None:
+                rows[item.data(Qt.ItemDataRole.UserRole)] = row
+        end = self.table.rowCount()
+        return sorted(entries, key=lambda entry: rows.get(entry.entry_id, end))
+
+    def refresh_mode_label(self) -> None:
+        """Kept as a no-op so callers need not care that the strip is gone.
+
+        Copy-vs-move and the output folder belong to the apply step, and the apply
+        confirmation states both. Parking them permanently in the toolbar made the
+        status area read as a run-on sentence.
+        """
+
+    # ------------------------------------------------------------ progress UI
+
+    def show_message(self, text: str) -> None:
+        self._status_text = text
+        self._render_status()
+        logger.info(text)
+
+    def _tick_spinner(self) -> None:
+        self._spin = (self._spin + 1) % len(SPINNER)
+        self._render_status()
+        # Everything that says "still working" moves off this one timer. A chapter
+        # encode holds the same step for minutes at a time, so motion is the only
+        # thing distinguishing a slow job from a dead one, and it has to be
+        # somewhere the eye already is: the bar, the row, and the sentence.
+        self.delegate.phase = (self.delegate.phase + 0.055) % 1.0
+        self._advance_row_progress_animations()
+        self._animate_progress_bar()
+        if self._row_progress:
+            self.table.viewport().update()
+
+    def _animate_progress_bar(self) -> None:
+        """Sweep a highlight along the toolbar bar while a job is running.
+
+        A determinate QProgressBar is a still image between updates, which for a
+        chapter encode means a still image for a minute. Qt has no animated chunk,
+        so the chunk is a gradient and the gradient is re-stated on every tick.
+        """
+        if not self._busy or not self.progress.isVisible():
+            return
+        head = (self._spin / len(SPINNER))
+        self.progress.setStyleSheet(
+            'QProgressBar { background: %s; border: none; border-radius: 3px; }'
+            'QProgressBar::chunk { border-radius: 3px; background: '
+            'qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 %s, stop:%.3f %s, '
+            'stop:%.3f %s, stop:%.3f %s, stop:1 %s); }'
+            % (BG_RAISED, ACCENT_DARK, max(0.0, head - 0.2), ACCENT_DARK,
+               head, ACCENT, min(1.0, head + 0.2), ACCENT_DARK, ACCENT_DARK))
+
+    def _render_status(self) -> None:
+        """The status sentence, with the queue count appended as a clickable link."""
+        import html as _html
+
+        text = _html.escape(getattr(self, '_status_text', '') or '')
+        if self._busy:
+            text = (f'<span style="color:{ACCENT};">{SPINNER[self._spin]}</span>  '
+                    + text)
+        waiting = len(self._queue_labels)
+        if waiting:
+            text += (f'   ·   <a href="queue" style="color:{ACCENT};">'
+                     f'{plural(waiting, "job")} queued</a>')
+        elif self._busy:
+            text += (f'   ·   <a href="queue" style="color:{ACCENT};">'
+                     f'open the queue</a>')
+        self.status_label.setText(text)
+        # The full sentence lives in the tooltip, because the label is width-capped -
+        # an uncapped one grows with the message and shoves Cancel off the toolbar,
+        # which is how the only stop button vanished mid-run.
+        self.status_label.setToolTip(getattr(self, '_status_text', '')
+                                     or 'What just happened')
+
+    def show_progress(self, done: float, total: float, message: str = '') -> None:
+        """One consistent readout: "<what is happening>  12/38".
+
+        The bar carries the numbers, the label carries the sentence. Nothing else goes
+        in here - a status strip that concatenates unrelated fragments is unreadable.
+
+        `done` may be fractional. A chapter merge spends minutes inside a single
+        chapter, and a bar that only moves when one finishes sits still while the
+        message beside it counts steadily up through the audio. So the bar runs on a
+        fixed 1000-step range and is filled from the exact fraction, while the text
+        still counts in whole chapters - which is the unit you can check against the
+        folder in front of you.
+        """
+        self._last_progress = (done, total, message)
+        self._refresh_queue_dialog()
+        self._progress_action.setVisible(True)
+        if total > 0:
+            fraction = max(0.0, min(1.0, done / total))
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(int(round(fraction * 1000)))
+            # The literal numbers are baked into the format string rather than left to
+            # %v/%m, which would print the 1000-step scale instead of the chapters.
+            self.progress.setFormat(
+                f'{int(done)} / {int(total)}  ({fraction:.0%})')
+        else:
+            self.progress.setRange(0, 0)  # indeterminate - no count is known yet
+            self.progress.setFormat('')
+        if message:
+            self._status_text = message
+            self._render_status()
+
+    def show_queue(self, labels: List[str]) -> None:
+        """Called by the controller whenever the pending-job list changes."""
+        self._queue_labels = list(labels)
+        self._queue_action.setVisible(bool(labels))
+        self.queue_button.setText(f'  {plural(len(labels), "job")} queued  ')
+        self._render_status()
+        self._refresh_identify_badge()
+        self._refresh_queue_dialog()
+
+    def set_scan_stale(self, drift: Optional[dict]) -> None:
+        """Mark Inputs when the list no longer matches the input folder.
+
+        A saved list is a snapshot. Files added, removed or replaced since it was
+        written are invisible until it is loaded again, and the whole session after
+        that point is spent reviewing a library that no longer exists - so the button
+        that fixes it says so, with a "!" badge and a tooltip naming what changed.
+
+        ``drift`` is what :meth:`FileScanner.compare_to_entries` returned, or None for
+        "not stale".
+        """
+        self._scan_drift = drift or None
+        self._refresh_scan_badge()
+
+    def set_input_folder_changed(self, previous: Optional[str]) -> None:
+        """The input folder setting itself changed - the list is now the wrong folder's.
+
+        No comparison of files can find this: every book in the list is exactly where
+        the list says it is, they are simply somewhere nobody is pointing at any more.
+        So the controller says so explicitly, and the button carries it like any other
+        reason to press it.
+        """
+        self._folder_changed_from = previous or None
+        self._refresh_scan_badge()
+
+    def _refresh_scan_badge(self) -> None:
+        """The "!" on Inputs, for drift that has no button of its own.
+
+        New books, missing books and finished books each get a button beside Inputs
+        (see _refresh_input_buttons). What is left for the badge is what only a load
+        answers: the folder setting changed, files changed size, a book lost some of
+        its files but not all of them, or the folder could not be read.
+        """
+        self._refresh_input_buttons()
+        action = self.tool_actions.get('scan')
+        if action is None:
+            return
+        base = ITEMS_BY_KEY['scan']
+        drift = getattr(self, '_scan_drift', None) or {}
+        moved = getattr(self, '_folder_changed_from', None)
+        files = drift.get('files', {})
+        partial = self._partially_missing_files()
+
+        why = []
+        if moved:
+            why.append(f'! The input folder was changed - the list still holds the '
+                       f'books from {moved}.')
+        if drift.get('unreadable'):
+            why.append('! The input folder could not be read.')
+        if files.get('changed'):
+            why.append(f'! {plural(len(files["changed"]), "audio file")} changed size '
+                       f'since this list was written:\n' + short_list(files['changed']))
+        if partial:
+            why.append(f'! {plural(len(partial), "audio file")} gone from books that '
+                       f'still have other files:\n' + short_list(partial))
+
+        size = self._icon_size()
+        action.setIcon(badged_icon('scan', TEXT, size, '!' if why else ''))
+        if not why:
+            action.setToolTip(self._tool_tooltip('scan', base.tooltip))
+            return
+        action.setToolTip(
+            self._tool_tooltip('scan', base.tooltip) + '\n\n' + '\n'.join(why)
+            + '\nLoad it before you review, or you are working on stale data.')
+
+    def _partially_missing_files(self) -> List[str]:
+        """Missing audio files that belong to books which still have others on disk.
+
+        Books with every file gone are the Missing button's; these are the rest.
+        """
+        files = (self._scan_drift or {}).get('files', {})
+        gone = files.get('missing') or []
+        if not gone:
+            return []
+        whole = set()
+        for entry_id in files.get('empty') or ():
+            entry = self.entries.get(entry_id)
+            if entry is not None:
+                whole.update(os.path.normcase(str(path))
+                             for path in entry.absolute_files())
+        return [path for path in gone if os.path.normcase(path) not in whole]
+
+    # ------------------------------------------------------- input buttons
+
+    def _add_input_buttons(self, icon: int) -> None:
+        """Clear finished / Missing / New / Not scanned, right after Inputs - shown only when needed.
+
+        Widgets with their text beside the icon, so the count reads even with toolbar
+        labels off. Placed after Inputs, or first when Inputs is not on the toolbar.
+        """
+        self._input_buttons = {}
+        actions = self.toolbar.actions()
+        scan = self.tool_actions.get('scan')
+        anchor = None
+        if scan in actions:
+            position = actions.index(scan) + 1
+            anchor = actions[position] if position < len(actions) else None
+        elif actions:
+            anchor = actions[0]
+        # Ordinary toolbar actions: same size, same label style as every other button.
+        # Each has its own icon in a single colour that says what it does; the arrow
+        # on Inputs takes the colour of the first one showing.
+        specs = [
+            ('finished', 'clear_finished', STATUS_TEXT['applied'], self._clear_finished),
+            ('missing', 'missing_books', STATUS_TEXT['rejected'], self._show_missing_books),
+            ('new', 'new_books', ACCENT, self._show_new_books),
+            ('unscanned', 'not_scanned', STATUS_TEXT['risky'], self._scan_unscanned),
+        ]
+        for key, glyph, colour, handler in specs:
+            action = QAction(make_icon(glyph, colour, icon), '', self)
+            action.triggered.connect(lambda _=False, h=handler: h())
+            if anchor is not None:
+                self.toolbar.insertAction(anchor, action)
+            else:
+                self.toolbar.addAction(action)
+            action.setVisible(False)
+            self._input_buttons[key] = (colour, action)
+
+    def _finished_books(self) -> List[BookEntry]:
+        return [entry for entry in self.entries.values()
+                if entry.status == STATUS_APPLIED]
+
+    def _missing_books(self) -> List[BookEntry]:
+        """Books with none of their files left in the input folder, not finalized."""
+        ids = (self._scan_drift or {}).get('files', {}).get('empty') or ()
+        return [self.entries[entry_id] for entry_id in ids
+                if entry_id in self.entries
+                and self.entries[entry_id].status != STATUS_APPLIED]
+
+    def _new_book_folders(self) -> List[str]:
+        """Folders in the input folder holding audio files the list does not know."""
+        added = (self._scan_drift or {}).get('files', {}).get('added') or ()
+        return sorted({str(Path(path).parent) for path in added},
+                      key=lambda folder: folder.lower())
+
+    def _refresh_input_buttons(self) -> None:
+        if not getattr(self, '_input_buttons', None):
+            return
+        finished = len(self._finished_books())
+        missing = len(self._missing_books())
+        new = len(self._new_book_folders())
+        unscanned = len(self._unscanned())
+        states = {
+            'finished': (finished, f'Clear {finished} finished',
+                         f'{plural(finished, "book")} finalized. Click to clear '
+                         f'{"it" if finished == 1 else "them"} from the list.\n'
+                         f'Files on disk and the Finalize log are untouched.'),
+            'missing': (missing, f'{missing} missing',
+                        f'{plural(missing, "book")} in the list with no files left in '
+                        f'the input folder.\nClick to see which, and remove them.'),
+            'new': (new, f'{new} new',
+                    f'{plural(new, "folder")} in the input folder with books not in '
+                    f'the list yet.\nClick to see which, and add them.'),
+            'unscanned': (unscanned, f'{unscanned} not scanned',
+                          f'{plural(unscanned, "book")} in the list without the Initial '
+                          f'Scan yet.\nClick to scan '
+                          f'{"it" if unscanned == 1 else "them"}: tags and names, '
+                          f'read locally.'),
+        }
+        arrow_colour = ''
+        for key, (count, text, tooltip) in states.items():
+            colour, action = self._input_buttons[key]
+            action.setText(text)
+            action.setToolTip(tooltip)
+            action.setVisible(count > 0)
+            if count > 0 and not arrow_colour:
+                arrow_colour = colour
+        self._set_inputs_arrow(arrow_colour)
+
+    def _scan_unscanned(self) -> None:
+        """Initial Scan on every listed book that has not had it."""
+        unscanned = self._unscanned()
+        if unscanned:
+            self.resolve_requested.emit(unscanned, list(INITIAL_SCAN_TIERS))
+
+    def _set_inputs_arrow(self, colour: str) -> None:
+        """A filled ">" on Inputs' right edge, in the colour of the action beside it."""
+        scan = self.tool_actions.get('scan')
+        button = self.toolbar.widgetForAction(scan) if scan is not None else None
+        if button is None:
+            return
+        shown = bool(colour)
+        # A toolbar rebuild makes a new Inputs button, so the arrow is remade for it.
+        arrow = getattr(self, '_inputs_arrow', None)
+        if arrow is None or arrow.parentWidget() is not button:
+            if not shown:
+                return
+            arrow = self._inputs_arrow = _edge_arrow(button)
+        if shown and arrow.property('arrowColour') != colour:
+            arrow.setProperty('arrowColour', colour)
+            arrow.setPixmap(_edge_arrow_pixmap(colour, button.devicePixelRatioF()))
+        arrow.setVisible(shown)
+        # Room for the arrow, via the app stylesheet: a stylesheet of the button's own
+        # crashed Qt when the toolbar rebuild deleted the button.
+        if bool(button.property('edgeArrow')) != shown:
+            button.setProperty('edgeArrow', shown)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _clear_finished(self) -> None:
+        from .item_list import books_lines, confirm_list
+
+        finished = self._finished_books()
+        if not finished:
+            return
+        if not confirm_list(
+                self, 'Clear finished books',
+                f'Remove {plural(len(finished), "finalized book")} from the list?\n\n'
+                f'Their files stay where Finalize put them, and the Finalize log can '
+                f'still revert them. The list is backed up first.',
+                [(f'Finished ({len(finished)}):', books_lines(finished, files=False))],
+                yes=f'Clear {len(finished)}', no='Cancel'):
+            return
+        self.remove_entries_requested.emit(
+            [entry.entry_id for entry in finished],
+            f'Cleared {plural(len(finished), "finished book")} from the list')
+
+    def _show_missing_books(self) -> None:
+        from .item_list import books_lines, list_dialog
+
+        missing = self._missing_books()
+        if not missing:
+            return
+        remove = f'Remove {len(missing)} from the list'
+        if list_dialog(
+                self, 'Missing books',
+                f'{plural(len(missing), "book")} in the list '
+                f'{"has" if len(missing) == 1 else "have"} no audio files left in the '
+                f'input folder - deleted or moved outside this program.',
+                [(f'Missing ({len(missing)}):', books_lines(missing, files=False))],
+                [remove, 'Close'], default=1) == remove:
+            self.purge_requested.emit([entry.entry_id for entry in missing])
+
+    def _show_new_books(self) -> None:
+        from .item_list import list_dialog
+        from ..load_options import KeepOptions
+
+        folders = self._new_book_folders()
+        if not folders:
+            return
+        root = self.settings.get_path('AO_INPUT_DIR')
+        shown = []
+        for folder in folders:
+            try:
+                shown.append(str(Path(folder).relative_to(root)))
+            except ValueError:
+                shown.append(folder)
+        missing = len(self._missing_books())
+        add = 'Add them'
+        if list_dialog(
+                self, 'New books',
+                f'{plural(len(folders), "folder")} in the input folder '
+                f'{"holds" if len(folders) == 1 else "hold"} audio the list does not '
+                f'have yet. Adding them reads the input folder; everything already in '
+                f'the list is kept as it is.'
+                + (f'\n\nThe {plural(missing, "missing book")} '
+                   f'{"is" if missing == 1 else "are"} dropped from the list by the '
+                   f'same read.' if missing else ''),
+                [(f'New ({len(folders)}):', shown)],
+                [add, 'Close'], default=0) == add:
+            self.load_requested.emit(None, KeepOptions.keep_everything(), False)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        # Coming back to the window is when a folder deleted or added in Explorer
+        # should show up on the buttons. At most every few seconds; the walk is
+        # directory listings and sizes only.
+        if (event.type() == QEvent.Type.ActivationChange and self.isActiveWindow()
+                and time.monotonic() - getattr(self, '_last_freshness_check', 0.0) > 3.0):
+            self._last_freshness_check = time.monotonic()
+            self._freshness_timer.start()
+
+    # --------------------------------------------------------- unsaved work
+
+    def flash_unsaved(self, seconds: float = 10.0, announce: bool = True,
+                      only=None) -> int:
+        """Light up the rows carrying work that has not been written out yet.
+
+        Pressing Inputs is the moment to notice that eleven books are approved and
+        still sitting here, so they are shown rather than described. The highlight
+        fades over `seconds` - but a highlight you looked away from is no help at all,
+        so the "Unsaved changes" shape filter can pull exactly these rows back up on
+        demand, whenever.
+
+        Returns how many there were. `announce` off leaves the status line alone, for
+        callers with something of their own to say about the same event.
+        """
+        from ..load_options import unsaved_entries
+
+        pool = self.entries.values()
+        if only is not None:
+            # A load of some rows speaks for those rows only; lighting up every other
+            # unsaved book as well paints the whole list as if all of it was loaded.
+            wanted = {entry.entry_id for entry in only}
+            pool = [entry for entry in pool if entry.entry_id in wanted]
+        waiting = unsaved_entries(pool)
+        self._flash = {entry.entry_id: 1.0 for entry in waiting}
+        self._flash_left = float(seconds) if waiting else 0.0
+        if not waiting:
+            self._flash_timer.stop()
+            self._paint_flash()
+            return 0
+
+        self._paint_flash()
+        self._flash_timer.start()
+        if announce:
+            # Short, because the status label is width-capped - the whole sentence is
+            # in its tooltip, and the shape filter is the way back to these rows.
+            self.show_message(f'{len(waiting)} book'
+                              f'{" has" if len(waiting) == 1 else "s have"} unsaved '
+                              f'changes - highlighted, and under the "Unsaved changes" '
+                              f'filter')
+        return len(waiting)
+
+    def _tick_flash(self) -> None:
+        self._flash_left -= self._flash_timer.interval() / 1000.0
+        if self._flash_left <= 0:
+            self._flash_timer.stop()
+            self._flash.clear()
+            self._paint_flash()
+            return
+        # Full strength for most of it, then fade out over the last second and a half,
+        # so it does not simply vanish while you are still looking at it.
+        strength = max(0.0, min(1.0, self._flash_left / 1.5))
+        self._flash = {key: strength for key in self._flash}
+        self._paint_flash()
+
+    def _paint_flash(self) -> None:
+        """Push the current highlight strength onto the rows and repaint."""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, COL_FILES)
+            entry_id = item.data(ROLE_ENTRY_ID) if item is not None else None
+            strength = self._flash.get(entry_id, 0.0)
+            for column in range(len(COLUMNS)):
+                cell = self.table.item(row, column)
+                if cell is not None:
+                    cell.setData(ROLE_FLASH, strength or None)
+        self.table.viewport().update()
+
+    def _refresh_identify_badge(self) -> None:
+        """Put the number of outstanding identifications on the Identify button."""
+        action = self.tool_actions.get('identify')
+        if action is None:
+            return
+        count = int((self.queue_provider() or {}).get('identifying') or 0)
+        size = self._icon_size()
+        action.setIcon(badged_icon('identify', TEXT, size, count))
+        base = ITEMS_BY_KEY['identify']
+        unscanned = len(self._unscanned())
+        label = INITIAL_SCAN_LABEL if unscanned else base.label
+        if action.text() != label:
+            action.setText(label)
+            # A different name is a different width; let the toolbar re-decide
+            # whether its labels still fit.
+            self._labelled_toolbar_width = 0
+            QTimer.singleShot(0, self._fit_toolbar)
+        # Disabled, the tooltip's job is to say why - the queue count is beside the
+        # point when the button cannot be pressed. See refresh_action_states.
+        if not action.isEnabled():
+            body = 'Nothing is loaded yet - press Ctrl+R'
+        elif unscanned:
+            body = (f'{plural(unscanned, "book")} not scanned yet. Reads the audio tags '
+                    f'and the file and folder names - locally, no book databases, web '
+                    f'search or language model.\nRuns on the selected rows that need '
+                    f'it, or on all of them. Afterwards this button is Identify again.')
+        else:
+            body = base.tooltip
+        action.setToolTip(
+            self._tool_tooltip('identify', body)
+            + (f'\n\n{plural(count, "identification")} outstanding. '
+               f'Right-click to open the queue.' if count else ''))
+
+    def show_queue_window(self) -> None:
+        """Open (or raise) the queue window."""
+        from .queue_dialog import QueueDialog
+
+        if self._queue_dialog is None:
+            dialog = QueueDialog(parent=self)
+            dialog.remove_requested.connect(self.queue_remove_requested.emit)
+            dialog.clear_requested.connect(self.queue_clear_requested.emit)
+            # "Cancel the running job" means exactly that. Routing it through the
+            # blanket cancel binned everything queued behind it as well.
+            dialog.cancel_requested.connect(self.cancel_current_requested.emit)
+            dialog.finished.connect(lambda _: setattr(self, '_queue_dialog', None))
+            self._queue_dialog = dialog
+        self._refresh_queue_dialog()
+        self._queue_dialog.show()
+        self._queue_dialog.raise_()
+        self._queue_dialog.activateWindow()
+
+    def _refresh_queue_dialog(self) -> None:
+        if self._queue_dialog is None:
+            return
+        done, total, message = self._last_progress
+        self._queue_dialog.update_status(self.queue_provider() or {},
+                                         done, total, message)
+
+    def hide_progress(self) -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._progress_action.setVisible(False)
+
+    def set_busy(self, busy: bool) -> None:
+        """Show that a job is running - without taking the window away from you.
+
+        The table stays live: reviewing, editing and approving rows are local
+        operations that have nothing to do with the background job, and blocking them
+        for the length of a network run made the app feel broken. Only the actions
+        that would start a *second* long job are held back, and those queue rather
+        than being refused.
+        """
+        self._cancel_action.setVisible(busy)
+        self._busy = busy
+        if busy and not self._spinner.isActive():
+            self._spinner.start()
+        elif not busy and self._spinner.isActive():
+            self._spinner.stop()
+        # Nothing is disabled: a second job queues behind the first. Greying the
+        # buttons out was what made the queue impossible to reach.
+        if not busy:
+            self._last_progress = (0, 0, '')
+            self.hide_progress()
+            # Hand the bar back to the theme, or it keeps the last frame of the
+            # sweep the next time something makes it visible.
+            self.progress.setStyleSheet('')
+        self._render_status()
+        # Every job that changes what Undo can reach - an apply, an undo, a merge -
+        # ends by calling this, so it is where the toolbar catches up with the journal.
+        self.refresh_action_states()
+        self._refresh_identify_badge()
+        self._refresh_queue_dialog()
+        self._refresh_history_dialog()
+
+    def show_report(self, title: str, body: str) -> None:
+        """Scrollable plain-text report, for anything without a richer view."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(900, 620)
+        layout = QVBoxLayout(dialog)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(body)
+        view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(view)
+        close = QPushButton('Close')
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()

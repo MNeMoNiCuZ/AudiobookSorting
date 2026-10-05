@@ -48,7 +48,7 @@ Optional:
 ## Usage
 
 ```bash
-python main.py
+python src/main.py
 ```
 
 Or run `launch.bat`, which uses the `venv` if present.
@@ -85,12 +85,12 @@ Copy mode is the default, so the original files are left in place.
 ### Command line
 
 ```bash
-python main.py --scan                             # scan and identify, print a report
-python main.py --scan --no-identify               # scan only
-python main.py --scan --auto-approve 0.9 --apply  # approve at or above 0.9 and apply
-python main.py --scan --dry-run                   # print what --apply would do
-python main.py --undo-last                        # reverse the last apply
-python main.py --undo-all                         # reverse every apply
+python src/main.py --scan                             # scan and identify, print a report
+python src/main.py --scan --no-identify               # scan only
+python src/main.py --scan --auto-approve 0.9 --apply  # approve at or above 0.9 and apply
+python src/main.py --scan --dry-run                   # print what --apply would do
+python src/main.py --undo-last                        # reverse the last apply
+python src/main.py --undo-all                         # reverse every apply
 ```
 
 | Flag | Overrides |
@@ -103,6 +103,7 @@ python main.py --undo-all                         # reverse every apply
 Test LLM provider connections:
 
 ```bash
+cd src
 python -m scripts.test_provider --all
 ```
 
@@ -113,3 +114,11 @@ build.bat
 ```
 
 Produces a standalone `AudiobookOrganizer.exe` in the project root.
+
+## Folders
+
+| Folder | Contents |
+|--------|----------|
+| `src/` | All code |
+| `user/` | Settings (`.env`), the book list, lookup cache, logs and backups |
+| `src/junk/` | Build intermediates, bytecode and scratch files; safe to delete |
