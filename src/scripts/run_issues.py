@@ -27,6 +27,7 @@ LABELS = {
     'api:openlibrary': 'Open Library', 'api:googlebooks': 'Google Books',
     'api:librivox': 'LibriVox', 'search:goodreads': 'Goodreads',
     'search:brave': 'Brave Search', 'search:duckduckgo': 'DuckDuckGo',
+    'search:parallel': 'Parallel', 'search:exa': 'Exa',
     'llm': 'Language model',
 }
 

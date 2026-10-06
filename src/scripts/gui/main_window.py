@@ -1388,6 +1388,8 @@ class MainWindow(QMainWindow):
 
     def refresh_toolbar(self) -> None:
         """Rebuild from settings - called again when the Settings page saves."""
+        # The Inputs arrow belongs to the button destroyed by this rebuild.
+        self._inputs_arrow = None
         self.toolbar.clear()
         self.tool_actions.clear()
         # The buttons those filters were watching have just been destroyed with the

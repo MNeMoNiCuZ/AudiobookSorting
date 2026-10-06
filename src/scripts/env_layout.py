@@ -63,7 +63,8 @@ SECTIONS: List[Tuple[str, str, List[str]]] = [
     ('Credentials',
      'All optional - the app runs with every one blank, it just has fewer places '
      'to look. Each is explained again beside the feature that uses it.',
-     ['AO_SEARCH_BRAVE_KEY', 'AO_GOOGLE_BOOKS_KEY', '*credential_providers']),
+     ['AO_SEARCH_BRAVE_KEY', 'AO_SEARCH_PARALLEL_KEY', 'AO_SEARCH_EXA_KEY',
+      'AO_GOOGLE_BOOKS_KEY', '*credential_providers']),
 
     ('Folders', '', ['AO_INPUT_DIR', 'AO_OUTPUT_DIR']),
 
@@ -87,7 +88,7 @@ SECTIONS: List[Tuple[str, str, List[str]]] = [
      'The five tiers, in the order they run. Each fills in only what the earlier '
      'ones could not.',
      ['AO_ENABLE_METADATA', 'AO_ENABLE_REGEX', 'AO_ENABLE_API', 'AO_ENABLE_SEARCH',
-      'AO_ENABLE_LLM', 'AO_API_SOURCES', 'AO_CONFIDENCE_SCORE',
+      'AO_ENABLE_LLM', 'AO_API_SOURCES', 'AO_SEARCH_ORDER', 'AO_CONFIDENCE_SCORE',
       'AO_ALWAYS_SEARCH_TO_TIER', 'AO_REQUIRE_COVER', 'AO_FOLDER_REASONING',
       'AO_LLM_BATCH_SIZE',
       'AO_REVIEW_APPROVE_THRESHOLD', 'AO_REVIEW_REJECT_THRESHOLD',

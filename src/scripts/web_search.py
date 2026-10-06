@@ -12,9 +12,9 @@ Two complementary strategies:
    tail of books Goodreads misses.
 
 For (2), DuckDuckGo's endpoints now answer every request with an anti-bot
-challenge (HTTP 202 and no rows), so it cannot be relied on. Set a Brave Search
-API key to get a real engine back; DuckDuckGo is still tried last in case it
-recovers.
+challenge (HTTP 202 and no rows), so it cannot be relied on. Configure Brave,
+Parallel or Exa keys for API search. Providers are tried in the configured order,
+with automatic fallback when a provider fails or returns no results.
 
 Everything here is best-effort: any failure returns nothing and the resolver moves on.
 """
@@ -31,6 +31,20 @@ from urllib.parse import quote_plus, urljoin
 from .models import normalize
 
 logger = logging.getLogger(__name__)
+
+SEARCH_PROVIDERS = {'brave': 'Brave Search', 'parallel': 'Parallel',
+                    'exa': 'Exa', 'duckduckgo': 'DuckDuckGo'}
+
+
+def search_order(value: str) -> List[str]:
+    """Keep valid unique providers, appending any omitted providers."""
+    order = []
+    for provider in (value or '').lower().split(','):
+        provider = provider.strip()
+        if provider in SEARCH_PROVIDERS and provider not in order:
+            order.append(provider)
+    return order + [provider for provider in SEARCH_PROVIDERS if provider not in order]
+
 
 USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/122.0 Safari/537.36')
@@ -54,8 +68,14 @@ class WebSearchClient:
         self.scrape = scrape
         self.settings = settings
         self.brave_key = ''
+        self.parallel_key = ''
+        self.exa_key = ''
+        self.provider_order = list(SEARCH_PROVIDERS)
         if settings is not None:
             self.brave_key = (settings.get('AO_SEARCH_BRAVE_KEY', '') or '').strip()
+            self.parallel_key = (settings.get('AO_SEARCH_PARALLEL_KEY', '') or '').strip()
+            self.exa_key = (settings.get('AO_SEARCH_EXA_KEY', '') or '').strip()
+            self.provider_order = search_order(settings.get('AO_SEARCH_ORDER', ''))
         self.logger = logging.getLogger(__name__)
         self._last_request = 0.0
         self.min_interval = 1.0  # be polite; these are not APIs
@@ -87,6 +107,7 @@ class WebSearchClient:
         self.last_from_cache = False
         self.last_failures = {}
         self.last_skipped = []
+        self.last_error = ''
         subject = _subject(hints)
         self.last_query = query = (f'{subject} audiobook series' if subject else '')
         if not subject:
@@ -104,12 +125,12 @@ class WebSearchClient:
         # builds a fresh bound method on every attribute access, so `strategy is
         # self._from_goodreads` was never true - which silently mislabelled every
         # scrape as a search, and left scrape=False unable to switch scraping off.
-        engine = 'brave' if self.brave_key else 'duckduckgo'
         for label, strategy in (('goodreads', self._from_goodreads),
-                                (engine, self._from_duckduckgo)):
+                                ('search', self._from_duckduckgo)):
             if not self.scrape and label == 'goodreads':
                 continue
-            self.last_sites.append(label)
+            if label != 'search':
+                self.last_sites.append(label)
             try:
                 found = strategy(hints)
             except Exception as exc:
@@ -293,40 +314,43 @@ class WebSearchClient:
         return merged
 
     def _ddg(self, query: str) -> List[Dict[str, str]]:
-        """Search results from the best engine currently available.
-
-        Brave first when a key is configured - it is a real API and answers
-        reliably. DuckDuckGo is only a fallback: its endpoints now return an
-        anti-bot challenge (HTTP 202, zero rows) to unattended callers, so it
-        usually contributes nothing.
-
-        When every engine refuses, the caller must be able to say *"the engine
-        refused"* rather than *"there are no results"* - they look identical from
-        here, and only one of them is our fault.
-        """
+        """Try configured providers in priority order until one returns results."""
         self.last_error = ''
-
-        if self.brave_key and self._off('brave'):
-            self.last_error = 'Brave was switched off for this run after refusing'
-        elif self.brave_key:
+        if not any((self.brave_key, self.parallel_key, self.exa_key)):
+            self._note('no AO_SEARCH_BRAVE_KEY, AO_SEARCH_PARALLEL_KEY or '
+                       'AO_SEARCH_EXA_KEY set; only DuckDuckGo is available')
+        for provider in self.provider_order:
+            if provider != 'duckduckgo' and not getattr(self, f'{provider}_key'):
+                continue
+            if self.should_cancel is not None and self.should_cancel():
+                break
+            if self._off(provider):
+                self._note(f'{SEARCH_PROVIDERS[provider]} was switched off for this run')
+                continue
+            self.last_sites.append(provider)
             try:
-                self._wait('brave')
-                results = self._brave(query)
-                self._ok('brave')
+                self._wait(provider)
+                strategy = (self._duckduckgo if provider == 'duckduckgo'
+                            else getattr(self, f'_{provider}'))
+                results = strategy(query)
+                if provider not in self.last_failures:
+                    self._ok(provider)
                 if results:
                     return results
-                self.last_error = 'Brave returned no rows'
+                self._note(f'{SEARCH_PROVIDERS[provider]} returned no rows')
             except Exception as exc:
-                self.last_error = f'Brave search failed: {exc}'
-                self._limited('brave', str(exc), permanent='rejected' in str(exc))
-                self.logger.debug('Brave failed (%s), falling back to DuckDuckGo', exc)
-        else:
-            self.last_error = ('no AO_SEARCH_BRAVE_KEY set, so only DuckDuckGo is '
-                               'available and it blocks automated callers')
+                # Do not include arbitrary exception text which might echo credentials.
+                message = str(exc) if isinstance(exc, SearchProviderError) else type(exc).__name__
+                if isinstance(exc, RuntimeError) and 'HTTP ' in str(exc):
+                    message = str(exc).split(' - ')[0]
+                self._note(f'{SEARCH_PROVIDERS[provider]} search failed: {message}')
+                self._limited(provider, message,
+                              permanent=getattr(exc, 'permanent', False)
+                              or 'rejected' in str(exc))
+        return []
 
-        if self._off('duckduckgo'):
-            self._note('DuckDuckGo was switched off for this run after refusing')
-            return []
+    def _duckduckgo(self, query: str) -> List[Dict[str, str]]:
+        """DuckDuckGo library with its existing HTML fallback."""
 
         try:
             from duckduckgo_search import DDGS
@@ -387,9 +411,10 @@ class WebSearchClient:
             headers={'Accept': 'application/json',
                      'X-Subscription-Token': self.brave_key})
         if response.status_code == 429:
-            raise RuntimeError('rate limited (the free tier allows one query/second)')
-        if response.status_code in (401, 403):
-            raise RuntimeError(f'HTTP {response.status_code} - the API key was rejected')
+            raise SearchProviderError('HTTP 429: rate or quota limit reached', permanent=True)
+        if response.status_code in (401, 402, 403):
+            raise SearchProviderError(f'HTTP {response.status_code}: quota exhausted or key rejected',
+                                      permanent=True)
         if response.status_code != 200:
             raise RuntimeError(f'HTTP {response.status_code}')
 
@@ -398,6 +423,38 @@ class WebSearchClient:
                  'body': _clean(_strip_tags(row.get('description') or '')),
                  'href': row.get('url') or ''}
                 for row in (payload.get('web', {}).get('results') or [])][:8]
+
+    def _search_api(self, url: str, key: str, payload: Dict[str, Any]) -> Dict:
+        import requests
+
+        response = requests.post(url, json=payload, timeout=self.timeout,
+                                 headers={'x-api-key': key, 'Accept': 'application/json'})
+        code = response.status_code
+        if code != 200:
+            reason = {401: 'API key rejected', 403: 'access denied',
+                      402: 'quota exhausted', 429: 'rate or quota limit reached'}.get(code, 'request failed')
+            raise SearchProviderError(f'HTTP {code}: {reason}',
+                                      permanent=code in (401, 402, 403, 429))
+        return response.json()
+
+    def _parallel(self, query: str) -> List[Dict[str, str]]:
+        payload = self._search_api('https://api.parallel.ai/v1/search', self.parallel_key,
+                                   {'objective': f'Find book author, series and series position for {query}.',
+                                    'search_queries': [query], 'mode': 'basic',
+                                    'max_chars_total': 8000})
+        return [{'title': _clean(row.get('title')),
+                 'body': _clean(' '.join(row.get('excerpts') or [])),
+                 'href': row.get('url') or ''}
+                for row in payload['results'][:8]]
+
+    def _exa(self, query: str) -> List[Dict[str, str]]:
+        payload = self._search_api('https://api.exa.ai/search', self.exa_key,
+                                   {'query': query, 'type': 'auto', 'numResults': 8,
+                                    'contents': {'highlights': True}})
+        return [{'title': _clean(row.get('title')),
+                 'body': _clean(' '.join(row.get('highlights') or [])),
+                 'href': row.get('url') or ''}
+                for row in payload['results'][:8]]
 
     @staticmethod
     def _parse_result_title(text: str) -> Dict[str, str]:
@@ -488,6 +545,12 @@ class WebSearchClient:
         if site:
             self._ok(site)
         return response.text
+
+
+class SearchProviderError(RuntimeError):
+    def __init__(self, message: str, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 class _Unset:

@@ -43,12 +43,15 @@ SECRET_PLACEHOLDERS: Dict[str, str] = {
 # Service keys, in the order they appear in the Credentials group. Not derived from
 # SCHEMA's 'secret' kind: the order is a judgement, and the LLM provider's own key is
 # deliberately not here - it belongs to the selected provider, not to the app.
-CREDENTIAL_KEYS = ('AO_SEARCH_BRAVE_KEY', 'AO_GOOGLE_BOOKS_KEY')
+CREDENTIAL_KEYS = ('AO_SEARCH_BRAVE_KEY', 'AO_SEARCH_PARALLEL_KEY',
+                   'AO_SEARCH_EXA_KEY', 'AO_GOOGLE_BOOKS_KEY')
 
 # Where to get the key, as links. Each names the page it opens and the button to
 # press on it, because "enable the Books API" is the name of the task, not the name
 # of anything on screen - the button on that page just says Enable.
 SECRET_HINTS: Dict[str, str] = {
+    'AO_SEARCH_PARALLEL_KEY': '<a href="https://platform.parallel.ai">Parallel</a>',
+    'AO_SEARCH_EXA_KEY': '<a href="https://dashboard.exa.ai">Exa</a>',
     'AO_SEARCH_BRAVE_KEY':
         'Create a key at '
         '<a href="https://brave.com/search/api">brave.com/search/api</a>.',
@@ -72,7 +75,7 @@ TABS: Dict[str, list] = {
         # Credentials are not here. Every API key lives on the Providers tab, in one
         # Credentials group at the top of it - one place to look for anything that
         # authenticates. See _build_credentials_box.
-        'AO_ENABLE_LLM', 'AO_API_SOURCES', 'AO_CONFIDENCE_SCORE',
+        'AO_ENABLE_LLM', 'AO_API_SOURCES', 'AO_SEARCH_ORDER', 'AO_CONFIDENCE_SCORE',
         'AO_ALWAYS_SEARCH_TO_TIER', 'AO_REQUIRE_COVER', 'AO_FOLDER_REASONING',
         'AO_LLM_BATCH_SIZE',
         'AO_REVIEW_APPROVE_THRESHOLD', 'AO_REVIEW_REJECT_THRESHOLD',
@@ -361,7 +364,8 @@ class SettingsDialog(QDialog):
             else:
                 cell_layout.addWidget(widget)
 
-            cell_layout.addWidget(hint)
+            if key != 'AO_SEARCH_ORDER':
+                cell_layout.addWidget(hint)
             form.addRow(label, cell)
 
             # "Remember layout" is the setting the reset belongs to: it is what saved
@@ -405,6 +409,8 @@ class SettingsDialog(QDialog):
         return scroll
 
     def _make_widget(self, key: str, kind: str, default: str) -> QWidget:
+        if key == 'AO_SEARCH_ORDER':
+            return self._make_search_order_widget()
         if key == 'AO_API_SOURCES':
             return self._make_sources_widget()
 
@@ -539,6 +545,47 @@ class SettingsDialog(QDialog):
         # A key with nothing to say about it should not reserve a blank line.
         status.setVisible(bool(status.text()))
         return widget
+
+    def _make_search_order_widget(self) -> QWidget:
+        widget = QWidget()
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        providers = QListWidget()
+        providers.setObjectName('providers')
+        providers.setFixedHeight(110)
+        providers.setToolTip('Search providers in priority order; providers without keys are skipped')
+        row.addWidget(providers, stretch=1)
+        buttons = QVBoxLayout()
+        for label, delta in (('Move up', -1), ('Move down', 1)):
+            button = QPushButton(label)
+            button.setToolTip(f'{label} in search priority')
+            button.clicked.connect(lambda _=False, d=delta: self._move_search_provider(d))
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        row.addLayout(buttons)
+        return widget
+
+    def _load_search_order(self, value: str) -> None:
+        from ..web_search import SEARCH_PROVIDERS, search_order
+
+        providers = self.widgets['AO_SEARCH_ORDER'].findChild(QListWidget, 'providers')
+        providers.clear()
+        for provider in search_order(value):
+            item = QListWidgetItem(SEARCH_PROVIDERS[provider])
+            item.setData(Qt.ItemDataRole.UserRole, provider)
+            item.setToolTip(SEARCH_PROVIDERS[provider])
+            providers.addItem(item)
+        providers.setCurrentRow(0)
+
+    def _move_search_provider(self, delta: int) -> None:
+        providers = self.widgets['AO_SEARCH_ORDER'].findChild(QListWidget, 'providers')
+        index = providers.currentRow()
+        target = index + delta
+        if index < 0 or not 0 <= target < providers.count():
+            return
+        providers.insertItem(target, providers.takeItem(index))
+        providers.setCurrentRow(target)
+        self._changed('AO_SEARCH_ORDER')
 
     def _make_sources_widget(self) -> QWidget:
         """One checkbox per known book database.
@@ -712,17 +759,19 @@ class SettingsDialog(QDialog):
 
     def _probe_secret(self, key: str, typed: str) -> tuple:
         """Make the one request that proves ``key``, and describe what came back."""
-        if key == 'AO_SEARCH_BRAVE_KEY':
-            from ..web_search import WebSearchClient
+        if key in ('AO_SEARCH_BRAVE_KEY', 'AO_SEARCH_PARALLEL_KEY', 'AO_SEARCH_EXA_KEY'):
+            from ..web_search import SEARCH_PROVIDERS, WebSearchClient
 
             client = WebSearchClient(cache=None, timeout=15)
-            client.brave_key = typed
+            provider = key.removeprefix('AO_SEARCH_').removesuffix('_KEY').lower()
+            name = SEARCH_PROVIDERS[provider]
+            setattr(client, f'{provider}_key', typed)
             try:
-                rows = client._brave('Dune Frank Herbert goodreads series')
+                rows = getattr(client, f'_{provider}')('Dune Frank Herbert goodreads series')
             except Exception as exc:
-                return False, f'Brave refused: {exc}'
+                return False, f'{name} refused: {exc}'
             if rows:
-                return True, (f'Works - Brave answered with {len(rows)} result(s) '
+                return True, (f'Works - {name} answered with {len(rows)} result(s) '
                               f'for a test search.')
             return False, ('The key was accepted but the search matched nothing, '
                            'which is odd for Dune - see the log.')
@@ -962,7 +1011,9 @@ class SettingsDialog(QDialog):
         for key, widget in self.widgets.items():
             _, kind, _ = SCHEMA[key]
             value = self.settings.get(key)
-            if key == 'AO_API_SOURCES':
+            if key == 'AO_SEARCH_ORDER':
+                self._load_search_order(value)
+            elif key == 'AO_API_SOURCES':
                 enabled = {s.strip().lower() for s in value.split(',') if s.strip()}
                 for source, box in self._sources_boxes(widget):
                     box.setChecked(source in enabled)
@@ -1117,7 +1168,11 @@ class SettingsDialog(QDialog):
         values: Dict[str, str] = {}
         for key, widget in self.widgets.items():
             _, kind, _ = SCHEMA[key]
-            if key == 'AO_API_SOURCES':
+            if key == 'AO_SEARCH_ORDER':
+                providers = widget.findChild(QListWidget, 'providers')
+                values[key] = ','.join(providers.item(index).data(Qt.ItemDataRole.UserRole)
+                                       for index in range(providers.count()))
+            elif key == 'AO_API_SOURCES':
                 chosen = [s for s, box in self._sources_boxes(widget) if box.isChecked()]
                 # Every source off would silently disable the tier; fall back instead.
                 values[key] = ','.join(chosen) or SCHEMA[key][0]
@@ -1179,7 +1234,9 @@ class SettingsDialog(QDialog):
             return
         for key, widget in self.widgets.items():
             default, kind, _ = SCHEMA[key]
-            if key == 'AO_API_SOURCES':
+            if key == 'AO_SEARCH_ORDER':
+                self._load_search_order(default)
+            elif key == 'AO_API_SOURCES':
                 enabled = {s.strip() for s in default.split(',')}
                 for source, box in self._sources_boxes(widget):
                     box.setChecked(source in enabled)
