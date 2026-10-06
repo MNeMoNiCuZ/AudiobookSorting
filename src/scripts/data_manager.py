@@ -39,6 +39,8 @@ class DataManager:
         self._last_saved: Dict[str, Dict] = {}
         self.load()
         self._last_saved = self._snapshot()
+        self.set_aside: List[str] = []
+        self._load_set_aside()
 
     # ------------------------------------------------------------------- load
 
@@ -98,6 +100,50 @@ class DataManager:
             self.logger.warning('Moved unreadable save file to %s', backup)
         except OSError:
             pass
+
+    # -------------------------------------------------------------- set aside
+
+    @property
+    def set_aside_file(self) -> Path:
+        return self.save_file.parent / 'set_aside.json'
+
+    def _load_set_aside(self) -> None:
+        """Read the files kept off the list. One that is gone from disk is forgotten."""
+        try:
+            raw = json.loads(self.set_aside_file.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            raw = []
+        paths = [str(path) for path in raw if isinstance(path, str)]             if isinstance(raw, list) else []
+        kept = [path for path in paths if Path(path).exists()]
+        self._store_set_aside(kept, write=kept != paths)
+
+    def add_set_aside(self, path: Path) -> None:
+        """Keep one file off the list - and out of "new" - while it stays on disk."""
+        key = os.path.normcase(os.path.normpath(str(path)))
+        paths = [p for p in self.set_aside
+                 if os.path.normcase(os.path.normpath(p)) != key]
+        self._store_set_aside(paths + [str(path)])
+
+    def clear_set_aside(self) -> List[str]:
+        """Let every set-aside file be found again. Returns the ones released."""
+        released = list(self.set_aside)
+        self._store_set_aside([])
+        return released
+
+    def _store_set_aside(self, paths: List[str], write: bool = True) -> None:
+        from .file_scanner import set_aside_files
+
+        self.set_aside = list(paths)
+        set_aside_files(self.set_aside)
+        if not write:
+            return
+        try:
+            self.set_aside_file.parent.mkdir(parents=True, exist_ok=True)
+            self.set_aside_file.write_text(
+                json.dumps(self.set_aside, indent=2, ensure_ascii=False),
+                encoding='utf-8')
+        except OSError as exc:
+            self.logger.error('Could not save %s: %s', self.set_aside_file, exc)
 
     # ------------------------------------------------------------------- save
 

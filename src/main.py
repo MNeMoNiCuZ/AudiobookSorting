@@ -226,7 +226,7 @@ def check_scan_freshness(app: 'Application', window, log: bool = True) -> Option
         return None
 
     stale = any(drift.get(key) for key in ('added', 'missing', 'changed', 'unreadable',
-                                                'empty'))
+                                                'empty', 'loose'))
     if stale and log:
         logger.info('Input folder has drifted from the saved entries: %s',
                     {key: value for key, value in drift.items() if key != 'files'})
@@ -838,6 +838,122 @@ def run_gui(app: Application) -> int:
         elif removed:
             window.show_message(f'Merged, and deleted {removed} chapter files')
 
+    # --- chapter split
+    def do_split(entry, books):
+        """Cut one .m4b into the books named in the split dialog, queued like a merge."""
+        from scripts.chapter_split import SplitPart, split_m4b
+
+        source = entry.absolute_files()[0]
+        parts = [SplitPart(start=book.chapters[0].start, end=book.chapters[-1].end,
+                           destination=book.folder / book.filename,
+                           values=book.values, chapters=tuple(book.chapters))
+                 for book in books]
+        worker = FunctionWorker(
+            split_m4b, source, parts,
+            label=f'Split {source.name} into {len(parts)} books', kind='merge',
+            ffmpeg=app.settings.get('AO_FFMPEG_PATH') or 'ffmpeg')
+
+        worker.signals.progress.connect(
+            lambda done_, total_, message: window.set_row_progress(
+                entry.entry_id, (done_ / total_) if total_ else 0.03, message))
+
+        def done(result):
+            window.set_row_progress(entry.entry_id, None)
+            window.set_busy(workers.busy)
+            ok, message, written = result
+            window.show_message(message)
+            if not ok:
+                QMessageBox.warning(window, 'Split failed', message)
+                return
+            _finish_split(entry, books, written)
+
+        worker.signals.error.connect(
+            lambda _text: window.set_row_progress(entry.entry_id, None))
+        worker.signals.cancelled.connect(
+            lambda: window.set_row_progress(entry.entry_id, None))
+        worker.signals.finished.connect(done)
+        wire(worker)
+
+    def _finish_split(entry, books, written) -> None:
+        """List the new books, then ask what happens to the original."""
+        import shutil
+
+        from scripts.gui.main_window import _move_to_trash
+        from scripts.models import Field, clean_value
+
+        source = entry.absolute_files()[0]
+        app.data.backup('before-split')
+        added = []
+        for book, path in zip(books, written):
+            # The original's cover images go with every book cut from it.
+            images = []
+            for name in entry.image_files:
+                try:
+                    shutil.copy2(Path(entry.folder) / name, path.parent / name)
+                    images.append(name)
+                except OSError as exc:
+                    logger.warning('Could not copy %s into %s: %s', name, path.parent, exc)
+            new = app.scanner._make_entry(path.parent, [path.name], images,
+                                          multi_book=False)
+            for name, value in book.values.items():
+                cleaned = clean_value(name, value)
+                if cleaned:
+                    setattr(new, name, Field(value=cleaned, source='user', confidence=1.0))
+            new.log('user', f'Split from {source.name}, chapters '
+                            f'{entry_chapter_range(book)}')
+            app.data.add(new)
+            window.upsert_entry(new)
+            added.append(new)
+        app.data.flush()
+        logger.info('Split %s into %d books', source, len(added))
+
+        box = QMessageBox(window)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle('Split finished')
+        box.setText(f'{source.name} was split into {len(added)} books, now in the '
+                    f'list.\n\nWhat should happen to the original?')
+        keep = box.addButton('Keep it', QMessageBox.ButtonRole.RejectRole)
+        remove = box.addButton('Remove from list', QMessageBox.ButtonRole.AcceptRole)
+        trash = box.addButton('Delete file (Recycle Bin)',
+                              QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        # The new books get the local pass - tags and names - straight away, as any
+        # book read in does; the values typed in the split dialog are yours and stay.
+        do_resolve(added, ['metadata', 'regex'], explicit=False)
+        if clicked is remove:
+            # Still on disk, but off the list on purpose: kept out of "new" too.
+            app.data.add_set_aside(source)
+            do_remove([entry.entry_id], f'Split into {len(added)} books; removed '
+                                        f'{source.name} from the list')
+        elif clicked is trash:
+            if not _move_to_trash(source):
+                QMessageBox.warning(window, 'Split finished',
+                                    f'Could not move {source} to the Recycle Bin. '
+                                    f'It stays on the list.')
+                return
+            folder = Path(entry.folder)
+            try:
+                # Its folder goes too when nothing but the cover images is left in it.
+                leftover = [child for child in folder.iterdir()
+                            if child.name not in entry.image_files]
+                if (not entry.is_multi_book_folder and not leftover
+                        and folder.resolve() != app.scanner.input_dir.resolve()):
+                    _move_to_trash(folder)
+            except OSError:
+                pass
+            do_remove([entry.entry_id], f'Split into {len(added)} books; moved '
+                                        f'{source.name} to the Recycle Bin')
+        else:
+            check_scan_freshness(app, window, log=False)
+            window.show_message(f'Split {source.name} into {len(added)} books')
+
+    def entry_chapter_range(book) -> str:
+        return (f'"{book.chapters[0].title}" to "{book.chapters[-1].title}"'
+                if len(book.chapters) > 1 else f'"{book.chapters[0].title}"')
+
     # --- settings
     def input_folder_changed(previous: str) -> None:
         """The input folder was changed in Settings. Say so, and offer to act on it.
@@ -976,6 +1092,42 @@ def run_gui(app: Application) -> int:
         logger.info('Removed %d books from the list', len(entry_ids))
         window.show_message(message)
 
+    def do_folderize(books):
+        """Move each loose book in the input folder's root into a folder of its own."""
+        from scripts import folderize
+
+        if workers.busy:
+            QMessageBox.information(
+                window, 'Folderize loose books',
+                'Wait for the running job to finish first - it may be reading the '
+                'files that would move.')
+            return
+        root = app.settings.get_path('AO_INPUT_DIR')
+        app.data.backup('before-folderize')
+        moved, error = {}, None
+        try:
+            moved = folderize.move(Path(root), books)
+        except OSError as exc:
+            error = exc
+            logger.exception('Folderizing loose books stopped')
+            # What did move before the failure is still followed below.
+            moved = getattr(exc, 'moved', moved)
+        relocated = folderize.relocate_entries(app.data.all(), Path(root), moved)
+        for old_id, entry in relocated.items():
+            app.data.remove(old_id)
+            app.data.add(entry)
+        app.data.flush()
+        window.set_entries(app.data.all())
+        check_scan_freshness(app, window, log=False)
+        folders = len({str(Path(new).parent) for new in moved.values()})
+        logger.info('Folderized %d files into %d folders; %d listed books followed',
+                    len(moved), folders, len(relocated))
+        window.show_message(f'Moved {len(moved)} loose file{"" if len(moved) == 1 else "s"}'
+                            f' into {folders} folder{"" if folders == 1 else "s"}')
+        if error is not None:
+            QMessageBox.warning(window, 'Folderize stopped',
+                                f'Stopped after {len(moved)} files:\n\n{error}')
+
     def do_restore():
         """Replace the list with one of the backups taken before loads and clears."""
         folder = app.data.save_file.parent / 'backups'
@@ -1005,6 +1157,7 @@ def run_gui(app: Application) -> int:
     window.freshness_check_requested.connect(
         lambda: None if workers.busy else check_scan_freshness(app, window, log=False))
     window.remove_entries_requested.connect(do_remove)
+    window.folderize_requested.connect(do_folderize)
     window.resolve_requested.connect(do_resolve)
     window.refresh_requested.connect(
         lambda entries, tiers: do_resolve(entries, tiers, fresh=True))
@@ -1014,6 +1167,15 @@ def run_gui(app: Application) -> int:
     window.undo_requested.connect(do_undo)
     window.revert_requested.connect(do_revert)
     window.merge_requested.connect(do_merge)
+    window.split_requested.connect(do_split)
+
+    def release_set_aside():
+        released = app.data.clear_set_aside()
+        check_scan_freshness(app, window, log=False)
+        window.show_message(f'{len(released)} set-aside file'
+                            f'{"" if len(released) == 1 else "s"} can be found again')
+
+    window.release_set_aside_requested.connect(release_set_aside)
 
     def do_combine(entries, fields):
         combined = app.data.combine(entries, fields)

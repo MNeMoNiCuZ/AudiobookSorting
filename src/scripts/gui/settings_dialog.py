@@ -74,6 +74,7 @@ TABS: Dict[str, list] = {
         # authenticates. See _build_credentials_box.
         'AO_ENABLE_LLM', 'AO_API_SOURCES', 'AO_CONFIDENCE_SCORE',
         'AO_ALWAYS_SEARCH_TO_TIER', 'AO_REQUIRE_COVER', 'AO_FOLDER_REASONING',
+        'AO_LLM_BATCH_SIZE',
         'AO_REVIEW_APPROVE_THRESHOLD', 'AO_REVIEW_REJECT_THRESHOLD',
         'AO_DETECT_DUPLICATES', 'AO_WARN_DIRTY_OUTPUT',
     ],
@@ -101,7 +102,7 @@ TABS: Dict[str, list] = {
         'AO_UI_COLOR_BY_SOURCE', 'AO_UI_ROW_TINT', 'AO_UI_SHOW_FILTERS',
         'AO_UI_SHOW_PANEL', 'AO_UI_COPY_RECENTS', 'AO_UI_RESORT_LIVE',
         'AO_UI_ADVANCE_AFTER_DECISION', 'AO_UI_CONFIRM_APPLY',
-        'AO_UI_REMEMBER_LAYOUT',
+        'AO_UI_CONFIRM_INPUT_ACTIONS', 'AO_UI_REMEMBER_LAYOUT',
     ],
     # The load keys sit under the input folder because that is what they are about:
     # what survives when you load that folder over work you have already done. The

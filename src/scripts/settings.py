@@ -58,7 +58,11 @@ SCHEMA: Dict[str, tuple] = {
     'AO_REQUIRE_COVER': ('false', 'bool',
                          'Keep searching when cover art is missing.'),
     'AO_FOLDER_REASONING': ('true', 'bool',
-                            'Identify books in the same folder together.'),
+                            'Show the model the other books in the same folder as '
+                            'context.'),
+    'AO_LLM_BATCH_SIZE': ('1', 'int',
+                          'Books sent to the model in one request. 1 asks about '
+                          'one book at a time.'),
 
     # --- caching
     'AO_CACHE_DB': ('user/cache.sqlite3', 'path', 'File used to cache lookup results.'),
@@ -159,6 +163,9 @@ SCHEMA: Dict[str, tuple] = {
                                      'Select the next row after approving or rejecting.'),
     'AO_UI_CONFIRM_APPLY': ('true', 'bool',
                             'Ask for confirmation before saving files.'),
+    'AO_UI_CONFIRM_INPUT_ACTIONS': ('true', 'bool',
+                                    'Ask for confirmation before the buttons beside '
+                                    'Inputs act.'),
     'AO_UI_REMEMBER_LAYOUT': ('true', 'bool',
                               'Reopen with the last window size and panel split.'),
     'AO_UI_WINDOW': ('', 'str', 'Saved window layout.'),

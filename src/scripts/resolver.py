@@ -51,6 +51,9 @@ class Resolver:
         # Books per step when a folder is identified: each batch is searched, sent to
         # the model and finished before the next starts.
         self.folder_batch_size = settings.get_int('AO_FOLDER_BATCH_SIZE', 8)
+        # Books per model request. 1 asks about each book on its own, with the rest of
+        # its folder as context; more sends that many books in one joint request.
+        self.llm_batch_size = max(1, settings.get_int('AO_LLM_BATCH_SIZE', 1))
         # Run at least this many tiers whatever the confidence. Tags and a filename
         # agreeing is not proof - they are both just the name someone gave the file -
         # so the default keeps going as far as the book databases.
@@ -379,7 +382,7 @@ class Resolver:
         def llm_wanted() -> bool:
             return wanted('llm', self.enable_llm) and (fresh or not self._llm_failed)
 
-        size = max(1, self.folder_batch_size)
+        size = max(1, self.folder_batch_size, self.llm_batch_size)
         for start in range(0, len(entries), size):
             batch = entries[start:start + size]
             needs_help: List[BookEntry] = []
@@ -425,25 +428,31 @@ class Resolver:
                 return entries
             # The model must see the database and search evidence from this run.
             self._share_within_folder(entries)
-            if self.folder_reasoning and len(needs_help) > 1:
-                # One request covers the batch; the rest of the folder rides along.
-                for entry in needs_help:
-                    report('llm', only=entry)
-                    self._stage(entry, 'llm')
-                self._tier_llm_folder(needs_help)
+            for first in range(0, len(needs_help), self.llm_batch_size):
+                group = needs_help[first:first + self.llm_batch_size]
+                if should_cancel and should_cancel():
+                    self._stage_stopped(entries)
+                    return entries
+                if len(group) > 1:
+                    # Batching is switched on: one request covers the group, and the
+                    # rest of the folder rides along.
+                    for entry in group:
+                        report('llm', only=entry)
+                        self._stage(entry, 'llm')
+                    self._tier_llm_folder(group)
+                    self._share_within_folder(entries)
+                    for entry in group:
+                        finish(entry)
+                    continue
+                # One book per request: only this book is being asked about. Its
+                # folder's other books go along as context, not as questions.
+                entry = group[0]
+                report('llm', only=entry)
+                entry.begin_tier('llm')
+                self._stage(entry, 'llm')
+                self._tier_llm(entry, fresh=fresh)
                 self._share_within_folder(entries)
-                for entry in needs_help:
-                    finish(entry)
-            else:
-                for entry in needs_help:
-                    if should_cancel and should_cancel():
-                        self._stage_stopped(entries)
-                        return entries
-                    report('llm', only=entry)
-                    entry.begin_tier('llm')
-                    self._stage(entry, 'llm')
-                    self._tier_llm(entry, fresh=fresh)
-                    finish(entry)
+                finish(entry)
 
         for entry in entries:
             if entry.entry_id not in finished:
@@ -697,11 +706,14 @@ class Resolver:
                             for name in ('title', 'author', 'series', 'series_index')}
         hints['findings'] = _findings(entry)
         hints['extent'] = _extent(entry)
-        siblings = self._folder_siblings(entry)
-        if siblings or entry.is_multi_book_folder:
+        shared = self._folder_siblings(entry)
+        if shared or entry.is_multi_book_folder:
             # The folder is shared with other entries, so the folder alone is not this
             # item's path - given only that, the model identifies the folder instead.
             hints['path'] = str(Path(hints['path']) / Path(entry.primary_audio).name)
+        # The other books in the folder are context for telling the series name from
+        # the book name - unless that is switched off.
+        siblings = shared if self.folder_reasoning else []
         sibling_files = {name for sibling in siblings for name in sibling['files']}
         own_files = [Path(name).name for name in entry.audio_files]
         context = [name for name in self._folder_context(entry)

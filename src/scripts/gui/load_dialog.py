@@ -441,7 +441,8 @@ class LoadInputDialog(QDialog):
             return
         count = len(ids)
         books = [entry for entry in self.all_entries if entry.entry_id in ids]
-        if not confirm_list(
+        confirm = self.settings.get_bool('AO_UI_CONFIRM_INPUT_ACTIONS', True)
+        if confirm and not confirm_list(
                 self, 'Are you sure?',
                 f'Remove these {_plural(count, "book")} with no files on disk from the '
                 f'list?\n\nNothing is loaded and nothing on disk is touched. The list '

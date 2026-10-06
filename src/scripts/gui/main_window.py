@@ -550,6 +550,7 @@ class MainWindow(QMainWindow):
     purge_requested = pyqtSignal(list)             # entry ids with no files left on disk
     remove_entries_requested = pyqtSignal(list, str)  # entry ids, status message
     restore_requested = pyqtSignal()               # replace the list with a backup
+    folderize_requested = pyqtSignal(list)         # LooseBooks: give each its own folder
     # Compare the list with the input folder again - sent when the window regains
     # focus, which is when a folder deleted or dropped in from Explorer turns up.
     freshness_check_requested = pyqtSignal()
@@ -561,6 +562,8 @@ class MainWindow(QMainWindow):
     undo_requested = pyqtSignal(int)               # index into the pending journal
     revert_requested = pyqtSignal(dict)            # pending index -> move indices/None
     merge_requested = pyqtSignal(object)           # entry
+    split_requested = pyqtSignal(object, object)   # entry, [SplitBook]
+    release_set_aside_requested = pyqtSignal()
     combine_requested = pyqtSignal(list, dict)    # entries and chosen identity fields
     settings_requested = pyqtSignal()
     settings_requested_on_tab = pyqtSignal(str)    # open Settings on a tab
@@ -644,7 +647,7 @@ class MainWindow(QMainWindow):
         # folder nobody is pointing at any more, which no file comparison can detect.
         self._folder_changed_from: Optional[str] = None
         # key -> (button, toolbar action) for the buttons beside Inputs that only show
-        # when there is something to do: finished books, missing books, new books.
+        # when there is something to do: finished, missing, new and loose books.
         self._input_buttons: Dict[str, tuple] = {}
         self._freshness_timer = QTimer(self)
         self._freshness_timer.setSingleShot(True)
@@ -933,12 +936,6 @@ class MainWindow(QMainWindow):
         # The cover cell is not editable and has nothing to select, so a plain click
         # on it is free to mean "show me this properly".
         self.table.clicked.connect(self._cell_clicked)
-        self.table.setToolTip('Double-click author, series, # or title to edit it. '
-                              'Delete clears the selected name cells, or asks to '
-                              'remove the book when a whole row is selected. '
-                              'Ctrl+C and Ctrl+V '
-                              'copy and paste them. '
-                              'Right-click for everything you can do to the selection.')
 
         header = self.table.horizontalHeader()
         # Header clicks sort without Qt first selecting the entire column.
@@ -3309,6 +3306,16 @@ class MainWindow(QMainWindow):
             lambda: self._merge_selected(mergeable),
             'Join the chapter files of every selected multi-file book into one .m4b',
             enabled=bool(mergeable))
+        # Judged on the name alone: opening the menu never touches the files. The
+        # chapters are read when the entry is chosen.
+        splittable = (len(entries) == 1 and len(entries[0].audio_files) == 1
+                      and Path(entries[0].audio_files[0]).suffix.lower()
+                      in ('.m4b', '.m4a', '.mp4'))
+        add('Split chapters into separate books...',
+            lambda: self._split_selected(entries[0]),
+            'Cut this chaptered .m4b into several books, each in a new folder beside '
+            'it. You name the books first; the audio is copied, not re-encoded.',
+            enabled=splittable)
         same_folder = len({os.path.normcase(os.path.normpath(e.folder))
                            for e in entries}) == 1
         add(f'Combine into one book{suffix}...',
@@ -3599,6 +3606,41 @@ class MainWindow(QMainWindow):
         for plan in plans:
             self.merge_requested.emit(plan)
         self.show_message(f'Queued {plural(len(plans), "merge")}')
+
+    def _split_selected(self, entry: BookEntry) -> None:
+        """Name the books one .m4b is cut into, then queue the split."""
+        from ..chapter_split import read_chapters
+        from .split_dialog import SplitDialog
+
+        source = entry.absolute_files()[0]
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            chapters = read_chapters(source,
+                                     self.settings.get('AO_FFMPEG_PATH') or 'ffmpeg')
+        finally:
+            QApplication.restoreOverrideCursor()
+        if len(chapters) < 2:
+            QMessageBox.information(
+                self, 'Split into books',
+                f'{source.name} has '
+                + ('no chapters' if not chapters else 'only one chapter')
+                + ', so there is nothing to split it at.')
+            return
+        folder = Path(entry.folder)
+        root = self.settings.get_path('AO_INPUT_DIR')
+        try:
+            at_root = root is not None and folder.resolve() == Path(root).resolve()
+        except OSError:
+            at_root = False
+        # Beside the book: next to its folder, or inside the folder when that folder
+        # is shared with other books or is the input folder itself.
+        base = folder if (entry.is_multi_book_folder or at_root) else folder.parent
+        dialog = SplitDialog(entry, chapters, base, self.settings, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        books = dialog.books()
+        self.split_requested.emit(entry, books)
+        self.show_message(f'Queued a split into {plural(len(books), "book")}')
 
     def _confirm_combine(self, entries: List[BookEntry]) -> None:
         entries = self.in_view_order(entries)
@@ -4805,7 +4847,7 @@ class MainWindow(QMainWindow):
         if not same:
             return
         stale = any(drift.get(key) for key in ('added', 'missing', 'changed',
-                                               'unreadable', 'empty'))
+                                               'unreadable', 'empty', 'loose'))
         self.set_scan_stale(drift if stale else None)
 
     def _confirm_load_loses_work(self, dialog) -> bool:
@@ -4885,6 +4927,15 @@ class MainWindow(QMainWindow):
         restore.setToolTip('Put the list back as it was before an earlier load, clear '
                            'or removal')
         restore.triggered.connect(self.restore_requested.emit)
+
+        from ..file_scanner import _SET_ASIDE
+        if _SET_ASIDE:
+            count = len(_SET_ASIDE)
+            release = menu.addAction(f'Stop ignoring {plural(count, "set-aside file")}')
+            release.setToolTip('Files taken off the list on purpose but left on disk - '
+                               'the originals of split books. Loads and the "new" button '
+                               'skip them until this is chosen.')
+            release.triggered.connect(self.release_set_aside_requested.emit)
 
         if self._scan_drift or self._folder_changed_from:
             what = menu.addAction('What changed since the last load...')
@@ -5429,7 +5480,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- input buttons
 
     def _add_input_buttons(self, icon: int) -> None:
-        """Clear finished / Missing / New / Not scanned, right after Inputs - shown only when needed.
+        """Clear finished / Missing / New / Loose / Not scanned, right after Inputs - shown only when needed.
 
         Widgets with their text beside the icon, so the count reads even with toolbar
         labels off. Placed after Inputs, or first when Inputs is not on the toolbar.
@@ -5446,7 +5497,11 @@ class MainWindow(QMainWindow):
         # Ordinary toolbar actions: same size, same label style as every other button.
         # Each has its own icon in a single colour that says what it does; the arrow
         # on Inputs takes the colour of the first one showing.
+        # In the order they are worth doing: folderizing moves files, which changes what
+        # counts as missing and new, so it goes first; clearing and removing come
+        # before adding, and scanning comes last, once the list holds the right books.
         specs = [
+            ('loose', 'loose_books', ACCENT, self._show_loose_books),
             ('finished', 'clear_finished', STATUS_TEXT['applied'], self._clear_finished),
             ('missing', 'missing_books', STATUS_TEXT['rejected'], self._show_missing_books),
             ('new', 'new_books', ACCENT, self._show_new_books),
@@ -5479,14 +5534,24 @@ class MainWindow(QMainWindow):
         return sorted({str(Path(path).parent) for path in added},
                       key=lambda folder: folder.lower())
 
+    def _loose_files(self) -> List[str]:
+        """Audio files lying directly in the input folder, not in a folder of their own."""
+        return list((self._scan_drift or {}).get('files', {}).get('loose') or ())
+
     def _refresh_input_buttons(self) -> None:
         if not getattr(self, '_input_buttons', None):
             return
         finished = len(self._finished_books())
         missing = len(self._missing_books())
         new = len(self._new_book_folders())
+        loose = len(self._loose_files())
         unscanned = len(self._unscanned())
+        # Same order as the buttons: the first one showing colours the arrow on Inputs.
         states = {
+            'loose': (loose, f'Folderize {loose} loose',
+                      f'{plural(loose, "audio file")} directly in the input folder '
+                      f'instead of in a folder of their own.\nClick to see the folders '
+                      f'they would go into, one per book, and move them.'),
             'finished': (finished, f'Clear {finished} finished',
                          f'{plural(finished, "book")} finalized. Click to clear '
                          f'{"it" if finished == 1 else "them"} from the list.\n'
@@ -5543,13 +5608,17 @@ class MainWindow(QMainWindow):
             button.style().unpolish(button)
             button.style().polish(button)
 
+    def _confirm_input_actions(self) -> bool:
+        """Whether the buttons beside Inputs show their list and ask before acting."""
+        return self.settings.get_bool('AO_UI_CONFIRM_INPUT_ACTIONS', True)
+
     def _clear_finished(self) -> None:
         from .item_list import books_lines, confirm_list
 
         finished = self._finished_books()
         if not finished:
             return
-        if not confirm_list(
+        if self._confirm_input_actions() and not confirm_list(
                 self, 'Clear finished books',
                 f'Remove {plural(len(finished), "finalized book")} from the list?\n\n'
                 f'Their files stay where Finalize put them, and the Finalize log can '
@@ -5568,7 +5637,7 @@ class MainWindow(QMainWindow):
         if not missing:
             return
         remove = f'Remove {len(missing)} from the list'
-        if list_dialog(
+        if not self._confirm_input_actions() or list_dialog(
                 self, 'Missing books',
                 f'{plural(len(missing), "book")} in the list '
                 f'{"has" if len(missing) == 1 else "have"} no audio files left in the '
@@ -5593,7 +5662,7 @@ class MainWindow(QMainWindow):
                 shown.append(folder)
         missing = len(self._missing_books())
         add = 'Add them'
-        if list_dialog(
+        if not self._confirm_input_actions() or list_dialog(
                 self, 'New books',
                 f'{plural(len(folders), "folder")} in the input folder '
                 f'{"holds" if len(folders) == 1 else "hold"} audio the list does not '
@@ -5605,6 +5674,36 @@ class MainWindow(QMainWindow):
                 [(f'New ({len(folders)}):', shown)],
                 [add, 'Close'], default=0) == add:
             self.load_requested.emit(None, KeepOptions.keep_everything(), False)
+
+    def _show_loose_books(self) -> None:
+        """Offer to move each loose book in the input folder's root into its own folder."""
+        from .item_list import list_dialog
+        from .. import folderize
+
+        if not self._loose_files():
+            return
+        root = self.settings.get_path('AO_INPUT_DIR')
+        # Grouping reads tags, as a scan does - a moment on a big pile of files.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            books = folderize.plan(Path(root))
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not books:
+            self.freshness_check_requested.emit()
+            return
+        lines = [f'{book.folder}{os.sep}{name}' for book in books for name in book.files]
+        move = f'Make {plural(len(books), "folder")}'
+        if not self._confirm_input_actions() or list_dialog(
+                self, 'Folderize loose books',
+                f'{plural(len(books), "book")} {"lies" if len(books) == 1 else "lie"} '
+                f'directly in the input folder. Each gets a folder of its own, named '
+                f'after it, and its audio - and any file with the same name, like a '
+                f'cover or a .cue - is moved in.\n\nBooks already in the list follow '
+                f'their files and keep what is known about them.',
+                [(f'New layout ({len(books)} folders):', lines)],
+                [move, 'Close'], default=0) == move:
+            self.folderize_requested.emit(books)
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)

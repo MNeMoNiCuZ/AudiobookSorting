@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .models import BookEntry
 
@@ -125,6 +125,21 @@ def _numbers_run(files: List[str]) -> bool:
     return False
 
 
+# Audio files taken off the list on purpose but left on disk - the original of a split
+# .m4b. Every scanner skips them, so they are not offered back as new books. Keys are
+# os.path.normcase paths; DataManager owns the saved list and keeps this in step.
+_SET_ASIDE: Set[str] = set()
+
+
+def set_aside_files(paths) -> None:
+    _SET_ASIDE.clear()
+    _SET_ASIDE.update(os.path.normcase(os.path.normpath(str(path))) for path in paths)
+
+
+def is_set_aside(path) -> bool:
+    return bool(_SET_ASIDE) and os.path.normcase(os.path.normpath(str(path))) in _SET_ASIDE
+
+
 class FileScanner:
     def __init__(self, input_dir: str, audio_extensions: Sequence[str] = AUDIO_EXTENSIONS):
         self.input_dir = Path(input_dir)
@@ -152,7 +167,8 @@ class FileScanner:
             dirs.sort()
             root_path = Path(root)
             audio_files = sorted(f for f in files
-                                 if f.lower().endswith(self.supported_audio))
+                                 if f.lower().endswith(self.supported_audio)
+                                 and not is_set_aside(root_path / f))
             if not audio_files:
                 continue
 
@@ -181,6 +197,8 @@ class FileScanner:
                 if not name.lower().endswith(self.supported_audio):
                     continue
                 path = Path(root) / name
+                if is_set_aside(path):
+                    continue
                 key = os.path.normcase(str(path))
                 if names is not None:
                     names[key] = str(path)
@@ -195,7 +213,8 @@ class FileScanner:
 
         Returns counts of files ``added``, ``missing`` and ``changed`` (same path, new
         size), and ``empty``: books in the list with none of their files left on disk,
-        which Inputs offers to remove. All zero means a rescan would find nothing new - which is the only case
+        which Inputs offers to remove, and ``loose``: audio files lying directly in
+        the input folder, which Inputs offers to folderize. All zero means a rescan would find nothing new - which is the only case
         in which carrying on with saved entries is safe rather than merely convenient.
 
         ``files`` names exactly which: the paths behind each count, and the entry ids of
@@ -207,7 +226,9 @@ class FileScanner:
         index = self.audio_index(names)
         if index is None:
             return {'added': 0, 'missing': 0, 'changed': 0, 'unreadable': 1, 'empty': 0,
-                    'files': {'added': [], 'missing': [], 'changed': [], 'empty': []}}
+                    'loose': 0,
+                    'files': {'added': [], 'missing': [], 'changed': [], 'empty': [],
+                              'loose': []}}
 
         # The size the file had *when it was scanned*, not the size it has now - the
         # whole question is whether those two still agree. An entry saved before sizes
@@ -235,13 +256,18 @@ class FileScanner:
         changed = [key for key, size in inside.items()
                    if size is not None and key in index and index[key] != size]
         empty = entries_without_files(entries)
+        # Audio straight in the input folder rather than in a folder of its own, which
+        # the Loose button beside Inputs offers to folderize.
+        root = os.path.normcase(os.path.normpath(str(self.input_dir)))
+        loose = [key for key in index if os.path.dirname(key) == root]
         return {'added': len(added), 'missing': len(missing),
                 'changed': len(changed), 'unreadable': 0,
-                'empty': len(empty),
+                'empty': len(empty), 'loose': len(loose),
                 'files': {'added': sorted(names[key] for key in added),
                           'missing': sorted(names[key] for key in missing),
                           'changed': sorted(names[key] for key in changed),
-                          'empty': [entry.entry_id for entry in empty]}}
+                          'empty': [entry.entry_id for entry in empty],
+                          'loose': sorted(names[key] for key in loose)}}
 
     def _entries_for_folder(self, folder: Path, audio_files: List[str],
                             image_files: List[str]) -> List[BookEntry]:

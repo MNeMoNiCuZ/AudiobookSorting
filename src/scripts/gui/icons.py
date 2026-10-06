@@ -190,6 +190,14 @@ def _new_books(painter: QPainter, colour: str) -> None:
     painter.drawLine(QPointF(8.3, 12.7), QPointF(15.7, 12.7))
 
 
+def _loose_books(painter: QPainter, colour: str) -> None:
+    """An arrow dropping into a folder - put the loose books into folders of their own."""
+    _folder(painter, colour, QRectF(2.6, 9.4, 18.8, 11.6))
+    painter.setPen(_pen(colour))
+    painter.drawLine(QPointF(12.0, 2.4), QPointF(12.0, 11.0))
+    _arrow_head(painter, QPointF(12.0, 16.6), QPointF(12.0, 11.0), 3.4, colour)
+
+
 def _missing_books(painter: QPainter, colour: str) -> None:
     """A dashed outline of a book - in the list, gone from the disk."""
     _book_closed(painter, colour, dashed=True)
@@ -459,6 +467,7 @@ SHAPES: Dict[str, Callable[[QPainter, str], None]] = {
     'warnings': _warning,
     'not_scanned': _not_scanned,
     'new_books': _new_books,
+    'loose_books': _loose_books,
     'missing_books': _missing_books,
     'clear_finished': _clear_finished,
 }
