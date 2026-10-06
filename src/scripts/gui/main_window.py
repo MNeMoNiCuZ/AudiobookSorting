@@ -46,6 +46,7 @@ from ..models import (IDENTITY_FIELDS, STATUS_APPLIED, STATUS_APPROVED, STATUS_P
                       stage_status)
 from .table import ColumnTable
 from .delegates import (KIND_CONFIDENCE, KIND_COVER, KIND_FILES, KIND_STATUS,
+                        BROKEN_TEXT, ROLE_BROKEN_AUDIO,
                         ROLE_CONFIDENCE, ROLE_DUPLICATE_IDENTITY, ROLE_ENTRY_ID, ROLE_FLASH, ROLE_KIND,
                         ROLE_SIDECARS, ROLE_SIZE,
                         ROLE_PROGRESS, ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
@@ -563,6 +564,7 @@ class MainWindow(QMainWindow):
     revert_requested = pyqtSignal(dict)            # pending index -> move indices/None
     merge_requested = pyqtSignal(object)           # entry
     split_requested = pyqtSignal(object, object)   # entry, [SplitBook]
+    repair_audio_requested = pyqtSignal(list)     # entries with broken audio
     release_set_aside_requested = pyqtSignal()
     combine_requested = pyqtSignal(list, dict)    # entries and chosen identity fields
     settings_requested = pyqtSignal()
@@ -692,6 +694,8 @@ class MainWindow(QMainWindow):
 
         self.paths_banner = self._build_paths_banner()
         left_layout.addWidget(self.paths_banner)
+        self.broken_banner = self._build_broken_banner()
+        left_layout.addWidget(self.broken_banner)
 
         self.filter_bar = QWidget()
         self.filter_bar.setLayout(self._build_filter_row())
@@ -767,6 +771,48 @@ class MainWindow(QMainWindow):
         row.addWidget(button)
         return banner
 
+    def _build_broken_banner(self) -> QWidget:
+        """Alarm-red strip above the table while any book has broken audio."""
+        banner = QWidget()
+        banner.setObjectName('brokenBanner')
+        banner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        banner.setStyleSheet(
+            '#brokenBanner { background: #8b0012; border: 2px solid #ff2a3d; '
+            'border-radius: 6px; }')
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(12, 9, 12, 9)
+        row.setSpacing(10)
+
+        self.broken_banner_label = QLabel('')
+        self.broken_banner_label.setWordWrap(True)
+        self.broken_banner_label.setStyleSheet(
+            'color: #ffffff; font-weight: bold; border: none; background: transparent;')
+        row.addWidget(self.broken_banner_label, stretch=1)
+
+        show = QPushButton('Show them')
+        show.setToolTip('Filter the table to the books with broken audio')
+        show.clicked.connect(lambda: self.status_filter.setCurrentText('Broken Audio'))
+        row.addWidget(show)
+
+        repair = QPushButton('Repair all...')
+        repair.setToolTip('Rewrite every broken MP3 header. The audio is copied, '
+                          'not re-encoded.')
+        repair.clicked.connect(lambda: self._confirm_repair_audio(
+            [e for e in self.entries.values() if e.broken_audio]))
+        row.addWidget(repair)
+        banner.setVisible(False)
+        return banner
+
+    def refresh_broken_banner(self) -> None:
+        broken = [e for e in self.entries.values() if e.broken_audio]
+        self.broken_banner.setVisible(bool(broken))
+        if broken:
+            files = sum(len(e.broken_audio) for e in broken)
+            self.broken_banner_label.setText(
+                f'⚠  BROKEN AUDIO: {plural(len(broken), "book")} '
+                f'({plural(files, "file")}) will stop playing after a few seconds - '
+                'the MP3 header covers only the intro.')
+
     def refresh_paths_banner(self) -> None:
         """Show or hide the banner for whatever the settings currently say."""
         missing = [name for key, name in (('AO_INPUT_DIR', 'input'),
@@ -791,7 +837,7 @@ class MainWindow(QMainWindow):
 
         self.status_filter = self._filter_combo(
             ['All statuses', 'Pending', 'Unsure', 'Approved', 'Rejected',
-             'Finalized', 'Duplicate', 'Has Warning'],
+             'Finalized', 'Duplicate', 'Has Warning', 'Broken Audio'],
             'Show only rows with this review status')
         for index, key in enumerate(
                 ('pending', 'risky', 'approved', 'rejected', 'applied', 'duplicate'),
@@ -800,6 +846,8 @@ class MainWindow(QMainWindow):
                 index, QColor(STATUS_TEXT[key]), Qt.ItemDataRole.ForegroundRole)
         self.status_filter.setItemData(
             7, QColor(STATUS_TEXT['risky']), Qt.ItemDataRole.ForegroundRole)
+        self.status_filter.setItemData(
+            8, QColor('#ff2a3d'), Qt.ItemDataRole.ForegroundRole)
         row.addWidget(self.status_filter)
 
         self.missing_filter = self._filter_combo(
@@ -1981,6 +2029,7 @@ class MainWindow(QMainWindow):
         # The counts already live in the filter bar ("12 of 38") and in the status
         # filter itself. Printing them a third time in the toolbar was noise.
         self.why_panel.set_stats(self.entries.values())
+        self.refresh_broken_banner()
         # Approving a row is what makes Save available, so the counts and the buttons
         # are refreshed together - every path that changes a status comes through here.
         self.refresh_action_states()
@@ -2058,7 +2107,8 @@ class MainWindow(QMainWindow):
                 and any(finding.kind == 'author_initials'
                         for finding in findings))
             item.setForeground(QColor(
-                STATUS_TEXT['rejected'] if author_initial_warning or duplicate_warning
+                BROKEN_TEXT if entry.broken_audio
+                else STATUS_TEXT['rejected'] if author_initial_warning or duplicate_warning
                 else self._field_colour(entry, field)))
             item.setToolTip(
                 f'{field.value or "(empty)"}\n'
@@ -2102,13 +2152,21 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_STATUS, status)
 
         sidecars = self._sidecars_for(entry)
+        broken_tip = ''
+        if entry.broken_audio:
+            broken_tip = ('⚠ BROKEN AUDIO - THIS BOOK WILL NOT PLAY IN FULL\n\n'
+                          + '\n'.join(entry.broken_audio)
+                          + '\n\nRight-click and choose "Repair broken audio" to fix it.')
         # The delegate paints the stripe and the pill from this, on every cell.
         for column in range(len(COLUMNS)):
             item = self.table.item(row, column)
             if item is not None:
                 item.setData(ROLE_STATUS, status_key)
                 item.setData(ROLE_DUPLICATE_IDENTITY, duplicate_warning)
+                item.setData(ROLE_BROKEN_AUDIO, bool(entry.broken_audio))
                 item.setData(ROLE_SIDECARS, sidecars)
+                if broken_tip:
+                    item.setToolTip(broken_tip)
         self._size_row(row)
 
         # Refresh both sides of a collision, including a book whose own fields did
@@ -3081,6 +3139,7 @@ class MainWindow(QMainWindow):
                 show = text in haystack
             if show and status != 'All statuses':
                 show = (bool(entry.warnings) if status == 'Has Warning'
+                        else bool(entry.broken_audio) if status == 'Broken Audio'
                         else pretty_status(entry.status) == status)
             if show and missing != 'Any completeness':
                 gaps = entry.missing_fields()
@@ -3228,6 +3287,20 @@ class MainWindow(QMainWindow):
         # from the Title cell is an action you did not ask for on a field you were
         # not looking at.
         clicked = EDITABLE.get(self.table.columnAt(position.x()))
+
+        # A book that will not play is the first thing on the menu, before any of
+        # the identification work that would be wasted on it.
+        broken = [e for e in entries if e.broken_audio]
+        if broken:
+            section('⚠ BROKEN AUDIO')
+            files = sum(len(e.broken_audio) for e in broken)
+            repair = add(f'Repair broken audio ({plural(files, "file")})',
+                         lambda: self._confirm_repair_audio(broken),
+                         'Rewrite the MP3 header so players see the whole book. The '
+                         'audio is copied, not re-encoded; the original goes to the '
+                         'Recycle Bin.')
+            if repair is not None:
+                repair.setIcon(make_icon('warning', '#ff2a3d', 18))
 
         # Ordered the way the work goes: identify it, correct it, then act on the
         # files. Destructive things last, where they are hard to hit.
@@ -3652,6 +3725,21 @@ class MainWindow(QMainWindow):
         for plan in plans:
             self.merge_requested.emit(plan)
         self.show_message(f'Queued {plural(len(plans), "merge")}')
+
+    def _confirm_repair_audio(self, entries: List[BookEntry]) -> None:
+        """Ask once, listing every broken file, then queue the repairs."""
+        messages = [message for entry in entries for message in entry.broken_audio]
+        if QMessageBox.warning(
+                self, 'Repair broken audio',
+                'These files have an MP3 header that covers only the start of the '
+                'audio, so players stop early:\n\n' + '\n\n'.join(messages)
+                + '\n\nRepair rewrites each file with ffmpeg (no re-encoding) and '
+                'sends the original to the Recycle Bin.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+            return
+        self.repair_audio_requested.emit(entries)
+        self.show_message(f'Queued repair of {plural(len(messages), "file")}')
 
     def _split_selected(self, entry: BookEntry) -> None:
         """Name the books one .m4b is cut into, then queue the split."""

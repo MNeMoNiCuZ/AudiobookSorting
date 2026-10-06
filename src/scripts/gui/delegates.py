@@ -50,6 +50,13 @@ ROLE_SIZE = Qt.ItemDataRole.UserRole + 11
 # The companion files going with the book - [(where it is, name it will get, shared)]
 # - drawn as thin lines under the row. Set on every cell of the row.
 ROLE_SIDECARS = Qt.ItemDataRole.UserRole + 12
+# True when one of the book's audio files has a header that cuts it short. The whole
+# row is painted in alarm red so it cannot be scrolled past. Set on every cell.
+ROLE_BROKEN_AUDIO = Qt.ItemDataRole.UserRole + 13
+
+BROKEN_FILL = '#8b0012'
+BROKEN_EDGE = '#ff2a3d'
+BROKEN_TEXT = '#ffffff'
 
 # One thin line per companion file under the book, at most SIDECAR_MAX_LINES of them
 # and a "+N more" line after that.
@@ -186,6 +193,9 @@ class ReviewDelegate(QStyledItemDelegate):
         self._paint_background(painter, cell, status, selected, hovered,
                                index.row() % 2 == 1,
                                bool(index.data(ROLE_DUPLICATE_IDENTITY)))
+        broken = bool(index.data(ROLE_BROKEN_AUDIO))
+        if broken:
+            self._paint_broken(painter, cell, selected)
 
         # The book is drawn in the top of the row; its companion files fill the strip
         # the row grew by underneath.
@@ -223,6 +233,8 @@ class ReviewDelegate(QStyledItemDelegate):
             self._paint_files(painter, body, index, selected)
         elif kind == KIND_CONFIDENCE:
             self._paint_confidence(painter, body, index)
+        elif kind == KIND_STATUS and broken:
+            self._paint_broken_pill(painter, rect)
         elif kind == KIND_STATUS:
             self._paint_status(painter, rect, status, hue,
                                str(index.data(Qt.ItemDataRole.DisplayRole) or ''),
@@ -351,6 +363,33 @@ class ReviewDelegate(QStyledItemDelegate):
 
         if selected:
             self._paint_selection_frame(painter, rect)
+
+    def _paint_broken(self, painter: QPainter, rect: QRect, selected: bool) -> None:
+        """Alarm red over the whole row, edged top and bottom in a brighter red."""
+        painter.fillRect(rect, QColor(BROKEN_FILL))
+        pen = QPen(QColor(BROKEN_EDGE))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.drawLine(rect.left(), rect.top() + 1, rect.right(), rect.top() + 1)
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+        if selected:
+            self._paint_selection_frame(painter, rect)
+
+    def _paint_broken_pill(self, painter: QPainter, rect: QRect) -> None:
+        """The Status cell of a broken row: a solid bright pill that says so."""
+        font = QFont(painter.font())
+        font.setPixelSize(11)
+        font.setWeight(QFont.Weight.Black)
+        painter.setFont(font)
+        label = '⚠ BROKEN AUDIO'
+        height = QFontMetrics(font).height() + 6
+        pill = QRectF(rect.left() + 2, rect.center().y() - height / 2,
+                      rect.width() - 4, height)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(BROKEN_EDGE)))
+        painter.drawRoundedRect(pill, height / 2, height / 2)
+        painter.setPen(QColor(BROKEN_TEXT))
+        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, label)
 
     def _paint_selection_frame(self, painter: QPainter, rect: QRect) -> None:
         """A bright rule along the top and bottom of the selected cell, closed at the

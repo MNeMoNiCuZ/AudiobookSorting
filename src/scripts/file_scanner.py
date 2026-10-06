@@ -376,6 +376,9 @@ class FileScanner:
             except OSError:
                 sizes.append(-1)
 
+        from .audio_health import check_files
+        broken = check_files(folder / name for name in audio_files)
+
         return BookEntry(
             entry_id=entry_id,
             folder=str(folder),
@@ -385,6 +388,7 @@ class FileScanner:
             primary_audio=str(primary),
             image_files=list(image_files),
             is_multi_book_folder=multi_book,
+            broken_audio=broken,
         )
 
     # ------------------------------------------------------------- heuristics

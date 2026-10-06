@@ -876,6 +876,60 @@ def run_gui(app: Application) -> int:
         worker.signals.finished.connect(done)
         wire(worker)
 
+    # --- broken MP3 header repair
+    def do_repair_audio(entries):
+        """Rewrite every broken MP3 of these books, one queued job per book."""
+        from scripts.audio_health import broken_header, check_files, repair_header
+        from scripts.gui.main_window import _move_to_trash
+
+        ffmpeg = app.settings.get('AO_FFMPEG_PATH') or 'ffmpeg'
+        for entry in entries:
+            paths = [p for p in entry.absolute_files() if broken_header(p)]
+            if not paths:
+                entry.broken_audio = check_files(entry.absolute_files())
+                window.upsert_entry(entry)
+                continue
+
+            def repair_all(paths=paths, should_cancel=None, on_progress=None):
+                results = [repair_header(path, ffmpeg, discard=_move_to_trash,
+                                         should_cancel=should_cancel,
+                                         on_progress=on_progress)
+                           for path in paths]
+                return all(ok for ok, _ in results), [m for _, m in results]
+
+            worker = FunctionWorker(
+                repair_all, label=f'Repair broken audio in {Path(entry.folder).name}',
+                kind='merge')
+            worker.signals.progress.connect(
+                lambda done_, total_, message, e=entry: window.set_row_progress(
+                    e.entry_id, (done_ / total_) if total_ else 0.03, message))
+
+            def done(result, entry=entry):
+                window.set_row_progress(entry.entry_id, None)
+                window.set_busy(workers.busy)
+                ok, messages = result
+                sizes = []
+                for path in entry.absolute_files():
+                    try:
+                        sizes.append(path.stat().st_size)
+                    except OSError:
+                        sizes.append(-1)
+                entry.audio_sizes = sizes
+                entry.broken_audio = check_files(entry.absolute_files())
+                entry.log('user', 'Repaired broken MP3 header: ' + '; '.join(messages))
+                app.data.mark_dirty()
+                window.upsert_entry(entry)
+                window.show_message('; '.join(messages))
+                if not ok or entry.broken_audio:
+                    QMessageBox.warning(window, 'Repair failed', '\n'.join(messages))
+
+            worker.signals.error.connect(
+                lambda _text, e=entry: window.set_row_progress(e.entry_id, None))
+            worker.signals.cancelled.connect(
+                lambda e=entry: window.set_row_progress(e.entry_id, None))
+            worker.signals.finished.connect(done)
+            wire(worker)
+
     def _finish_split(entry, books, written) -> None:
         """List the new books, then ask what happens to the original."""
         import shutil
@@ -1175,6 +1229,7 @@ def run_gui(app: Application) -> int:
     window.revert_requested.connect(do_revert)
     window.merge_requested.connect(do_merge)
     window.split_requested.connect(do_split)
+    window.repair_audio_requested.connect(do_repair_audio)
 
     def release_set_aside():
         released = app.data.clear_set_aside()

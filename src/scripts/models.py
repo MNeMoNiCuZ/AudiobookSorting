@@ -120,6 +120,10 @@ class BookEntry:
     # on every resolve; the confidence of the fields involved is docked to match.
     warnings: List[str] = field(default_factory=list)
     warnings_silenced: bool = False
+    # One message per audio file whose header claims far less audio than the file
+    # holds - see scripts.audio_health. Players stop at the header's length, so the
+    # book is unplayable as it stands. Re-checked on every scan; never silenced.
+    broken_audio: List[str] = field(default_factory=list)
     warnings_checked_values: Dict[str, str] = field(default_factory=dict)
     # field name -> the factor its confidence has already been multiplied by for the
     # warnings above. Kept so re-running identification re-judges the value instead of

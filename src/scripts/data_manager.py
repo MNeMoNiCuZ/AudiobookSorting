@@ -389,6 +389,7 @@ class DataManager:
                     existing.primary_audio = entry.primary_audio
                     existing.image_files = entry.image_files
                     existing.is_multi_book_folder = entry.is_multi_book_folder
+                    existing.broken_audio = entry.broken_audio
                     kept = existing
                 else:
                     self.entries[entry.entry_id] = entry
@@ -437,6 +438,8 @@ class DataManager:
             keep.primary_audio = str(Path(keep.folder) / names[0])
             keep.image_files = images
             keep.combined_by_user = True
+            keep.broken_audio = [message for entry in entries
+                                 for message in entry.broken_audio]
             keep.is_multi_book_folder = False
             for entry in entries[1:]:
                 self.entries.pop(entry.entry_id, None)
