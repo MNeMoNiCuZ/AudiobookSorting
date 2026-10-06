@@ -16,6 +16,8 @@ about ``BookEntry``.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import (QEvent, QModelIndex, QPersistentModelIndex, QPointF, QRect, QRectF, QSize, Qt,
                           pyqtSignal)
 from PyQt6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QLinearGradient,
@@ -45,6 +47,22 @@ ROLE_WARNING_IGNORED = Qt.ItemDataRole.UserRole + 9
 ROLE_DUPLICATE_IDENTITY = Qt.ItemDataRole.UserRole + 10
 # The book's size on disk as a short label ("412 MB"), drawn in the status pill.
 ROLE_SIZE = Qt.ItemDataRole.UserRole + 11
+# The companion files going with the book - [(where it is, name it will get, shared)]
+# - drawn as thin lines under the row. Set on every cell of the row.
+ROLE_SIDECARS = Qt.ItemDataRole.UserRole + 12
+
+# One thin line per companion file under the book, at most SIDECAR_MAX_LINES of them
+# and a "+N more" line after that.
+SIDECAR_LINE = 16
+SIDECAR_MAX_LINES = 4
+
+
+def sidecar_strip_height(plan) -> int:
+    """How much taller a row gets to show these companion files under it."""
+    if not plan:
+        return 0
+    lines = min(len(plan), SIDECAR_MAX_LINES) + (len(plan) > SIDECAR_MAX_LINES)
+    return lines * SIDECAR_LINE + 4
 
 # What a cell should look like. Set as ROLE_KIND on the item.
 KIND_TEXT = 'text'
@@ -159,15 +177,24 @@ class ReviewDelegate(QStyledItemDelegate):
         # around the table leaves that outline looking like a second, ghost cursor.
         option.state &= ~QStyle.StateFlag.State_HasFocus
 
-        rect = option.rect
+        cell = option.rect
         status = str(index.data(ROLE_STATUS) or 'pending')
         hue = STATUS_HUES.get(status, TEXT_FAINT)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
-        self._paint_background(painter, rect, status, selected, hovered,
+        self._paint_background(painter, cell, status, selected, hovered,
                                index.row() % 2 == 1,
                                bool(index.data(ROLE_DUPLICATE_IDENTITY)))
+
+        # The book is drawn in the top of the row; its companion files fill the strip
+        # the row grew by underneath.
+        plan = index.data(ROLE_SIDECARS) or []
+        strip = min(sidecar_strip_height(plan), max(0, cell.height() - 20))
+        rect = cell.adjusted(0, 0, 0, -strip)
+        if strip:
+            self._paint_sidecars(painter, cell, rect.bottom() + 1, plan, index,
+                                 selected)
 
         # Drawn over the fill and under everything else, so it tints the row without
         # touching the status colour the fill is already carrying.
@@ -175,14 +202,14 @@ class ReviewDelegate(QStyledItemDelegate):
         if flash:
             tint = QColor(ACCENT)
             tint.setAlpha(int(58 * max(0.0, min(1.0, float(flash)))))
-            painter.fillRect(rect, tint)
+            painter.fillRect(cell, tint)
 
         # The stripe belongs to the leftmost *visible* column - the cover column is
         # hidden in compact rows, and the stripe must not vanish with it.
         if (self.show_stripe and status != 'pending'
                 and index.column() == self._first_visible_column()):
-            painter.fillRect(QRect(rect.left(), rect.top(), STRIPE_WIDTH,
-                                   rect.height()), QColor(hue))
+            painter.fillRect(QRect(cell.left(), cell.top(), STRIPE_WIDTH,
+                                   cell.height()), QColor(hue))
 
         # Extra left padding on the leading column so text clears the status stripe.
         leading = index.column() == self._first_visible_column()
@@ -207,6 +234,77 @@ class ReviewDelegate(QStyledItemDelegate):
             self._paint_warning_badge(painter, rect, index)
 
         painter.restore()
+
+    def _paint_sidecars(self, painter: QPainter, cell: QRect, top: int, plan, index,
+                        selected: bool) -> None:
+        """The book's companion files, one thin line each: where the file is now and
+        the name it will have once the book is finalized.
+
+        The lines start under the Files column and run on across the row. Every cell
+        draws its own slice of them, clipped to itself, so they flow across columns
+        without the row being split into cells of its own.
+        """
+        view = self.parent()
+        strip = QRect(cell.left(), top, cell.width(), cell.bottom() - top)
+        # Sunk a shade below the row, so it reads as part of the book, not a book.
+        shade = QColor(BG_BASE).darker(118)
+        shade.setAlpha(170)
+        painter.fillRect(strip.adjusted(0, 0, 0, -1), shade)
+        if selected:
+            self._paint_selection_frame(painter, cell)
+
+        start = cell.left() + PAD
+        if view is not None and hasattr(view, 'columnViewportPosition'):
+            model = index.model()
+            columns = [c for c in range(model.columnCount())
+                       if not view.isColumnHidden(c)]
+            files = next((c for c in columns
+                          if model.index(index.row(), c).data(ROLE_KIND) == KIND_FILES),
+                         columns[0] if columns else index.column())
+            start = view.columnViewportPosition(files) + PAD
+
+        font = QFont(painter.font())
+        font.setBold(False)
+        font.setPixelSize(11)
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        painter.setClipRect(strip)
+
+        shown = list(plan[:SIDECAR_MAX_LINES])
+        y = top + 2
+        for where, name, shared in shown:
+            renamed = Path(name).name != Path(where).name or '/' in where
+            x = start
+            painter.setPen(QColor(TEXT_FAINT))
+            painter.drawText(QRect(x, y, 16, SIDECAR_LINE),
+                             Qt.AlignmentFlag.AlignVCenter, '↳')
+            x += 16
+            painter.setPen(QColor(TEXT_SECONDARY if renamed else TEXT_DIM))
+            painter.drawText(QRect(x, y, 4000, SIDECAR_LINE),
+                             Qt.AlignmentFlag.AlignVCenter, where)
+            x += metrics.horizontalAdvance(where)
+            if renamed:
+                painter.setPen(QColor(TEXT_FAINT))
+                arrow = '   →   '
+                painter.drawText(QRect(x, y, 4000, SIDECAR_LINE),
+                                 Qt.AlignmentFlag.AlignVCenter, arrow)
+                x += metrics.horizontalAdvance(arrow)
+                painter.setPen(QColor(TEXT))
+                painter.drawText(QRect(x, y, 4000, SIDECAR_LINE),
+                                 Qt.AlignmentFlag.AlignVCenter, name)
+                x += metrics.horizontalAdvance(name)
+            if shared:
+                painter.setPen(QColor(TEXT_FAINT))
+                painter.drawText(QRect(x, y, 4000, SIDECAR_LINE),
+                                 Qt.AlignmentFlag.AlignVCenter,
+                                 '   (shared - each book gets a copy)')
+            y += SIDECAR_LINE
+        if len(plan) > len(shown):
+            painter.setPen(QColor(TEXT_FAINT))
+            painter.drawText(QRect(start + 16, y, 4000, SIDECAR_LINE),
+                             Qt.AlignmentFlag.AlignVCenter,
+                             f'+ {len(plan) - len(shown)} more companion files')
+        painter.setClipping(False)
 
     @staticmethod
     def warning_badge_rect(rect: QRect) -> QRect:

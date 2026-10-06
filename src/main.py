@@ -335,9 +335,11 @@ def run_gui(app: Application) -> int:
 
     window.entry_changed = persist
     window.preview_provider = lambda entry: app.file_ops.preview(entry)
+    window.sidecar_provider = lambda entry: app.file_ops.sidecar_plan(entry)
     # A setting changed directly from the main window, so rebuild the components that
     # keep their own settings-derived state.
     window.settings_changed.connect(app.reload_settings)
+    window.settings_changed.connect(window.refresh_sidecars)
     # The queue view reads the manager directly rather than being fed a copy, so the
     # badge, the toolbar count and the Queue window can never disagree about it.
     window.queue_provider = workers.status
@@ -1035,6 +1037,8 @@ def run_gui(app: Application) -> int:
                 app.data.update(entry)
             if renamed:
                 window.set_entries(app.data.all())
+            else:
+                window.refresh_sidecars()
             window._validate_entries()
             window.show_message('Settings saved to .env'
                                 + (f', {len(renamed)} name'
@@ -1113,8 +1117,11 @@ def run_gui(app: Application) -> int:
             # What did move before the failure is still followed below.
             moved = getattr(exc, 'moved', moved)
         relocated = folderize.relocate_entries(app.data.all(), Path(root), moved)
-        for old_id, entry in relocated.items():
+        # Every old id out before any new one goes in: one book's new id can be
+        # another's old one, and removing that after adding would drop the book.
+        for old_id in relocated:
             app.data.remove(old_id)
+        for entry in relocated.values():
             app.data.add(entry)
         app.data.flush()
         window.set_entries(app.data.all())

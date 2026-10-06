@@ -47,10 +47,10 @@ from ..models import (IDENTITY_FIELDS, STATUS_APPLIED, STATUS_APPROVED, STATUS_P
 from .table import ColumnTable
 from .delegates import (KIND_CONFIDENCE, KIND_COVER, KIND_FILES, KIND_STATUS,
                         ROLE_CONFIDENCE, ROLE_DUPLICATE_IDENTITY, ROLE_ENTRY_ID, ROLE_FLASH, ROLE_KIND,
-                        ROLE_SIZE,
+                        ROLE_SIDECARS, ROLE_SIZE,
                         ROLE_PROGRESS, ROLE_PROGRESS_TEXT, ROLE_SECONDARY, ROLE_STATUS,
                         ROLE_WARNING, ROLE_WARNING_IGNORED,
-                        ReviewDelegate)
+                        ReviewDelegate, sidecar_strip_height)
 from .cover_loader import CoverLoader, read_cover
 from .cover_viewer import CoverViewer
 from .icons import badged_icon
@@ -578,6 +578,9 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.settings = settings
         self.preview_provider = None
+        # The companion files going with a book and the names they will get, drawn
+        # under its row. Set by the application: FileOperations owns that answer.
+        self.sidecar_provider = None
         self.entries: Dict[str, BookEntry] = {}
         self._identity_keys = {}
         self._identity_groups = {}
@@ -1042,7 +1045,7 @@ class MainWindow(QMainWindow):
         height = ROW_HEIGHTS.get(density, ROW_HEIGHTS['normal'])
         self.table.verticalHeader().setDefaultSectionSize(height)
         for row in range(self.table.rowCount()):
-            self.table.setRowHeight(row, height)
+            self._size_row(row)
         # Covers need a row tall enough to hold one; in compact rows they are noise.
         self._hide_column(COL_COVER, not self.delegate.show_covers
                           or density == 'compact')
@@ -1260,6 +1263,10 @@ class MainWindow(QMainWindow):
         model = self.table.selectionModel()
         with QSignalBlocker(self.table), QSignalBlocker(model):
             self.table.sortItems(column, header.sortIndicatorOrder())
+            # Row heights stay with the position, not the book: re-fit each row to the
+            # companion-file lines of the book that sorted into it.
+            for row in range(self.table.rowCount()):
+                self._size_row(row)
             rows = {entry.entry_id: row for row in range(self.table.rowCount())
                     if (entry := self._entry_at(row)) is not None}
             selection = QItemSelection()
@@ -2094,12 +2101,15 @@ class MainWindow(QMainWindow):
         status.setToolTip(self._status_tooltip(entry, status_label))
         self.table.setItem(row, COL_STATUS, status)
 
+        sidecars = self._sidecars_for(entry)
         # The delegate paints the stripe and the pill from this, on every cell.
         for column in range(len(COLUMNS)):
             item = self.table.item(row, column)
             if item is not None:
                 item.setData(ROLE_STATUS, status_key)
                 item.setData(ROLE_DUPLICATE_IDENTITY, duplicate_warning)
+                item.setData(ROLE_SIDECARS, sidecars)
+        self._size_row(row)
 
         # Refresh both sides of a collision, including a book whose own fields did
         # not change. Sorting waits until all affected rows have been written.
@@ -2208,6 +2218,42 @@ class MainWindow(QMainWindow):
         item.setText(label)
         item.setToolTip(self._status_tooltip(entry, label))
         self._updating = previous
+
+    def _sidecars_for(self, entry: BookEntry) -> list:
+        """[(where, name it will get, shared)] for the lines under the book's row."""
+        if self.sidecar_provider is None:
+            return []
+        try:
+            return [tuple(item) for item in self.sidecar_provider(entry)]
+        except Exception as exc:     # a listing failing must not take the row with it
+            logger.warning('Could not list companion files of %s: %s',
+                           entry.entry_id, exc)
+            return []
+
+    def refresh_sidecars(self) -> None:
+        """Re-read every book's companion files and the names they will get - after
+        the rename settings or the templates changed."""
+        for row in range(self.table.rowCount()):
+            entry = self._entry_at(row)
+            if entry is None:
+                continue
+            sidecars = self._sidecars_for(entry)
+            for column in range(len(COLUMNS)):
+                item = self.table.item(row, column)
+                if item is not None:
+                    item.setData(ROLE_SIDECARS, sidecars)
+            self._size_row(row)
+        self.table.viewport().update()
+
+    def _size_row(self, row: int) -> None:
+        """The density's row height, plus room for the book's companion-file lines."""
+        density = self.settings.get('AO_UI_DENSITY') or 'normal'
+        height = ROW_HEIGHTS.get(density, ROW_HEIGHTS['normal'])
+        item = self.table.item(row, COL_FILES)
+        plan = item.data(ROLE_SIDECARS) if item is not None else None
+        height += sidecar_strip_height(plan or [])
+        if self.table.rowHeight(row) != height:
+            self.table.setRowHeight(row, height)
 
     def _files_summary(self, entry: BookEntry):
         """(filename, path-from-root) - the delegate draws them as two lines.
@@ -2772,9 +2818,9 @@ class MainWindow(QMainWindow):
     def _apply_warning_fixes(self, entry: BookEntry, fixes, label: str) -> None:
         from ..models import Field, clean_value
 
-        changed = [(field, clean_value(field, value.strip()))
+        changed = [(field, clean_value(field, value.strip(), manual=True))
                    for field, value in fixes
-                   if clean_value(field, value.strip()) != entry.value(field)]
+                   if clean_value(field, value.strip(), manual=True) != entry.value(field)]
         if not changed:
             return
         self._record_edit(f'fixed {label}',
@@ -2796,7 +2842,7 @@ class MainWindow(QMainWindow):
     def _edit_warning_field(self, entry: BookEntry, field: str, value: str) -> bool:
         from ..models import Field, clean_value
 
-        cleaned = clean_value(field, value.strip())
+        cleaned = clean_value(field, value.strip(), manual=True)
         if cleaned == entry.value(field):
             return False
         self._record_edit(
@@ -3110,7 +3156,7 @@ class MainWindow(QMainWindow):
         # not an edit.
         if field == 'series_index' and clean_value(field, value) == str(current.value):
             return
-        cleaned = clean_value(field, value)
+        cleaned = clean_value(field, value, manual=True)
         self._record_edit(f'{field} typed on "{self._label_for(entry)}"',
                           [(entry.entry_id, field, current)])
         setattr(entry, field, Field(value=cleaned, source='user', confidence=1.0))
@@ -4454,7 +4500,7 @@ class MainWindow(QMainWindow):
             if not fields:
                 continue
             for name, value in fields.items():
-                cleaned = clean_value(name, value)
+                cleaned = clean_value(name, value, manual=True)
                 setattr(entry, name,
                         Field(value=cleaned, source='user', confidence=1.0))
                 entry.log('user', f'{name} set to "{cleaned}" in the grid editor')
@@ -4750,7 +4796,7 @@ class MainWindow(QMainWindow):
                     if column_offset >= len(line):
                         continue
                     value = line[column_offset]
-                cleaned = clean_value(name, value.strip())
+                cleaned = clean_value(name, value.strip(), manual=True)
                 if cleaned == entry.value(name):
                     continue
                 writes.append((entry, name, cleaned))
@@ -4784,7 +4830,7 @@ class MainWindow(QMainWindow):
 
     def _write_field(self, entries: List[BookEntry], field: str, value: str) -> None:
         from ..models import Field, clean_value
-        cleaned = clean_value(field, value)
+        cleaned = clean_value(field, value, manual=True)
         self._record_edit(f'{field} set on {len(entries)} row'
                           f'{"" if len(entries) == 1 else "s"}',
                           self._snapshot(entries, [field]))
@@ -5686,7 +5732,7 @@ class MainWindow(QMainWindow):
         # Grouping reads tags, as a scan does - a moment on a big pile of files.
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            books = folderize.plan(Path(root))
+            books = folderize.plan(Path(root), entries=list(self.entries.values()))
         finally:
             QApplication.restoreOverrideCursor()
         if not books:

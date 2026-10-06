@@ -157,7 +157,7 @@ class BookEntry:
         Returns True if the entry changed. A value from a tier that agrees with what we
         already have does not overwrite, it corroborates - and raises confidence.
         """
-        value = clean_value(name, value)
+        value = clean_value(name, value, manual=source == 'user')
         if not value:
             return False
         # "Volume 3" or "Chapter 01" is a label, not a book's title, whoever says so.
@@ -254,7 +254,7 @@ class BookEntry:
     def force_field(self, name: str, value: Any, source: str,
                     confidence: Optional[float] = None) -> bool:
         """Write a field even over a user edit. Only ever called after you agree."""
-        value = clean_value(name, value)
+        value = clean_value(name, value, manual=source == 'user')
         if not value:
             return False
         confidence = (SOURCE_CONFIDENCE.get(source, 0.5)
@@ -511,6 +511,8 @@ def renormalize(entry: 'BookEntry') -> bool:
     changed = False
     for name in FILTERED_FIELDS:
         field = getattr(entry, name)
+        if field.source == 'user':
+            continue
         cleaned = clean_value(name, field.value)
         if cleaned and cleaned != field.value:
             field.value = cleaned
@@ -518,8 +520,13 @@ def renormalize(entry: 'BookEntry') -> bool:
     return changed
 
 
-def clean_value(name: str, value: Any) -> str:
-    """Normalise a candidate value, rejecting the junk models and tags like to emit."""
+def clean_value(name: str, value: Any, manual: bool = False) -> str:
+    """Normalise a candidate value, rejecting the junk models and tags like to emit.
+
+    ``manual`` is a value you typed yourself: it is taken as written, so the bracket
+    stripping, blocked terms and punctuation tidy that clean up looked-up names are
+    skipped and "Title [Dramatized]" stays "Title [Dramatized]".
+    """
     if value is None:
         return ''
     text = str(value).strip().strip('"\'')
@@ -547,9 +554,10 @@ def clean_value(name: str, value: Any) -> str:
         # ":" is never part of a name: it is illegal in a filename, so
         # "Title: Subtitle" is stored as "Title - Subtitle".
         text = replace_colons(text)
-        text = apply_text_filters(text)
-        if _tidy_punctuation:
-            text = tidy_text(text)
+        if not manual:
+            text = apply_text_filters(text)
+            if _tidy_punctuation:
+                text = tidy_text(text)
     if name == 'author':
         # Imported here rather than at the top: quality is a leaf today, and a name
         # style is not worth making models depend on it for good.

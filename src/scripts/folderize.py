@@ -16,7 +16,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, Iterable, List, NamedTuple, Optional
 
 from .file_scanner import FileScanner, _album_of
 from .models import BookEntry
@@ -42,11 +42,14 @@ def loose_audio(input_dir: Path, scanner: Optional[FileScanner] = None) -> List[
                   and (Path(input_dir) / name).is_file())
 
 
-def plan(input_dir: Path, scanner: Optional[FileScanner] = None) -> List[LooseBook]:
+def plan(input_dir: Path, scanner: Optional[FileScanner] = None,
+         entries: Iterable[BookEntry] = ()) -> List[LooseBook]:
     """The folders folderizing would make, and what goes in each. Touches nothing.
 
-    The books are grouped exactly as a scan groups them, so each folder holds what the
-    list would have shown as one book.
+    A book already in the list keeps the files the list gives it - one you combined
+    stays one book, in one folder, so it can follow its files. The loose audio the list
+    does not have is grouped exactly as a scan groups it, so each folder holds what the
+    list will show as one book once it is added.
     """
     root = Path(input_dir)
     scanner = scanner or FileScanner(str(root))
@@ -59,12 +62,29 @@ def plan(input_dir: Path, scanner: Optional[FileScanner] = None) -> List[LooseBo
     except OSError:
         others = []
 
+    groups: List[List[str]] = []
+    remaining = {name.lower(): name for name in audio}
+    root_key = os.path.normcase(os.path.normpath(str(root)))
+    for entry in entries:
+        if os.path.normcase(os.path.normpath(entry.folder or '')) != root_key:
+            continue
+        names = [remaining.pop(name.lower()) for name in entry.audio_files
+                 if name.lower() in remaining]
+        if names:
+            groups.append(names)
+    unlisted = [name for name in audio if name.lower() in remaining]
+    if unlisted:
+        groups.extend(scanner.book_sets(root, unlisted))
+
     taken = {name.lower() for name in os.listdir(root)}
+    claimed = set()
     books: List[LooseBook] = []
-    for names in scanner.book_sets(root, audio):
+    for names in groups:
         stems = {Path(name).stem.lower() for name in names}
+        # A companion goes with the first book it is named after, and only that one.
         companions = [name for name in others
-                      if Path(name).stem.lower() in stems]
+                      if Path(name).stem.lower() in stems and name not in claimed]
+        claimed.update(companions)
         folder = _free_name(root, _folder_name(root, names), taken)
         taken.add(folder.lower())
         books.append(LooseBook(folder, sorted(names + companions)))
@@ -109,7 +129,7 @@ def relocate_entries(entries: List[BookEntry], input_dir: Path,
     root = os.path.normcase(os.path.normpath(str(input_dir)))
     where = {os.path.normcase(os.path.normpath(old)): Path(new).parent
              for old, new in moved.items()}
-    relocated: Dict[str, BookEntry] = {}
+    following: List[tuple] = []
     for entry in entries:
         if os.path.normcase(os.path.normpath(entry.folder)) != root:
             continue
@@ -117,9 +137,21 @@ def relocate_entries(entries: List[BookEntry], input_dir: Path,
                    for path in entry.absolute_files()}
         if len(targets) != 1 or None in targets:
             continue
-        folder = next(iter(targets))
+        following.append((entry, next(iter(targets))))
+
+    # Two books that went into one folder are a multi-book folder, with the ids a scan
+    # of it would give: "Folder/first file". Both named "Folder" would be one entry, and
+    # the list would quietly lose the other book.
+    sharing: Dict[Path, int] = {}
+    for _, folder in following:
+        sharing[folder] = sharing.get(folder, 0) + 1
+
+    relocated: Dict[str, BookEntry] = {}
+    for entry, folder in following:
         old_id = entry.entry_id
-        entry.entry_id = folder.name
+        shared = sharing[folder] > 1
+        entry.entry_id = (str(Path(folder.name) / entry.audio_files[0]) if shared
+                          else folder.name)
         entry.folder = str(folder)
         entry.relative_path = folder.name
         entry.primary_audio = str(folder / entry.audio_files[0])
@@ -127,7 +159,7 @@ def relocate_entries(entries: List[BookEntry], input_dir: Path,
                                    if Path(new).parent == folder
                                    and new.lower().endswith(
                                        ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif')))
-        entry.is_multi_book_folder = False
+        entry.is_multi_book_folder = shared
         entry.log('user', f'Moved from the root of the input folder into "{folder.name}"')
         relocated[old_id] = entry
     return relocated

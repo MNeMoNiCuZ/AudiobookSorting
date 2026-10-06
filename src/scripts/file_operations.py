@@ -59,6 +59,21 @@ CLUTTER_NAMES = ('thumbs.db', 'desktop.ini', '.ds_store', 'ehthumbs.db')
 # and never carried along as a companion.
 DEFAULT_JUNK_PATTERNS = ('.pad', '*.torrent', '_____padding_file_*')
 COVER_NAMES = ('cover', 'folder', 'front', 'albumart', 'thumb', 'poster')
+# The e-book formats proper. One of these is the book in another form, so it is
+# renamed to match the book wherever it sat - even in an "Ebook" subfolder.
+EBOOK_EXTENSIONS = (
+    '.epub', '.kepub', '.kepub.epub', '.mobi', '.azw', '.azw1', '.azw3', '.azw4',
+    '.azw8', '.kfx', '.kfx-zip', '.kf8', '.prc', '.pdb', '.lit', '.lrf', '.lrx',
+    '.fb2', '.fb2.zip', '.fbz', '.fb3', '.ibooks',
+)
+# Words a file named after a book may carry besides its title and author:
+# "Dune (Retail) [ePub].epub", "Frank Herbert - Dune - Unabridged.mobi".
+_NAME_NOISE = frozenset((
+    'a', 'an', 'the', 'and', 'of', 'by', 'ebook', 'e', 'book', 'books', 'retail',
+    'epub', 'kepub', 'mobi', 'azw', 'azw3', 'kfx', 'pdf', 'fb2', 'unabridged',
+    'abridged', 'novel', 'edition', 'ed', 'vol', 'volume', 'v', 'part', 'no',
+    'complete', 'final', 'kindle', 'calibre', 'audiobook', 'companion', 'cover',
+))
 
 
 # The skip reason of a book you rejected - the preview groups these on their own.
@@ -76,6 +91,72 @@ def _book_keys(entry: BookEntry) -> Set[str]:
     keys.add(_name_key(entry.value('title') or ''))
     keys.discard('')
     return keys
+
+
+def _companion_suffix(name: str) -> str:
+    """The file's companion extension, compound ones whole: ".fb2.zip", not ".zip"."""
+    lower = name.lower()
+    matches = [ext for ext in COMPANION_EXTENSIONS if lower.endswith(ext)]
+    return max(matches, key=len) if matches else Path(name).suffix.lower()
+
+
+def _companion_stem(name: str) -> str:
+    return name[:len(name) - len(_companion_suffix(name))]
+
+
+def _words(text: str) -> List[str]:
+    return re.findall(r'[0-9a-z]+', (text or '').lower())
+
+
+def _name_match(entry: BookEntry, stem: str, strict: bool) -> int:
+    """How well a file's name says it belongs to this book; 0 when it does not.
+
+    An exact match on the title or an audio file's name beats anything else. Short
+    of that, the title's words in a row inside the name ("Frank Herbert - Dune
+    (Retail)") score the title's length, so the longer of two titles wins:
+    "Dune Messiah.epub" is Dune Messiah's, not Dune's. ``strict`` - for a file found
+    among other books' folders - also requires every other word in the name to be
+    the author, the series, a number or an ordinary tag, so "Dune" never claims
+    "Dune Messiah" when Dune Messiah is not on the list.
+    """
+    key = _name_key(stem)
+    if not key:
+        return 0
+    if key in _book_keys(entry):
+        return 10_000 + len(key)
+    words = _words(stem)
+    allowed = None
+    best = 0
+    title = entry.value('title') or ''
+    for candidate in {title, _VERSION_SUFFIX.sub('', title)}:
+        wanted = _words(candidate)
+        if len(''.join(wanted)) < 4:
+            continue    # "It" would be found inside half the library
+        size = len(wanted)
+        for start in range(len(words) - size + 1):
+            if words[start:start + size] != wanted:
+                continue
+            if strict:
+                if allowed is None:
+                    allowed = (set(_words(entry.value('author')))
+                               | set(_words(entry.value('series'))) | _NAME_NOISE)
+                rest = words[:start] + words[start + size:]
+                if any(w not in allowed and not w.isdigit() for w in rest):
+                    continue
+            best = max(best, len(''.join(wanted)))
+            break
+    return best
+
+
+def _best_owners(stem: str, books: List[BookEntry], strict: bool) -> List[BookEntry]:
+    """The books a file's name matches best - one, several tied, or none."""
+    scores = [(_name_match(book, stem, strict), book) for book in books]
+    top = max((score for score, _ in scores), default=0)
+    return [book for score, book in scores if top and score == top]
+
+
+_VERSION_SUFFIX = re.compile(r'[\s(\[]*\bv(?:er(?:sion)?)?\.?\s*\d+[)\]]?\s*$',
+                             re.IGNORECASE)
 
 
 def _title_key(entry: BookEntry) -> str:
@@ -196,16 +277,18 @@ class FileOperations:
         """
         return self._owned(entry)[0]
 
-    def _owned(self, entry: BookEntry) -> Tuple[List[Path], Dict[Path, List[BookEntry]]]:
-        """files_for, plus the companion files shared with other books, and with whom."""
+    def _owned(self, entry: BookEntry
+               ) -> Tuple[List[Path], Dict[Path, List[BookEntry]], Dict[Path, str]]:
+        """files_for, plus the companion files shared with other books and with whom,
+        and the names of those found outside the book's own folders."""
         folder = Path(entry.folder)
         files: List[Path] = []
         for name in entry.audio_files:
             path = folder / name
             if path.is_file():
                 files.append(path)
-        companions, shared = self._companions(entry, exclude=files)
-        return files + companions, shared
+        companions, shared, placed = self._companions(entry, exclude=files)
+        return files + companions, shared, placed
 
     def companions_for(self, entry: BookEntry,
                        exclude: Iterable[Path] = ()) -> List[Path]:
@@ -223,11 +306,13 @@ class FileOperations:
         return self._companions(entry, exclude)[0]
 
     def _companions(self, entry: BookEntry, exclude: Iterable[Path] = ()
-                    ) -> Tuple[List[Path], Dict[Path, List[BookEntry]]]:
+                    ) -> Tuple[List[Path], Dict[Path, List[BookEntry]], Dict[Path, str]]:
         from .file_scanner import AUDIO_EXTENSIONS
 
         files: List[Path] = []
         shared: Dict[Path, List[BookEntry]] = {}
+        # Files found beside other books, and the name they take in the book's folder.
+        placed: Dict[Path, str] = {}
         taken = set(exclude)
         junk = self.junk_patterns
 
@@ -242,7 +327,8 @@ class FileOperations:
         # Folders where other books live. Their files are found from there, even once
         # their audio has gone and the folder looks like a book's "Extras".
         book_folders = set()
-        for other in self.known_entries():
+        known = list(self.known_entries())
+        for other in known:
             if other.entry_id != entry.entry_id and other.folder:
                 try:
                     book_folders.add(Path(other.folder).resolve())
@@ -279,25 +365,88 @@ class FileOperations:
         if levels is None:
             # Other books share this folder but we were not told which: only a file
             # named after this book can be attributed to it.
-            keys = _book_keys(entry)
             files.extend(p for p in candidates(own)
-                         if p.parent == own and _name_key(p.stem) in keys)
-            return files, shared
+                         if p.parent == own
+                         and _name_match(entry, _companion_stem(p.name), strict=True))
+            return files, shared, placed
 
         previous: Optional[Path] = None
         for where, members in levels:
             others = [m for m in members if m.entry_id != entry.entry_id]
-            mine = _book_keys(entry)
-            theirs = set().union(*(_book_keys(m) for m in others)) if others else set()
             for path in candidates(where, skip=previous):
-                key = _name_key(path.stem)
-                if others and key not in mine and key in theirs:
+                if not others:
+                    files.append(path)
+                    continue
+                owners = _best_owners(_companion_stem(path.name), [entry, *others],
+                                      strict=False)
+                if owners and entry not in owners:
                     continue        # named after one of the other books
                 files.append(path)
-                if others and key not in mine:
-                    shared[path] = others
+                if owners != [entry]:
+                    # Named after none of them, or after several: it is all of theirs.
+                    shared[path] = [m for m in owners if m is not entry] or others
             previous = where
-        return files, shared
+
+        # Past the folders this book owns - the author's folder, the input folder, an
+        # "Ebooks" folder beside them - a file is this book's only when it is named
+        # after this book and after no other: "Author/Title.epub" next to
+        # "Author/Title/". It goes into the book's folder under its own name.
+        everyone = [entry, *(e for e in known if e.entry_id != entry.entry_id)]
+        previous = levels[-1][0] if levels else own
+        for where in self._outer_folders(previous):
+            if where.is_dir():
+                for path in self._named_candidates(where, previous, hosts_book):
+                    stem = _companion_stem(path.name)
+                    if (_name_match(entry, stem, strict=True) and companion(path)
+                            and _best_owners(stem, everyone, strict=True) == [entry]):
+                        files.append(path)
+                        placed[path] = path.name
+            previous = where
+        return files, shared, placed
+
+    def _outer_folders(self, start: Path) -> List[Path]:
+        """The folders above ``start``, up to and including the input folder."""
+        try:
+            root = self.settings.get_path('AO_INPUT_DIR').resolve()
+            start.resolve().relative_to(root)
+        except (OSError, ValueError):
+            return []
+        folders: List[Path] = []
+        current = start
+        while current.parent != current:
+            current = current.parent
+            try:
+                resolved = current.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                break
+            folders.append(current)
+            if resolved == root:
+                break
+        return folders
+
+    @staticmethod
+    def _named_candidates(where: Path, skip: Optional[Path],
+                          hosts_book: Callable[[Path], bool]) -> List[Path]:
+        """Companion-named files loose in ``where``, or in its subfolders that hold no
+        book. Names only: matching a name is cheap, listing a whole library is not."""
+        found: List[Path] = []
+        try:
+            children = sorted(where.iterdir())
+        except OSError:
+            return found
+        for path in children:
+            if skip is not None and path == skip:
+                continue
+            if path.name.lower().endswith(COMPANION_EXTENSIONS):
+                found.append(path)
+            elif path.is_dir() and not hosts_book(path):
+                try:
+                    found.extend(p for p in sorted(path.rglob('*'))
+                                 if p.name.lower().endswith(COMPANION_EXTENSIONS))
+                except OSError:
+                    continue
+        return found
 
     def _levels(self, entry: BookEntry) -> Optional[List[Tuple[Path, List[BookEntry]]]]:
         """The folders this book draws companions from, nearest first, and the books
@@ -448,10 +597,10 @@ class FileOperations:
             planned: List[Dict] = []
             destination = Path()
             if dry_run:
-                files = self.files_for(entry)
+                files, _, placed = self._owned(entry)
                 if files:
                     destination = self.destination_for(entry)
-                    rename_map = self._rename_map(entry, files)
+                    rename_map = {**placed, **self._rename_map(entry, files)}
                     operation = 'copy' if self.copy_mode else 'move'
                     planned = [{'source': str(path),
                                 'destination': str(destination
@@ -462,7 +611,7 @@ class FileOperations:
             return ApplyResult(entry.entry_id, destination, planned, skipped=True,
                                dry_run=dry_run, reason=REJECTED_REASON)
 
-        files, shared = self._owned(entry)
+        files, shared, placed = self._owned(entry)
         if not files:
             return ApplyResult(entry.entry_id, Path(), [],
                                error='No files found for this entry', dry_run=dry_run)
@@ -475,7 +624,7 @@ class FileOperations:
 
         operation = 'copy' if self.copy_mode else 'move'
         planned: List[Dict] = []
-        rename_map = self._rename_map(entry, files)
+        rename_map = {**placed, **self._rename_map(entry, files)}
 
         for path in files:
             target = destination / rename_map.get(path,
@@ -527,19 +676,47 @@ class FileOperations:
             self._remove_emptied_source(Path(entry.folder))
         return ApplyResult(entry.entry_id, destination, done)
 
+    def sidecar_plan(self, entry: BookEntry) -> List[Tuple[str, str, bool]]:
+        """The companion files going with this book: (where it is now, the name it
+        will have in the book's folder, whether other books get a copy too).
+
+        Exactly what Finalize would take and how it would name it, for the list to
+        show under the book.
+        """
+        from .file_scanner import AUDIO_EXTENSIONS
+        files, shared, placed = self._owned(entry)
+        companions = [p for p in files if p.suffix.lower() not in AUDIO_EXTENSIONS]
+        if not companions:
+            return []
+        rename_map = {**placed, **self._rename_map(entry, files)}
+        folder = Path(entry.folder)
+        plan = []
+        for path in companions:
+            # Its name in the book's folder, or its path from the input folder when it
+            # sits elsewhere - beside the book, in an "Ebooks" folder.
+            for base in (folder, self.settings.get_path('AO_INPUT_DIR')):
+                try:
+                    where = path.relative_to(base).as_posix()
+                    break
+                except ValueError:
+                    where = str(path)
+            plan.append((where, rename_map.get(path, self._relative_name(entry, path)),
+                         path in shared))
+        return plan
+
     def leftovers_for(self, entry: BookEntry) -> List[Path]:
         """Companion files a finalized book left behind in its source folders."""
         return self._leftovers(entry)[0]
 
     def _leftovers(self, entry: BookEntry
-                   ) -> Tuple[List[Path], Dict[Path, List[BookEntry]]]:
+                   ) -> Tuple[List[Path], Dict[Path, List[BookEntry]], Dict[Path, str]]:
         if not entry.applied_path or not Path(entry.applied_path).is_dir():
-            return [], {}
+            return [], {}, {}
         destination = Path(entry.applied_path)
-        files, shared = self._companions(entry)
+        files, shared, placed = self._companions(entry)
         # Already there - a shared file a sibling's run copied in, or a second click.
         files = [p for p in files if not self._has_copy(destination, p)]
-        return files, shared
+        return files, shared, placed
 
     def collect_leftovers(self, entry: BookEntry) -> ApplyResult:
         """Bring the files a finalized book left behind into the folder it went to.
@@ -548,12 +725,12 @@ class FileOperations:
         can be undone, and the source folders removed once they are empty.
         """
         destination = Path(entry.applied_path or '')
-        files, shared = self._leftovers(entry)
+        files, shared, placed = self._leftovers(entry)
         if not files:
             return ApplyResult(entry.entry_id, destination, [], skipped=True,
                                reason='nothing left behind')
 
-        rename_map = self._rename_map(entry, files)
+        rename_map = {**placed, **self._rename_map(entry, files)}
         transaction = Transaction(entry_id=entry.entry_id, destination=str(destination))
         done: List[Dict] = []
         error = ''
@@ -656,6 +833,9 @@ class FileOperations:
         of its kind here" - two .jpgs might be "cover" and "back", and renaming both to
         the same stem would collide, so an extension with more than one file is left
         exactly as it is and everything else follows the audio.
+
+        Loose files are renamed where they are. An e-book is renamed wherever it sat,
+        an "Ebook" subfolder included, and comes up beside the audio.
         """
         if not self.settings.get_bool('AO_RENAME_SUPPORT_FILES', False):
             return {}
@@ -667,10 +847,10 @@ class FileOperations:
         # Loose in the book's folder, or loose in a parent folder it owns.
         homes = {folder, *folder.parents}
         support = [p for p in files if p.suffix.lower() not in AUDIO_EXTENSIONS
-                   and p.parent in homes]
+                   and (p.parent in homes or p.name.lower().endswith(EBOOK_EXTENSIONS))]
         by_extension: Dict[str, List[Path]] = {}
         for path in support:
-            by_extension.setdefault(path.suffix.lower(), []).append(path)
+            by_extension.setdefault(_companion_suffix(path.name), []).append(path)
 
         base = render_template(template, {
             'author': entry.value('author'),
@@ -687,7 +867,7 @@ class FileOperations:
         for extension, paths in by_extension.items():
             if len(paths) != 1:
                 continue    # ambiguous - leave them alone
-            stem = sanitize_component(base, fallback=paths[0].stem)
+            stem = sanitize_component(base, fallback=_companion_stem(paths[0].name))
             mapping[paths[0]] = f'{stem}{extension}'
         return mapping
 
